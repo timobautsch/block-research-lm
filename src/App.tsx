@@ -152,12 +152,12 @@ interface ApiDiscoverResponse {
 }
 
 const ACCENTS = [
-  "#4285f4",
-  "#34a853",
-  "#fbbc04",
-  "#ea4335",
-  "#7e57c2",
-  "#00acc1",
+  "#0fd070",
+  "#aa9fff",
+  "#dcbd4f",
+  "#74ccf4",
+  "#2bb673",
+  "#daab4e",
 ];
 
 const STOP_WORDS = new Set([
@@ -250,7 +250,7 @@ const initialMessages: ChatMessage[] = [
     role: "assistant",
     createdAt: Date.now() - 1000 * 60 * 10,
     content:
-      "Select sources on the left, ask a question in the center, and create outputs in Studio. Answers in this clone are generated locally from selected source text and include citations when matching evidence is found.",
+      "Select sources on the left, ask a question in the center, and create outputs in Studio. This workspace answers from selected source text and includes citations when matching evidence is found.",
   },
 ];
 
@@ -905,10 +905,13 @@ function TopBar({
           <PanelLeft size={20} />
         </button>
         <div className="brand-mark" aria-hidden="true">
-          <span />
+          <img src="/brand/blockresearch-mark.svg" alt="" />
         </div>
-        <div>
-          <p className="brand-eyebrow">Notebook</p>
+        <div className="brand-copy">
+          <p className="brand-eyebrow">
+            <img src="/brand/blockresearch-wordmark.svg" alt="blockresearch" />
+            <span>Research workspace</span>
+          </p>
           <h1>{title}</h1>
         </div>
         <button className="title-button" type="button" onClick={onNotebookMenu} aria-label="Notebook menu">
