@@ -250,7 +250,7 @@ const initialMessages: ChatMessage[] = [
     role: "assistant",
     createdAt: Date.now() - 1000 * 60 * 10,
     content:
-      "Select sources on the left, ask a question in the center, and create outputs in Studio. This workspace answers from selected source text and includes citations when matching evidence is found.",
+      "Workspace ready. Answers are grounded in the selected source set and include citations when matching evidence is found.",
   },
 ];
 
@@ -1176,14 +1176,22 @@ function ChatPanel({
       </div>
 
       <div className="messages" role="log" aria-live="polite">
-        {messages.map((message) => (
-          <ChatBubble
-            key={message.id}
-            message={message}
-            onSaveNote={() => onSaveNote(message)}
-            onCopy={() => onCopy(message.content, "Answer copied.")}
+        {messages.length === 1 ? (
+          <ResearchCanvas
+            selectedCount={selectedSources.length}
+            answerStyle={answerStyle}
+            onSuggestion={onSuggestion}
           />
-        ))}
+        ) : (
+          messages.map((message) => (
+            <ChatBubble
+              key={message.id}
+              message={message}
+              onSaveNote={() => onSaveNote(message)}
+              onCopy={() => onCopy(message.content, "Answer copied.")}
+            />
+          ))
+        )}
       </div>
 
       <div className="prompt-suggestions" aria-label="Suggested prompts">
@@ -1226,6 +1234,69 @@ function ChatPanel({
         Claude answers are grounded in selected sources. If the API is unavailable,
         a local source-matched fallback keeps the notebook usable.
       </p>
+    </section>
+  );
+}
+
+interface ResearchCanvasProps {
+  selectedCount: number;
+  answerStyle: string;
+  onSuggestion: (suggestion: string) => void;
+}
+
+function ResearchCanvas({
+  selectedCount,
+  answerStyle,
+  onSuggestion,
+}: ResearchCanvasProps) {
+  return (
+    <section className="research-canvas" aria-label="Research workspace start">
+      <div className="canvas-kicker">
+        <Sparkles size={16} />
+        blockresearch AI desk
+      </div>
+      <h3>{selectedCount || "No"} selected sources ready for synthesis</h3>
+      <p>
+        Grounded answers, citations, and Studio outputs are prepared from the
+        active notebook context.
+      </p>
+      <div className="canvas-actions">
+        <button
+          type="button"
+          onClick={() => onSuggestion("Summarize the selected sources with citations")}
+        >
+          <ClipboardList size={16} />
+          Summarize
+        </button>
+        <button
+          type="button"
+          onClick={() => onSuggestion("Where do the sources disagree?")}
+        >
+          <GitBranch size={16} />
+          Compare evidence
+        </button>
+        <button
+          type="button"
+          onClick={() => onSuggestion("What should I create in Studio first?")}
+        >
+          <Sparkles size={16} />
+          Studio plan
+        </button>
+      </div>
+      <div className="canvas-metrics" aria-label="Current notebook context">
+        <span>
+          <Library size={15} />
+          {selectedCount} active
+        </span>
+        <span>
+          <MessageSquareText size={15} />
+          {answerStyle}
+        </span>
+        <span>
+          <Target size={15} />
+          Citation-first
+        </span>
+      </div>
     </section>
   );
 }
