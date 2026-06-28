@@ -2080,7 +2080,9 @@ export async function createSourceStudioEngine(options = {}) {
       heading_path: item.heading_path,
       page_number: item.page_number,
     }));
-    const concise = /concise|brief/i.test(answerStyle);
+    const strict = /strict/i.test(answerStyle);
+    const exploratory = /explor/i.test(answerStyle);
+    const concise = strict || /concise|brief/i.test(answerStyle);
     const evidenceSentences = citations.map((citation) => bestSentenceForQuestion(citation.quote, question));
     const lines = [];
     if (evidencePack.intent === "compare") {
@@ -2090,7 +2092,7 @@ export async function createSourceStudioEngine(options = {}) {
     } else {
       lines.push("Based on the active sources:");
     }
-    evidenceSentences.slice(0, concise ? 3 : 5).forEach((sentence, index) => {
+    evidenceSentences.slice(0, strict ? 3 : exploratory ? 6 : concise ? 3 : 5).forEach((sentence, index) => {
       lines.push(`- ${sentence} [${index + 1}]`);
     });
     return {

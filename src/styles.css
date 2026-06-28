@@ -1191,6 +1191,31 @@ select:focus-visible {
   display: none;
 }
 
+.answer-mode {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 0 16px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #141714;
+}
+
+.answer-mode button {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.035);
+  color: #aab5af;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.answer-mode button[data-active="true"] {
+  border-color: rgba(15, 208, 112, 0.42);
+  background: rgba(15, 208, 112, 0.1);
+  color: var(--green);
+}
+
 .context-chip {
   max-width: min(360px, 45vw);
   min-height: 32px;
