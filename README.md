@@ -1,19 +1,35 @@
-# NotebookLM-Style Research Workspace
+# SourceStudio AI
 
-A NotebookLM-inspired research workspace built with React, Vite, Express, and Claude. It implements the core workflow of a source-grounded notebook: manage sources, ask questions, cite evidence, save notes, and generate Studio outputs.
+SourceStudio AI ist ein lokaler, NotebookLM-inspirierter Research Workspace. Die App bildet nicht nur eine Oberfläche nach, sondern implementiert eine quellengebundene Research-Pipeline: Quellen importieren, strukturieren, aktivieren oder deaktivieren, Wissen extrahieren, Fragen beantworten, Citations prüfen und daraus Artefakte wie Reports, Mind Maps, Quizze, Flashcards, Slide Decks, Audio Briefings und Video Storyboards erzeugen.
 
-This is an interview/demo project, not an official Google product and not affiliated with Google or NotebookLM.
+Der zentrale Qualitätsanspruch ist: Antworten und Artefakte entstehen nachvollziehbar aus den aktiven Quellen. Dafür nutzt die App Evidence Packs, Source Blocks, Citation Chips und ein Citation Ledger.
 
-## Features
+SourceStudio AI ist kein offizielles Google- oder NotebookLM-Produkt.
 
-- Three-panel research workspace: Sources, Chat, and Studio.
-- Source management with upload, paste, link, delete, select, search, and generated source discovery.
-- Claude-backed grounded chat via a same-origin server route.
-- Citation snippets for generated answers.
-- Studio generation for audio scripts, video storyboards, mind maps, reports, flashcards, quizzes, and infographic copy.
-- Notes, copy actions, JSON export, notebook rename, notebook duplicate, chat clearing, and Studio output clearing.
-- Responsive mobile tab layout.
-- Local fallback behavior when Claude is unavailable.
+## Produktidee
+
+Die wichtigste Produktidee ist nicht PDF hochladen und chatten, sondern ein kontrollierter Wissensraum: Quellen sind die Autorität. Der Chat und alle Studio-Artefakte greifen auf dieselbe strukturierte Evidence-Schicht zu.
+
+## Funktionen
+
+- Notebook Workspace mit Sources, Chat und Studio.
+- Markdown/Text-Ingestion.
+- Notes als first-class Sources.
+- URL-Ingestion mit serverseitigem Fetch und HTML-Cleanup.
+- PDF-Dateien mit lokalem Text-Extraction-Fallback für Demo-Szenarien.
+- Aktive/inaktive Quellen als Scope für Retrieval, Chat und Artefakte.
+- Source Blocks mit stabilen IDs, Heading-Kontext und Block-Highlighting.
+- Hierarchical Chunking mit Source References und deterministischen lokalen Embeddings.
+- Knowledge Layer mit Summaries, Claims, Entities, Topics, Risiken, offenen Fragen, Suggested Questions und Suggested Artifacts.
+- Hybrid Retrieval über Keyword-, lokale Vektor-, Metadata-, Heading- und Entity-Signale.
+- Evidence Packs und gespeicherte Retrieval Runs.
+- Grounded Chat mit inline Citation Chips.
+- Citation Ledger mit Claim-Support-Statistiken.
+- Abstention, wenn aktive Quellen eine Antwort nicht tragen.
+- Artifact Studio für Report, Mind Map, Flashcards, Quiz, Data Table, Slide Deck, Audio Overview Transcript, Video Overview Storyboard und Infographic.
+- Optionales ElevenLabs Rendering für Audio Overview MP3-Dateien über Text-to-Dialogue.
+- Server-seitiger Model Router mit lokalem Fallback und optionalem Anthropic/OpenAI/Gemini-Pfad für Grounded Chat.
+- Seed Demo Notebook, Tests und API-Smoke-Scripts.
 
 ## Stack
 
@@ -21,103 +37,105 @@ This is an interview/demo project, not an official Google product and not affili
 - Vite 7
 - TypeScript
 - Express 5
-- Claude Messages API
-- `lucide-react` icons
+- Zod
+- Node.js 24.x
+- Node.js JSON/Filesystem Storage
+- Deterministische lokale Embeddings
+- Optional serverseitige LLM Provider über den Model Router
 
-## Setup
-
-Install dependencies:
+## Quickstart
 
 ```bash
+fnm use
 npm install
-```
-
-Create local environment:
-
-```bash
 cp .env.example .env.local
-```
-
-Set `ANTHROPIC_API_KEY` in `.env.local`.
-
-For local Blockresearch reuse, you can point at existing private env files without copying secrets:
-
-```bash
-BLOCKRESEARCH_ENV_PATHS="/absolute/path/to/.env.dev:/absolute/path/to/seo-automation/.env" npm run dev
-```
-
-Do not commit `.env.local` or any secret-bearing file.
-
-## Development
-
-```bash
 npm run dev
 ```
 
-Open:
+App öffnen:
 
 ```text
 http://127.0.0.1:5173/
 ```
 
-## Production Build
+Demo Notebook neu erzeugen:
 
 ```bash
-npm run build
-npm run serve
+npm run seed -- --reset
 ```
 
-## Verification
-
-Run the full local verification gate:
+## Commands
 
 ```bash
-npm run verify
+npm run dev          # local app/server
+npm run build        # production client build
+npm run serve        # production static server
+npm run seed         # create demo notebook
+npm test             # parser/retrieval/citation/artifact tests
+npm run verify       # button audit, build, lint, tests, server syntax check
+npm run smoke:api    # health check against a running local server
+npm run smoke:e2e    # create notebook, add source, ask, generate quiz via API
 ```
-
-This runs:
-
-- button action audit
-- TypeScript production build
-- ESLint
-- server syntax check
-
-With a local server running, check the API:
-
-```bash
-npm run smoke:api
-```
-
-To also call Claude:
-
-```bash
-SMOKE_CHAT=true npm run smoke:api
-```
-
-`SMOKE_CHAT=true` uses the configured Anthropic key and may consume API credits.
 
 ## Environment
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `ANTHROPIC_API_KEY` | Yes for LLM features | Server-side Claude API key. |
-| `ANTHROPIC_MODEL` | No | Defaults to `claude-haiku-4-5-20251001`. |
-| `PORT` | No | Defaults to `5173`. |
-| `BLOCKRESEARCH_ENV_PATHS` | No | Colon-separated local env file paths for private Blockresearch reuse. |
+Siehe [ENVIRONMENT.md](./ENVIRONMENT.md).
 
-## Current Product Boundaries
+Wichtige Variablen:
 
-This project intentionally implements the core NotebookLM-style workflows, but it does not claim feature parity with NotebookLM:
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_MODEL`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- `GOOGLE_API_KEY`
+- `GOOGLE_MODEL`
+- `ELEVENLABS_API_KEY`
+- `ELEVENLABS_VOICE_ID_HOST_A`
+- `ELEVENLABS_VOICE_ID_HOST_B`
+- `DATABASE_URL`
+- `REDIS_URL`
+- `STORAGE_DIR`
+- `DEFAULT_REASONING_PROVIDER`
+- `DEFAULT_EMBEDDING_PROVIDER`
 
-- PDF/DOCX/PPTX extraction is not production-grade yet.
-- URL import accepts pasted page text instead of full server-side article extraction.
-- Audio Overview is a browser speech playback experience, not a generated audio file.
-- Video Overview is a generated storyboard, not rendered video.
-- Notebook state is currently in-memory for the running browser session.
+API-Keys bleiben serverseitig. Ohne Provider-Keys nutzt die App reproduzierbare lokale Fallbacks.
 
-Recommended next production steps:
+## Local Storage
 
-1. Add persistent notebook storage.
-2. Add robust PDF/DOCX/PPTX/URL extraction.
-3. Add structured tests for API and browser flows.
-4. Add deploy target and GitHub Actions verification.
+Die App läuft vollständig lokal und benötigt keine externen Produktivdatenbanken. Persistenz liegt standardmäßig unter:
+
+```text
+.data/sourcestudio/
+```
+
+Der Ordner enthält Notebook State, importierte Dateien und Artefakt-Exports. Er ist gitignored.
+
+## Provider-Strategie
+
+Die App erkennt optionale Provider-Keys über lokale Environment-Variablen. Für reproduzierbare Tests und lokale Demo-Läufe steht ein deterministischer Fallback-Provider zur Verfügung. Die Architektur trennt Provider-Status, Model Runs und Generierung über einen Model Router. Bei gesetztem API-Key kann die Antwortgenerierung serverseitig über externe LLM-Provider laufen.
+
+Grounded Chat unterstützt externe LLM Provider über den Model Router. Der lokale Fallback bleibt für Tests und Offline-Demo verfügbar.
+
+Studio-Artefakte können ebenfalls über den Model Router generiert werden. Standardmäßig bleibt `artifact_generation` lokal, damit Studio-Klicks keine ungeplanten Providerkosten auslösen. Mit `SOURCESTUDIO_ARTIFACT_PROVIDER=anthropic`, `openai`, `google` oder `auto` erzeugt die App Reports, Mind Maps, Quizzes, Slides und weitere Studio-Payloads über den gewählten Provider, validiert die JSON-Struktur und hängt serverseitig die kanonischen Evidence-Pack-Citations an. Bei Providerfehlern fällt die Generierung automatisch auf den lokalen Artefaktgenerator zurück.
+
+## Grenzen des Prototyps
+
+Die App ist ein starker lokaler Interview-Slice, aber noch kein vollständig betriebenes SaaS-System. Für Produktion wären als nächste Schritte sinnvoll:
+
+- Postgres/pgvector statt lokalem Filesystem-Speicher.
+- Redis/Queue Worker statt synchroner lokaler Jobs.
+- produktive Embedding Provider statt lokaler Hash-Embeddings.
+- weitere LLM-Rollen pro Prompt über Anthropic/OpenAI/Gemini.
+- robusteres PDF/OCR/Layout-Parsing.
+- Auth, Multi-Tenant-Isolation und Deployment.
+- Monitoring, Rate Limits und Usage Accounting.
+
+## Dokumentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md)
+- [DECISIONS.md](./DECISIONS.md)
+- [DEMO_SCRIPT.md](./DEMO_SCRIPT.md)
+- [EVALUATION.md](./EVALUATION.md)
+- [ENVIRONMENT.md](./ENVIRONMENT.md)
+- [SUBMISSION_SUMMARY.md](./SUBMISSION_SUMMARY.md)
+- [TODO.md](./TODO.md)

@@ -1,2740 +1,3871 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ChangeEvent, FormEvent, ReactNode } from "react";
-import type { LucideIcon } from "lucide-react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import {
+  ArrowRight,
   AudioLines,
-  BookOpen,
   Bot,
-  Check,
+  CheckCircle,
+  CheckCircle2,
   ChevronDown,
+  Circle,
   ClipboardList,
   Compass,
-  Copy,
+  Database,
   Download,
   FileText,
-  FolderOpen,
   GitBranch,
-  GraduationCap,
-  Images,
+  Globe,
+  KeyRound,
+  Layers3,
   Library,
-  Link2,
+  ListChecks,
+  Loader2,
+  Lock,
+  LogOut,
+  Map,
+  Maximize2,
   MessageSquareText,
-  MoreHorizontal,
+  Minimize2,
+  MoreVertical,
   NotebookPen,
   PanelLeft,
-  Pause,
-  Play,
+  PlayCircle,
   Plus,
   Presentation,
-  Search,
+  RefreshCw,
   Send,
-  Settings2,
+  Settings,
   Share2,
+  ShieldCheck,
+  Shuffle,
   Sparkles,
-  StickyNote,
-  Target,
+  Table2,
   Trash2,
   UploadCloud,
-  UserRound,
+  Mail,
+  UserCircle,
+  UserPlus,
   Video,
-  X,
+  XCircle,
 } from "lucide-react";
 
-type SourceKind =
-  | "doc"
-  | "pdf"
-  | "url"
-  | "youtube"
-  | "text"
-  | "slide"
-  | "ebook"
-  | "image";
-
-type ChatRole = "assistant" | "user";
-type MobilePanel = "sources" | "chat" | "studio";
-type AddMode = "upload" | "paste" | "link" | "discover";
-type UtilityModal = "navigation" | "share" | "notebook" | "studio" | null;
-type ArtifactKind =
-  | "audio"
-  | "video"
-  | "mindmap"
+type SourceType = "markdown" | "text" | "pdf" | "url" | "note" | "docx" | "youtube" | "audio" | "google_doc";
+type SourceStatus = "pending" | "parsing" | "indexed" | "failed";
+type AnswerStyle = "Strict" | "Balanced" | "Exploratory";
+type ArtifactType =
   | "report"
+  | "mindmap"
   | "flashcards"
   | "quiz"
+  | "data-table"
+  | "slide-deck"
+  | "audio"
+  | "video"
   | "infographic";
+type AudioFormat = "deep_dive" | "brief" | "critique" | "debate";
+type AudioLength = "short" | "default" | "long";
+type FlashcardDifficulty = "mixed" | "easy" | "medium" | "hard";
+type FlashcardCountPreset = "fewer" | "standard" | "more";
+type FlashcardCardType = "concept" | "application" | "cloze" | "caveat" | "source-check" | "compare";
+type SourceMode = "active" | "selected" | "all";
+interface AudioOverviewOptions {
+  format: AudioFormat;
+  length: AudioLength;
+  language: string;
+  prompt: string;
+}
+interface FlashcardOptions {
+  topic: string;
+  difficulty: FlashcardDifficulty;
+  countPreset: FlashcardCountPreset;
+  count: number;
+  language: string;
+  audience: string;
+  cardTypes: FlashcardCardType[];
+  sourceMode: SourceMode;
+  selectedSourceIds: string[];
+}
+type MobilePanel = "sources" | "chat" | "studio";
+const AUTH_MODES = ["login", "signup", "reset-request", "reset-confirm"] as const;
+type AuthMode = (typeof AUTH_MODES)[number];
+type ApiInit = Parameters<typeof fetch>[1];
+const BRAND_NAME = "Nanas Block Research LM";
+const BRAND_EYEBROW = "Block Research AI";
+const BRAND_LOGO_PATH = "/brand/blockresearch-mark.svg";
+const ASSISTANT_NAME = "Block Research LM";
 
-type ArtifactStatus = "ready" | "draft";
+interface AuthUser {
+  id: string;
+  email: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string;
+}
+
+interface AuthResponse {
+  authenticated: boolean;
+  user: AuthUser;
+  session?: {
+    expires_at?: string;
+  };
+}
+
+interface AuthSessionResponse {
+  authenticated: boolean;
+  user: AuthUser | null;
+}
+
+interface PasswordResetResponse {
+  ok: boolean;
+  delivery: string;
+  expires_at?: string;
+  reset_token?: string;
+}
+
+interface MindMapNode {
+  id?: string;
+  label?: string;
+  type?: string;
+  source_refs?: Array<Record<string, unknown>>;
+}
+
+interface MindMapEdge {
+  id?: string;
+  source?: string;
+  target?: string;
+  label?: string;
+}
+
+interface FlashcardPayload {
+  id?: string;
+  card_type?: string;
+  learning_goal?: string;
+  question?: string;
+  answer?: string;
+  explanation?: string;
+  hint?: string;
+  difficulty?: string;
+  tags?: string[];
+  citation?: string;
+  evidence_id?: string;
+  evidence_quote?: string;
+  source_title?: string;
+  source_refs?: SourceRef[];
+  support_level?: string;
+  confidence?: number;
+  attempts?: number;
+  got_it_count?: number;
+  missed_count?: number;
+  review_state?: string;
+  last_reviewed_at?: string;
+  mastery_score?: number;
+  due_state?: string;
+}
+
+interface FlashcardProgressPayload {
+  total?: number;
+  active?: number;
+  deleted?: number;
+  reviewed?: number;
+  remaining?: number;
+  due?: number;
+  got_it?: number;
+  missed?: number;
+  mastery_score?: number;
+  session_complete?: boolean;
+}
+
+interface FlashcardProgress {
+  total: number;
+  active: number;
+  deleted: number;
+  reviewed: number;
+  remaining: number;
+  due: number;
+  got_it: number;
+  missed: number;
+  mastery_score: number;
+  session_complete: boolean;
+}
+
+interface SourceRef {
+  source_id?: string;
+  block_ids?: string[];
+  chunk_id?: string;
+  quote?: string;
+}
+
+interface FlashcardDeck {
+  id: string;
+  notebook_id: string;
+  artifact_id: string;
+  title: string;
+  options_json: Record<string, unknown>;
+  progress: FlashcardProgress;
+  cards: FlashcardPayload[];
+  source_coverage?: {
+    cited_source_count?: number;
+    cited_sources?: string[];
+  };
+}
+
+interface QuizPayload {
+  id?: string;
+  type?: string;
+  learning_goal?: string;
+  question?: string;
+  options?: string[];
+  correct_index?: number;
+  correct_answer?: string;
+  explanation?: string;
+  distractor_rationales?: string[];
+  source_refs?: Array<Record<string, unknown>>;
+  difficulty?: string;
+  citation?: string;
+  tags?: string[];
+  evidence_quote?: string;
+}
+
+interface TableRowPayload {
+  cells?: Record<string, unknown>;
+}
+
+interface SlidePayload {
+  title?: string;
+  subtitle?: string;
+  bullets?: string[];
+  speaker_notes?: string;
+  visual_suggestion?: string;
+  layout_type?: string;
+  citations?: Citation[];
+}
+
+interface TranscriptPayload {
+  host?: string;
+  text?: string;
+}
+
+interface StoryboardPayload {
+  scene?: number;
+  title?: string;
+  narration?: string;
+}
+
+interface ReportPointPayload {
+  text?: string;
+  citation?: string;
+}
+
+interface InfographicPanelPayload {
+  panel?: number;
+  headline?: string;
+  copy?: string;
+  citation?: string;
+  evidence_id?: string;
+  source_title?: string;
+  metric_label?: string;
+  metric_value?: string;
+}
+
+interface SourceBlock {
+  block_id: string;
+  source_id: string;
+  type: string;
+  text: string;
+  heading_path: string[];
+  order_index: number;
+}
+
+interface KnowledgeObject {
+  id: string;
+  type: string;
+  source_id: string;
+  data: Record<string, unknown>;
+}
 
 interface Source {
   id: string;
+  notebook_id: string;
+  type: SourceType;
   title: string;
-  kind: SourceKind;
-  body: string;
-  createdAt: number;
-  selected: boolean;
-  accent: string;
+  original_url: string;
+  status: SourceStatus;
+  cleaned_text: string;
+  metadata_json: Record<string, unknown>;
+  active: boolean;
+  block_count: number;
+  chunk_count: number;
+  word_count: number;
+  summary: string;
+  knowledge: KnowledgeObject[];
 }
 
 interface Citation {
   index: number;
-  sourceId: string;
-  sourceTitle: string;
+  evidence_id: string;
+  source_id: string;
+  sourceId?: string;
+  source_title: string;
+  sourceTitle?: string;
+  block_ids: string[];
+  chunk_id: string;
   quote: string;
+  heading_path: string[];
+  page_number?: number | null;
 }
 
 interface ChatMessage {
   id: string;
-  role: ChatRole;
+  role: "user" | "assistant";
   content: string;
-  createdAt: number;
+  created_at: string;
   citations?: Citation[];
   provider?: string;
   model?: string;
-  mode?: "llm" | "local";
+  mode?: string;
+  fallback_reason?: string;
+  claim_stats?: {
+    claims_checked: number;
+    supported: number;
+    partially_supported: number;
+    unsupported: number;
+    not_checkable: number;
+    citation_coverage?: number;
+    support_score?: number;
+  };
+}
+
+interface ArtifactEvidenceAudit {
+  status?: string;
+  evidence_pack_id?: string;
+  retrieval_run_id?: string;
+  retrieval_intent?: string;
+  query?: string;
+  evidence_items?: number;
+  cited_evidence_items?: number;
+  uncited_evidence_ids?: string[];
+  invalid_evidence_ids?: string[];
+  invalid_citation_count?: number;
+  evidence_coverage?: number;
+  active_source_count?: number;
+  source_count?: number;
+  cited_source_count?: number;
+  source_coverage?: number;
+  artifact_items?: number;
+  cited_artifact_items?: number;
+  item_citation_coverage?: number;
+  summary?: string;
+  constraints?: Record<string, unknown>;
+  top_sources?: Array<{
+    source_id?: string;
+    title?: string;
+    references?: number;
+    evidence_items?: number;
+    cited_items?: number;
+    coverage?: number;
+    support_types?: string[];
+  }>;
 }
 
 interface Artifact {
   id: string;
-  kind: ArtifactKind;
+  type: ArtifactType;
   title: string;
-  subtitle: string;
-  body: string;
-  createdAt: number;
-  sourceCount: number;
-  status: ArtifactStatus;
-  provider?: string;
-  model?: string;
+  content_json: Record<string, unknown>;
+  text_content: string;
+  file_path: string;
+  source_refs_json: Array<Record<string, unknown>>;
+  created_at: string;
 }
 
-interface Note {
+interface ArtifactJob {
+  id: string;
+  type: ArtifactType;
+  status: "queued" | "running" | "completed" | "failed";
+  progress: number;
+  result_artifact_id: string;
+  error: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+interface Notebook {
   id: string;
   title: string;
-  body: string;
-  createdAt: number;
-  pinned?: boolean;
+  description: string;
+  summary: string;
+  active_source_count: number;
+  source_count: number;
+  sources: Source[];
+  artifacts: Artifact[];
+  jobs: ArtifactJob[];
+  knowledge: KnowledgeObject[];
+  messages: ChatMessage[];
+  suggested_questions: string[];
+  suggested_artifacts: ArtifactType[];
 }
 
-interface RankedSnippet {
-  source: Source;
-  text: string;
-  score: number;
+interface ProviderStatus {
+  anthropic: boolean;
+  openai: boolean;
+  google: boolean;
+  elevenlabs: boolean;
+  database: boolean;
+  redis: boolean;
+  storage: string;
+  storage_dir: string;
+  available_reasoning_providers: string[];
+  active_grounded_answer_provider: string;
+  grounded_answer_model: string;
+  external_grounded_answer_enabled: boolean;
 }
 
-interface LlmHealth {
-  configured: boolean;
+interface DebugJob {
+  id: string;
+  notebook_id: string;
+  type: ArtifactType;
+  status: ArtifactJob["status"];
+  progress: number;
+  result_artifact_id: string;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DebugModelRun {
+  id: string;
+  role: string;
   provider: string;
   model: string;
+  status: string;
+  input_tokens_estimate: number;
+  output_tokens_estimate: number;
+  latency_ms: number;
+  error: string;
+  created_at: string;
 }
 
-interface ApiChatResponse {
-  content: string;
-  citations?: Citation[];
-  provider?: string;
-  model?: string;
+interface DebugEvent {
+  id: string;
+  timestamp: string;
+  level: "debug" | "info" | "warn" | "error";
+  event: string;
+  details: Record<string, unknown>;
 }
 
-interface ApiArtifactResponse {
-  title?: string;
-  subtitle?: string;
+interface DebugSnapshot {
+  server_time: string;
+  storage_dir: string;
+  provider: ProviderStatus;
+  counts: Record<string, number>;
+  running_jobs: DebugJob[];
+  failed_jobs: DebugJob[];
+  recent_jobs: DebugJob[];
+  recent_model_runs: DebugModelRun[];
+  recent_messages: Array<Record<string, unknown>>;
+}
+
+interface DebugStatusResponse {
+  debug: DebugSnapshot;
+  events: DebugEvent[];
+}
+
+interface SourceForm {
+  type: SourceType;
+  title: string;
+  original_url: string;
   body: string;
-  provider?: string;
-  model?: string;
+  file_name?: string;
+  mime_type?: string;
+  base64?: string;
 }
 
-interface ApiDiscoverResponse {
-  sources: Array<{
-    title: string;
-    kind: SourceKind;
-    body: string;
-  }>;
-  provider?: string;
-  model?: string;
-}
-
-const ACCENTS = [
-  "#0fd070",
-  "#aa9fff",
-  "#dcbd4f",
-  "#74ccf4",
-  "#2bb673",
-  "#daab4e",
-];
-
-const STOP_WORDS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "as",
-  "at",
-  "be",
-  "by",
-  "for",
-  "from",
-  "how",
-  "i",
-  "in",
-  "is",
-  "it",
-  "me",
-  "of",
-  "on",
-  "or",
-  "our",
-  "the",
-  "this",
-  "to",
-  "was",
-  "we",
-  "what",
-  "when",
-  "where",
-  "which",
-  "with",
-  "you",
-]);
-
-const sampleSources: Source[] = [
-  {
-    id: "source-release-brief",
-    title: "Notebook research workspace brief",
-    kind: "doc",
-    createdAt: Date.now() - 1000 * 60 * 60 * 24 * 2,
-    selected: true,
-    accent: ACCENTS[0],
-    body: `NotebookLM-style research workspaces are organized around three core activities: collecting sources, asking grounded questions, and generating new study or communication assets.
-
-Sources can include documents, links, video transcripts, ebooks, slides, and notes. Users expect to select which sources are active for a chat so the answer stays grounded in the right material.
-
-The chat experience should clearly show when an answer is based on sources. Citations are critical because researchers need to inspect the exact evidence before trusting a summary or using it in finished work.
-
-The Studio surface turns selected sources into artifacts such as audio overviews, video overviews, mind maps, reports, study guides, flashcards, quizzes, slide decks, and infographics. Multiple outputs of the same type should be stored for later review.
-
-Long-term projects benefit from saved conversation history, reusable notes, and configurable chat goals. A project may need a tutor, analyst, editor, debate partner, or briefing assistant depending on the moment.`,
-  },
-  {
-    id: "source-interviews",
-    title: "Customer interview synthesis",
-    kind: "text",
-    createdAt: Date.now() - 1000 * 60 * 60 * 8,
-    selected: true,
-    accent: ACCENTS[1],
-    body: `Interviewees described the best research tools as calm, dense, and easy to scan. They want the left side to hold source management, the center to preserve the conversation, and the right side to collect outputs without interrupting the main task.
-
-The most repeated frustration was uncertainty. Users do not want a generic chatbot that answers from memory. They want a clear source count, obvious citations, and a fast way to open the original material.
-
-Teams asked for share controls, stable project history, output export, and a way to create several versions of the same artifact. A product manager might create a short report for executives and a longer study guide for the product team from the same source collection.
-
-Students wanted flashcards and quizzes that remember progress across sessions. Analysts wanted mind maps to reveal relationships across dense PDFs and transcripts. Content teams wanted infographics and presentations with quick revision instructions.`,
-  },
-  {
-    id: "source-video",
-    title: "Design review meeting transcript",
-    kind: "youtube",
-    createdAt: Date.now() - 1000 * 60 * 28,
-    selected: true,
-    accent: ACCENTS[2],
-    body: `The design review opened with a reminder that the app should feel like a working surface, not a marketing page. The first screen should be the product: sources, chat, and studio visible together on desktop.
-
-The team agreed to keep the visual system close to modern Material patterns: soft panels, clear borders, rounded controls, compact density, and color used for status or source identity. Oversized hero content was rejected because the target user is already inside a research workflow.
-
-For responsiveness, the three-panel desktop layout should become a tabbed mobile workspace. The active tab should preserve context and avoid forcing users to reload or lose draft questions.
-
-The review also called out trust details: every generated answer needs an AI or local-generation disclosure, and destructive actions need clear labels. Empty states should offer direct actions rather than explaining the whole product.`,
-  },
-];
-
-const initialMessages: ChatMessage[] = [
-  {
-    id: "message-welcome",
-    role: "assistant",
-    createdAt: Date.now() - 1000 * 60 * 10,
-    content:
-      "Workspace ready. Answers are grounded in the selected source set and include citations when matching evidence is found.",
-  },
-];
-
-const initialArtifacts: Artifact[] = [
-  {
-    id: "artifact-briefing",
-    kind: "report",
-    title: "Workspace briefing",
-    subtitle: "Generated from 3 selected sources",
-    createdAt: Date.now() - 1000 * 60 * 7,
-    sourceCount: 3,
-    status: "ready",
-    body: `# Workspace briefing
-
-The research workspace should prioritize grounded answers, visible source control, and reusable outputs.
-
-Key points:
-- Keep Sources, Chat, and Studio visible together on desktop.
-- Make citations and selected source count impossible to miss.
-- Store multiple outputs per artifact type for long-running projects.
-- Treat mobile as a tabbed workspace rather than a reduced landing page.
-
-Recommended next step: test the upload and chat loop with a dense source collection.`,
-  },
-];
-
-const initialNotes: Note[] = [
-  {
-    id: "note-source-grounding",
-    title: "Source grounding",
-    createdAt: Date.now() - 1000 * 60 * 22,
-    pinned: true,
-    body: "Answers should show the selected source count and citations so the user can inspect the evidence before trusting a generated summary.",
-  },
-];
-
-const sourceKindConfig: Record<
-  SourceKind,
-  { label: string; icon: LucideIcon }
-> = {
-  doc: { label: "Doc", icon: FileText },
-  pdf: { label: "PDF", icon: FileText },
-  url: { label: "Website", icon: Link2 },
-  youtube: { label: "Video", icon: Video },
-  text: { label: "Text", icon: NotebookPen },
-  slide: { label: "Slides", icon: Presentation },
-  ebook: { label: "EPUB", icon: BookOpen },
-  image: { label: "Image", icon: Images },
+const emptySourceForm: SourceForm = {
+  type: "markdown",
+  title: "",
+  original_url: "",
+  body: "",
 };
 
-const artifactConfig: Record<
-  ArtifactKind,
-  {
-    title: string;
-    action: string;
-    description: string;
-    icon: LucideIcon;
+const artifactTypes: Array<{
+  type: ArtifactType;
+  title: string;
+  action: string;
+  icon: ReactNode;
+}> = [
+  { type: "audio", title: "Audio Overview", action: "Script", icon: <AudioLines size={18} /> },
+  { type: "slide-deck", title: "Slide Deck", action: "Beta", icon: <Presentation size={18} /> },
+  { type: "video", title: "Video Overview", action: "Storyboard", icon: <Video size={18} /> },
+  { type: "mindmap", title: "Mind Map", action: "Map", icon: <Map size={18} /> },
+  { type: "report", title: "Reports", action: "Write", icon: <ClipboardList size={18} /> },
+  { type: "flashcards", title: "Flashcards", action: "Cards", icon: <Layers3 size={18} /> },
+  { type: "quiz", title: "Quiz", action: "Test", icon: <ListChecks size={18} /> },
+  { type: "infographic", title: "Infographic", action: "Beta", icon: <Sparkles size={18} /> },
+  { type: "data-table", title: "Data Table", action: "Extract", icon: <Table2 size={18} /> },
+];
+
+const sourceTypeOptions: Array<{ type: SourceType; label: string }> = [
+  { type: "markdown", label: "Document" },
+  { type: "note", label: "Note" },
+  { type: "url", label: "Website" },
+  { type: "youtube", label: "YouTube" },
+  { type: "google_doc", label: "Google Doc" },
+  { type: "pdf", label: "PDF" },
+  { type: "docx", label: "DOCX" },
+  { type: "audio", label: "Audio" },
+];
+
+const audioFormatOptions: Array<{ value: AudioFormat; label: string }> = [
+  { value: "deep_dive", label: "Deep Dive" },
+  { value: "brief", label: "Brief" },
+  { value: "critique", label: "Critique" },
+  { value: "debate", label: "Debate" },
+];
+
+const audioLengthOptions: Array<{ value: AudioLength; label: string }> = [
+  { value: "default", label: "Default" },
+  { value: "short", label: "Shorter" },
+  { value: "long", label: "Longer" },
+];
+
+const audioLanguageOptions = ["English", "German", "Spanish", "French", "Italian"];
+const flashcardDifficultyOptions: Array<{ value: FlashcardDifficulty; label: string }> = [
+  { value: "mixed", label: "Mixed" },
+  { value: "easy", label: "Easy" },
+  { value: "medium", label: "Medium" },
+  { value: "hard", label: "Hard" },
+];
+const flashcardCountOptions: Array<{ value: FlashcardCountPreset; label: string; count: number }> = [
+  { value: "fewer", label: "Fewer", count: 6 },
+  { value: "standard", label: "Standard", count: 10 },
+  { value: "more", label: "More", count: 16 },
+];
+const flashcardCardTypeOptions: Array<{ value: FlashcardCardType; label: string }> = [
+  { value: "concept", label: "Concept" },
+  { value: "application", label: "Apply" },
+  { value: "cloze", label: "Cloze" },
+  { value: "caveat", label: "Caveat" },
+  { value: "source-check", label: "Source check" },
+  { value: "compare", label: "Compare" },
+];
+const sourceModeOptions: Array<{ value: SourceMode; label: string }> = [
+  { value: "active", label: "Active" },
+  { value: "selected", label: "Selected" },
+  { value: "all", label: "All" },
+];
+
+const defaultAudioOverviewOptions: AudioOverviewOptions = {
+  format: "deep_dive",
+  length: "default",
+  language: "English",
+  prompt: "",
+};
+
+const defaultFlashcardOptions: FlashcardOptions = {
+  topic: "",
+  difficulty: "mixed",
+  countPreset: "standard",
+  count: 10,
+  language: "English",
+  audience: "general",
+  cardTypes: ["concept", "application", "cloze", "caveat", "source-check", "compare"],
+  sourceMode: "active",
+  selectedSourceIds: [],
+};
+
+function initialAuthState(): { mode: AuthMode; token: string } {
+  const hash = window.location.hash || "";
+  if (hash.startsWith("#reset-password=")) {
+    return { mode: "reset-confirm", token: decodeURIComponent(hash.replace("#reset-password=", "")) };
   }
-> = {
-  audio: {
-    title: "Audio Overview",
-    action: "Generate",
-    description: "Podcast-style discussion with playable controls.",
-    icon: AudioLines,
-  },
-  video: {
-    title: "Video Overview",
-    action: "Generate",
-    description: "Narrated visual outline with scenes and chapters.",
-    icon: Video,
-  },
-  mindmap: {
-    title: "Mind Map",
-    action: "Create",
-    description: "Relationship map from selected source themes.",
-    icon: GitBranch,
-  },
-  report: {
-    title: "Report",
-    action: "Write",
-    description: "Briefing doc, study guide, or analysis summary.",
-    icon: ClipboardList,
-  },
-  flashcards: {
-    title: "Flashcards",
-    action: "Build",
-    description: "Question and answer cards that track review.",
-    icon: GraduationCap,
-  },
-  quiz: {
-    title: "Quiz",
-    action: "Build",
-    description: "Multiple-choice checks based on your material.",
-    icon: Check,
-  },
-  infographic: {
-    title: "Infographic",
-    action: "Draft",
-    description: "Visual summary in structured content blocks.",
-    icon: Images,
-  },
-};
+  if (hash.startsWith("#reset-password?")) {
+    const params = new URLSearchParams(hash.replace("#reset-password?", ""));
+    return { mode: "reset-confirm", token: params.get("token") || "" };
+  }
+  return { mode: "login", token: "" };
+}
 
-const promptSuggestions = [
-  "Summarize the selected sources with citations",
-  "What should I create in Studio first?",
-  "Where do the sources disagree?",
-  "Turn this into a study plan",
-];
+function isAuthMode(value: unknown): value is AuthMode {
+  return typeof value === "string" && AUTH_MODES.includes(value as AuthMode);
+}
 
-function App() {
-  const [notebookTitle, setNotebookTitle] = useState("Customer discovery sprint");
-  const [sources, setSources] = useState<Source[]>(sampleSources);
-  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
-  const [artifacts, setArtifacts] = useState<Artifact[]>(initialArtifacts);
-  const [notes, setNotes] = useState<Note[]>(initialNotes);
-  const [activeSourceId, setActiveSourceId] = useState(sampleSources[0].id);
-  const [activeArtifactId, setActiveArtifactId] = useState(initialArtifacts[0].id);
-  const [question, setQuestion] = useState("");
-  const [sourceSearch, setSourceSearch] = useState("");
-  const [isAddOpen, setIsAddOpen] = useState(false);
-  const [addMode, setAddMode] = useState<AddMode>("upload");
-  const [isConfigureOpen, setIsConfigureOpen] = useState(false);
+function normalizeAuthMode(value: unknown): AuthMode {
+  return isAuthMode(value) ? value : "login";
+}
+
+function flashcardArtifactOptions(options: FlashcardOptions) {
+  return {
+    topic: options.topic.trim(),
+    difficulty: options.difficulty,
+    count_preset: options.countPreset,
+    count: options.count,
+    language: options.language,
+    audience: options.audience.trim() || "general",
+    card_types: options.cardTypes,
+    source_mode: options.sourceMode,
+    selected_source_ids: options.sourceMode === "selected" ? options.selectedSourceIds : [],
+  };
+}
+
+export default function App() {
+  const [showLanding, setShowLanding] = useState(() => window.location.hash !== "#workspace");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authMode, setAuthMode] = useState<AuthMode>(() => initialAuthState().mode);
+  const [resetToken, setResetToken] = useState(() => initialAuthState().token);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [notebook, setNotebook] = useState<Notebook | null>(null);
+  const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
-  const [chatGoal, setChatGoal] = useState(
-    "Act as a research partner. Prioritize concise answers with citations.",
-  );
-  const [chatPersona, setChatPersona] = useState("Research analyst");
-  const [answerStyle, setAnswerStyle] = useState("Balanced");
-  const [quickNote, setQuickNote] = useState("");
-  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
-  const [utilityModal, setUtilityModal] = useState<UtilityModal>(null);
-  const [llmHealth, setLlmHealth] = useState<LlmHealth | null>(null);
+  const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
+  const [activeSourceId, setActiveSourceId] = useState("");
+  const [sourceBlocks, setSourceBlocks] = useState<SourceBlock[]>([]);
+  const [highlightedBlockIds, setHighlightedBlockIds] = useState<string[]>([]);
+  const [question, setQuestion] = useState("");
+  const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("Balanced");
+  const [selectedArtifactId, setSelectedArtifactId] = useState("");
+  const [audioOptions, setAudioOptions] = useState<AudioOverviewOptions>(defaultAudioOverviewOptions);
+  const [flashcardOptions, setFlashcardOptions] = useState<FlashcardOptions>(defaultFlashcardOptions);
+  const [isArtifactDetailOpen, setIsArtifactDetailOpen] = useState(false);
+  const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
+  const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<"" | "settings" | "account" | "notebooks">("");
+  const [isDebugOpen, setIsDebugOpen] = useState(false);
+  const [debugStatus, setDebugStatus] = useState<DebugStatusResponse | null>(null);
+  const [isBooting, setIsBooting] = useState(true);
+  const [isAddingSource, setIsAddingSource] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
-  const [generatingKind, setGeneratingKind] = useState<ArtifactKind | null>(null);
+  const [isCreatingArtifact, setIsCreatingArtifact] = useState<ArtifactType | "">("");
   const [toast, setToast] = useState("");
-  const speechRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const [error, setError] = useState("");
+  const [sourceFormNotice, setSourceFormNotice] = useState("");
+  const didBootRef = useRef(false);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+  const sourceBodyRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const activeSource = useMemo(
+    () => notebook?.sources.find((source) => source.id === activeSourceId) || notebook?.sources[0] || null,
+    [activeSourceId, notebook],
+  );
+  const selectedArtifact = useMemo(
+    () =>
+      notebook?.artifacts.find((artifact) => artifact.id === selectedArtifactId) ||
+      notebook?.artifacts[0] ||
+      null,
+    [notebook, selectedArtifactId],
+  );
+  const latestAssistant = useMemo(
+    () => [...(notebook?.messages || [])].reverse().find((message) => message.role === "assistant"),
+    [notebook?.messages],
+  );
+  const topicMap = useMemo(
+    () => notebook?.knowledge.find((item) => item.type === "topic_map")?.data?.topics as Array<{ label: string; weight: number }> | undefined,
+    [notebook],
+  );
+  const isSourceReady = useMemo(() => {
+    const body = sourceForm.body.trim();
+    const url = sourceForm.original_url.trim();
+    const hasFile = Boolean(sourceForm.base64);
+    if (sourceNeedsUrl(sourceForm.type)) return Boolean(url || body);
+    if (sourceAcceptsFile(sourceForm.type)) return Boolean(hasFile || body);
+    return Boolean(body || hasFile);
+  }, [sourceForm]);
 
   useEffect(() => {
-    let isMounted = true;
-    fetch("/api/health")
-      .then((response) => response.json())
-      .then((health: LlmHealth) => {
-        if (isMounted) setLlmHealth(health);
-      })
-      .catch(() => {
-        if (isMounted) {
-          setLlmHealth({ configured: false, provider: "Claude", model: "unavailable" });
-        }
-      });
-    return () => {
-      isMounted = false;
-    };
+    if (didBootRef.current) return;
+    didBootRef.current = true;
+    void boot();
+    // boot intentionally runs once to initialize persisted notebook state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!toast) return;
-    const timeout = window.setTimeout(() => setToast(""), 2600);
-    return () => window.clearTimeout(timeout);
-  }, [toast]);
+    if (notebook?.sources.length && !activeSourceId) {
+      setActiveSourceId(notebook.sources[0].id);
+    }
+  }, [activeSourceId, notebook]);
 
-  const selectedSources = useMemo(
-    () => sources.filter((source) => source.selected),
-    [sources],
-  );
+  useEffect(() => {
+    if (!activeSourceId) return;
+    void loadSourceBlocks(activeSourceId);
+  }, [activeSourceId]);
 
-  const activeSource = useMemo(
-    () => sources.find((source) => source.id === activeSourceId) ?? sources[0],
-    [activeSourceId, sources],
-  );
+  useEffect(() => {
+    const messagesNode = messagesRef.current;
+    if (!messagesNode) return;
+    messagesNode.scrollTop = messagesNode.scrollHeight;
+  }, [notebook?.messages.length, isAsking]);
 
-  const filteredSources = useMemo(() => {
-    const query = sourceSearch.trim().toLowerCase();
-    if (!query) return sources;
-    return sources.filter((source) => {
-      return (
-        source.title.toLowerCase().includes(query) ||
-        source.body.toLowerCase().includes(query) ||
-        sourceKindConfig[source.kind].label.toLowerCase().includes(query)
-      );
-    });
-  }, [sourceSearch, sources]);
-
-  const activeArtifact = useMemo(
-    () =>
-      artifacts.find((artifact) => artifact.id === activeArtifactId) ??
-      artifacts[0],
-    [activeArtifactId, artifacts],
-  );
-
-  const selectedWordCount = useMemo(
-    () =>
-      selectedSources.reduce(
-        (total, source) => total + countWords(source.body),
-        0,
-      ),
-    [selectedSources],
-  );
-
-  const handleToggleSource = (sourceId: string) => {
-    setSources((currentSources) =>
-      currentSources.map((source) =>
-        source.id === sourceId
-          ? { ...source, selected: !source.selected }
-          : source,
-      ),
-    );
-  };
-
-  const handleSelectAllSources = () => {
-    const shouldSelectAll = selectedSources.length !== sources.length;
-    setSources((currentSources) =>
-      currentSources.map((source) => ({
-        ...source,
-        selected: shouldSelectAll,
-      })),
-    );
-  };
-
-  const handleDeleteSource = (sourceId: string) => {
-    setSources((currentSources) => {
-      const nextSources = currentSources.filter((source) => source.id !== sourceId);
-      if (activeSourceId === sourceId && nextSources.length) {
-        setActiveSourceId(nextSources[0].id);
+  useEffect(() => {
+    if (!authUser || showLanding) return;
+    let isCancelled = false;
+    async function refreshDebug() {
+      try {
+        const status = await api<DebugStatusResponse>("/api/debug/status?limit=140");
+        if (!isCancelled) setDebugStatus(status);
+      } catch {
+        if (!isCancelled) setDebugStatus(null);
       }
-      return nextSources;
-    });
-  };
-
-  const handleAddSources = (incomingSources: Source[]) => {
-    if (!incomingSources.length) return;
-    setSources((currentSources) => [...incomingSources, ...currentSources]);
-    setActiveSourceId(incomingSources[0].id);
-    setIsAddOpen(false);
-    setMobilePanel("sources");
-  };
-
-  const handleAsk = async (event?: FormEvent<HTMLFormElement>) => {
-    event?.preventDefault();
-    const cleanQuestion = question.trim();
-    if (!cleanQuestion || isAsking) return;
-
-    const userMessage: ChatMessage = {
-      id: makeId("message"),
-      role: "user",
-      content: cleanQuestion,
-      createdAt: Date.now(),
+    }
+    void refreshDebug();
+    const timer = window.setInterval(() => void refreshDebug(), 3500);
+    return () => {
+      isCancelled = true;
+      window.clearInterval(timer);
     };
+  }, [authUser, showLanding]);
 
-    const priorMessages = messages;
-    setMessages((currentMessages) => [...currentMessages, userMessage]);
-    setQuestion("");
-    setMobilePanel("chat");
-    setIsAsking(true);
-
+  async function boot() {
+    setIsBooting(true);
+    setError("");
     try {
-      const response = await askClaudeForAnswer({
-        question: cleanQuestion,
-        selectedSources,
-        chatGoal,
-        chatPersona,
-        answerStyle,
-        history: priorMessages,
+      const health = await api<{ providers: ProviderStatus }>("/api/health");
+      setProviderStatus(health.providers);
+      const session = await api<AuthSessionResponse>("/api/auth/session");
+      setAuthUser(session.authenticated ? session.user : null);
+      if (!session.authenticated || !session.user) {
+        setNotebook(null);
+        setActiveSourceId("");
+        setSelectedArtifactId("");
+        return;
+      }
+      await loadWorkspaceData();
+    } catch (bootError) {
+      setError(messageFromError(bootError));
+    } finally {
+      setAuthChecked(true);
+      setIsBooting(false);
+    }
+  }
+
+  async function loadWorkspaceData() {
+    const list = await api<{ notebooks: Notebook[] }>("/api/notebooks");
+    if (list.notebooks.length) {
+      setNotebooks(list.notebooks);
+      setNotebook(await loadNotebook(list.notebooks[0].id));
+    } else {
+      const seeded = await api<{ notebook: Notebook }>("/api/seed", {
+        method: "POST",
+        body: JSON.stringify({ reset: false }),
       });
-      const assistantMessage: ChatMessage = {
-        id: makeId("message"),
-        role: "assistant",
-        content: response.content,
-        citations: response.citations,
-        provider: response.provider,
-        model: response.model,
-        mode: "llm",
-        createdAt: Date.now(),
-      };
-      setMessages((currentMessages) => [...currentMessages, assistantMessage]);
-    } catch (error) {
-      const generated = createGroundedResponse(
-        cleanQuestion,
-        selectedSources,
-        chatGoal,
-        chatPersona,
-        answerStyle,
+      setNotebooks([seeded.notebook]);
+      setNotebook(seeded.notebook);
+      setToast("Seed notebook created.");
+    }
+  }
+
+  async function refreshNotebookList() {
+    try {
+      const list = await api<{ notebooks: Notebook[] }>("/api/notebooks");
+      setNotebooks(list.notebooks);
+    } catch {
+      // notebook list is non-critical chrome; ignore refresh failures.
+    }
+  }
+
+  async function createNotebook() {
+    setOpenMenu("");
+    setError("");
+    setIsBooting(true);
+    try {
+      const created = await api<{ notebook: Notebook }>("/api/notebooks", {
+        method: "POST",
+        body: JSON.stringify({ title: "Untitled notebook" }),
+      });
+      const loaded = await loadNotebook(created.notebook.id);
+      setNotebook(loaded);
+      setActiveSourceId("");
+      setSelectedArtifactId("");
+      await refreshNotebookList();
+      setToast("New notebook created.");
+    } catch (createError) {
+      setError(messageFromError(createError));
+    } finally {
+      setIsBooting(false);
+    }
+  }
+
+  async function switchNotebook(id: string) {
+    setOpenMenu("");
+    if (!id || id === notebook?.id) return;
+    setError("");
+    setIsBooting(true);
+    try {
+      const loaded = await loadNotebook(id);
+      setNotebook(loaded);
+      setActiveSourceId(loaded.sources[0]?.id || "");
+      setSelectedArtifactId("");
+    } catch (switchError) {
+      setError(messageFromError(switchError));
+    } finally {
+      setIsBooting(false);
+    }
+  }
+
+  function openAddSource(type: SourceType = "markdown") {
+    setSourceForm({ ...emptySourceForm, type });
+    setSourceFormNotice("");
+    setIsAddSourceOpen(true);
+    window.requestAnimationFrame(() => sourceBodyRef.current?.focus());
+  }
+
+  async function setAllSourcesActive(active: boolean) {
+    if (!notebook) return;
+    setError("");
+    const targets = notebook.sources.filter((source) => source.active !== active);
+    if (!targets.length) return;
+    try {
+      await Promise.all(
+        targets.map((source) =>
+          api(`/api/sources/${source.id}/active`, {
+            method: "PATCH",
+            body: JSON.stringify({ active }),
+          }),
+        ),
       );
-      const assistantMessage: ChatMessage = {
-        id: makeId("message"),
-        role: "assistant",
-        content: `${generated.content}\n\nLLM status: ${getErrorMessage(error)} The local grounded fallback answered from selected source snippets.`,
-        citations: generated.citations,
-        provider: "Local fallback",
-        mode: "local",
-        createdAt: Date.now(),
-      };
-      setMessages((currentMessages) => [...currentMessages, assistantMessage]);
-      setToast("Claude was unavailable; local fallback used.");
+      await refreshNotebook();
+      refreshDebugSilently();
+    } catch (toggleError) {
+      setError(messageFromError(toggleError));
+    }
+  }
+
+  async function loadDebugStatus() {
+    const status = await api<DebugStatusResponse>("/api/debug/status?limit=180");
+    setDebugStatus(status);
+    return status;
+  }
+
+  function refreshDebugSilently() {
+    void loadDebugStatus().catch(() => undefined);
+  }
+
+  async function handleAuthSuccess(response: AuthResponse) {
+    setAuthUser(response.user);
+    setAuthChecked(true);
+    setError("");
+    setShowLanding(false);
+    setMobilePanel("chat");
+    window.history.replaceState(null, "", "#workspace");
+    setIsBooting(true);
+    try {
+      await loadWorkspaceData();
+      refreshDebugSilently();
+    } catch (authError) {
+      setError(messageFromError(authError));
+    } finally {
+      setIsBooting(false);
+    }
+  }
+
+  async function handleLogout() {
+    setError("");
+    try {
+      await api<{ ok: boolean }>("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+    } finally {
+      setAuthUser(null);
+      setNotebook(null);
+      setActiveSourceId("");
+      setSelectedArtifactId("");
+      setShowLanding(true);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }
+
+  async function refreshNotebook(id = notebook?.id) {
+    if (!id) return;
+    setNotebook(await loadNotebook(id));
+  }
+
+  async function loadNotebook(id: string) {
+    const response = await api<{ notebook: Notebook }>(`/api/notebooks/${id}`);
+    return response.notebook;
+  }
+
+  async function loadSourceBlocks(sourceId: string) {
+    try {
+      const response = await api<{ blocks: SourceBlock[] }>(`/api/sources/${sourceId}/blocks`);
+      setSourceBlocks(response.blocks);
+    } catch (blockError) {
+      setError(messageFromError(blockError));
+    }
+  }
+
+  async function handleSeedReset() {
+    setIsBooting(true);
+    setError("");
+    try {
+      const seeded = await api<{ notebook: Notebook }>("/api/seed", {
+        method: "POST",
+        body: JSON.stringify({ reset: true }),
+      });
+      setNotebook(seeded.notebook);
+      setActiveSourceId(seeded.notebook.sources[0]?.id || "");
+      setSelectedArtifactId(seeded.notebook.artifacts[0]?.id || "");
+      setToast("Demo notebook rebuilt.");
+      refreshDebugSilently();
+    } catch (seedError) {
+      setError(messageFromError(seedError));
+    } finally {
+      setIsBooting(false);
+    }
+  }
+
+  async function handleSourceSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!notebook) return;
+    if (!isSourceReady) {
+      const notice = sourceNeedsUrl(sourceForm.type)
+        ? `Add a ${sourceTypeLabel(sourceForm.type)} URL or paste fallback text first.`
+        : sourceAcceptsFile(sourceForm.type)
+          ? `Choose a ${sourceTypeLabel(sourceForm.type)} file or paste extracted text first.`
+          : "Paste source text or choose a file first.";
+      setSourceFormNotice(notice);
+      sourceBodyRef.current?.focus();
+      return;
+    }
+    setIsAddingSource(true);
+    setError("");
+    setSourceFormNotice("");
+    try {
+      const response = await api<{ source: Source }>(`/api/notebooks/${notebook.id}/sources`, {
+        method: "POST",
+        body: JSON.stringify({
+          type: sourceForm.type,
+          title: sourceForm.title.trim() || undefined,
+          body: sourceForm.body.trim(),
+          original_url: sourceForm.original_url.trim(),
+          file_name: sourceForm.file_name,
+          mime_type: sourceForm.mime_type,
+          base64: sourceForm.base64,
+          active: true,
+        }),
+      });
+      setActiveSourceId(response.source.id);
+      setSourceForm(emptySourceForm);
+      setIsAddSourceOpen(false);
+      await refreshNotebook();
+      setToast("Source added. Parsing and indexing into your notebook.");
+      refreshDebugSilently();
+    } catch (sourceError) {
+      setError(messageFromError(sourceError));
+    } finally {
+      setIsAddingSource(false);
+    }
+  }
+
+  async function handleFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const base64 = await fileToBase64(file);
+    const text = file.type.includes("text") || file.name.endsWith(".md") ? await file.text() : "";
+    setSourceFormNotice("");
+    setSourceForm((current) => ({
+      ...current,
+      type: sourceTypeFromFile(file),
+      title: current.title || file.name.replace(/\.[^.]+$/, ""),
+      file_name: file.name,
+      mime_type: file.type || "application/octet-stream",
+      base64,
+      body: text || current.body,
+    }));
+  }
+
+  async function toggleSource(source: Source) {
+    setError("");
+    await api(`/api/sources/${source.id}/active`, {
+      method: "PATCH",
+      body: JSON.stringify({ active: !source.active }),
+    });
+    await refreshNotebook();
+    refreshDebugSilently();
+  }
+
+  async function deleteSource(source: Source) {
+    setError("");
+    await api(`/api/sources/${source.id}`, { method: "DELETE" });
+    if (activeSourceId === source.id) setActiveSourceId("");
+    await refreshNotebook();
+    setToast("Source removed from notebook and indexes.");
+    refreshDebugSilently();
+  }
+
+  async function askQuestion(input = question) {
+    if (!notebook || !input.trim()) return;
+    setIsAsking(true);
+    setError("");
+    setQuestion("");
+    try {
+      const response = await api<{
+        message: ChatMessage;
+        evidence_pack: { active_source_ids: string[] };
+      }>("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          notebook_id: notebook.id,
+          question: input,
+          answer_style: answerStyle,
+          chat_goal: "Source-only mode. Cite every factual claim.",
+        }),
+      });
+      await refreshNotebook();
+      const firstCitation = response.message.citations?.[0];
+      if (firstCitation) focusCitation(firstCitation);
+      setToast(
+        response.message.mode === "abstained"
+          ? "Source-only mode abstained because evidence was insufficient."
+          : "Answer grounded and verified.",
+      );
+      refreshDebugSilently();
+    } catch (chatError) {
+      setError(messageFromError(chatError));
     } finally {
       setIsAsking(false);
     }
-  };
+  }
 
-  const handleSuggestion = (suggestion: string) => {
-    setQuestion(suggestion);
-  };
-
-  const handleGenerateArtifact = async (kind: ArtifactKind) => {
-    if (generatingKind) return;
-    setGeneratingKind(kind);
-    setMobilePanel("studio");
-    const title = `${artifactConfig[kind].title} ${artifacts.length + 1}`;
+  async function createArtifact(type: ArtifactType) {
+    if (!notebook) return;
+    setIsCreatingArtifact(type);
+    setError("");
     try {
-      const response = await createClaudeArtifact({
-        kind,
-        title,
-        selectedSources,
-        notes,
-      });
-      const artifact: Artifact = {
-        id: makeId("artifact"),
-        kind,
-        title: response.title || title,
-        subtitle:
-          response.subtitle ||
-          `Generated by ${response.provider || "Claude"} from ${selectedSources.length} selected source${selectedSources.length === 1 ? "" : "s"}`,
-        sourceCount: selectedSources.length,
-        body: response.body,
-        status: "ready",
-        provider: response.provider,
-        model: response.model,
-        createdAt: Date.now(),
-      };
-      setArtifacts((currentArtifacts) => [artifact, ...currentArtifacts]);
-      setActiveArtifactId(artifact.id);
-      setToast(`${artifactConfig[kind].title} generated with Claude.`);
-    } catch (error) {
-      const artifact = {
-        ...createArtifact(kind, selectedSources, artifacts.length + 1),
-        subtitle: `Local fallback; Claude error: ${getErrorMessage(error)}`,
-        provider: "Local fallback",
-      };
-      setArtifacts((currentArtifacts) => [artifact, ...currentArtifacts]);
-      setActiveArtifactId(artifact.id);
-      setToast("Claude was unavailable; local artifact fallback used.");
-    } finally {
-      setGeneratingKind(null);
-    }
-  };
-
-  const handleSaveMessageAsNote = (message: ChatMessage) => {
-    const newNote: Note = {
-      id: makeId("note"),
-      title: "Saved chat answer",
-      body: message.content,
-      createdAt: Date.now(),
-      pinned: false,
-    };
-    setNotes((currentNotes) => [newNote, ...currentNotes]);
-    setMobilePanel("studio");
-    setToast("Saved answer to notes.");
-  };
-
-  const handleAddQuickNote = () => {
-    const body = quickNote.trim();
-    if (!body) return;
-    const firstLine = body.split("\n")[0] || "Untitled note";
-    const note: Note = {
-      id: makeId("note"),
-      title: truncate(firstLine, 44),
-      body,
-      createdAt: Date.now(),
-    };
-    setNotes((currentNotes) => [note, ...currentNotes]);
-    setQuickNote("");
-    setToast("Note added.");
-  };
-
-  const handleDeleteNote = (noteId: string) => {
-    setNotes((currentNotes) => currentNotes.filter((note) => note.id !== noteId));
-    setToast("Note deleted.");
-  };
-
-  const handleDiscoverSources = async (topic: string) => {
-    try {
-      const response = await discoverClaudeSources(topic);
-      const nextSources = response.sources.map((source) =>
-        buildSource({
-          title: source.title,
-          body: source.body,
-          kind: source.kind,
+      const response = await api<{ artifact: Artifact; job: ArtifactJob }>("/api/artifacts", {
+        method: "POST",
+        body: JSON.stringify({
+          notebook_id: notebook.id,
+          type,
+          options: type === "audio"
+            ? {
+                format: audioOptions.format,
+                length: audioOptions.length,
+                language: audioOptions.language,
+                prompt: audioOptions.prompt.trim(),
+              }
+            : type === "flashcards"
+              ? flashcardArtifactOptions(flashcardOptions)
+              : {},
         }),
-      );
-      handleAddSources(nextSources);
-      setToast(`Claude discovered ${nextSources.length} starter sources.`);
-    } catch (error) {
-      const nextSources = createDiscoveredSources(topic);
-      handleAddSources(nextSources);
-      setToast(`Claude discovery failed; local starter sources added. ${getErrorMessage(error)}`);
+      });
+      await refreshNotebook();
+      setSelectedArtifactId(response.artifact.id);
+      setToast(`${artifactTitle(type)} generated from an Evidence Pack.`);
+      refreshDebugSilently();
+    } catch (artifactError) {
+      setError(messageFromError(artifactError));
+    } finally {
+      setIsCreatingArtifact("");
     }
-  };
+  }
 
-  const handleNewNotebook = () => {
-    const now = Date.now();
-    setNotebookTitle("Untitled notebook");
-    setSources([]);
-    setMessages([
-      {
-        id: "message-welcome-new",
-        role: "assistant",
-        createdAt: now,
-        content:
-          "New notebook created. Add sources first, then ask questions or generate Studio outputs.",
+  function focusCitation(citation: Citation) {
+    const sourceId = citation.source_id || citation.sourceId || "";
+    setActiveSourceId(sourceId);
+    setHighlightedBlockIds(citation.block_ids || []);
+    setMobilePanel("sources");
+  }
+
+  function openWorkspace(nextAuthMode?: unknown) {
+    setShowLanding(false);
+    setMobilePanel("chat");
+    if (!authUser) setAuthMode(normalizeAuthMode(nextAuthMode));
+    window.history.replaceState(null, "", "#workspace");
+  }
+
+  function openHome() {
+    setShowLanding(true);
+    window.history.replaceState(null, "", window.location.pathname);
+  }
+
+  function startNoteSource() {
+    setMobilePanel("sources");
+    openAddSource("note");
+  }
+
+  function exportNotebook() {
+    if (!notebook) return;
+    const payload = {
+      product: BRAND_NAME,
+      exported_at: new Date().toISOString(),
+      provider: {
+        active_grounded_answer_provider: providerStatus?.active_grounded_answer_provider || "local",
+        grounded_answer_model: providerStatus?.grounded_answer_model || "local-grounded-v1",
+        external_grounded_answer_enabled: Boolean(providerStatus?.external_grounded_answer_enabled),
       },
-    ]);
-    setArtifacts([]);
-    setNotes([]);
-    setActiveSourceId("");
-    setActiveArtifactId("");
-    setUtilityModal(null);
-    setToast("New notebook created.");
-  };
-
-  const handleDuplicateNotebook = () => {
-    setNotebookTitle(`${notebookTitle} copy`);
-    setUtilityModal(null);
-    setToast("Notebook duplicated as a local copy.");
-  };
-
-  const handleClearChat = () => {
-    setMessages(initialMessages);
-    setUtilityModal(null);
-    setToast("Chat history cleared.");
-  };
-
-  const handleClearArtifacts = () => {
-    setArtifacts([]);
-    setActiveArtifactId("");
-    setUtilityModal(null);
-    setToast("Studio outputs cleared.");
-  };
-
-  const handleCopy = async (text: string, successMessage: string) => {
-    const copied = await copyToClipboard(text);
-    setToast(copied ? successMessage : "Copy failed; browser denied clipboard access.");
-  };
-
-  const handleToggleAudio = () => {
-    if (!activeArtifact) return;
-    if (!("speechSynthesis" in window)) {
-      setToast("Speech playback is not supported in this browser.");
-      return;
-    }
-
-    if (isAudioPlaying) {
-      window.speechSynthesis.cancel();
-      speechRef.current = null;
-      setIsAudioPlaying(false);
-      return;
-    }
-
-    const utterance = new SpeechSynthesisUtterance(
-      activeArtifact.body.replace(/[#*_`>-]/g, " ").replace(/\s+/g, " ").slice(0, 12000),
-    );
-    utterance.rate = 0.96;
-    utterance.onend = () => setIsAudioPlaying(false);
-    utterance.onerror = () => {
-      setIsAudioPlaying(false);
-      setToast("Audio playback failed.");
+      notebook: {
+        id: notebook.id,
+        title: notebook.title,
+        description: notebook.description,
+        summary: notebook.summary,
+        active_source_count: notebook.active_source_count,
+        source_count: notebook.source_count,
+        sources: notebook.sources.map((source) => ({
+          id: source.id,
+          type: source.type,
+          title: source.title,
+          original_url: source.original_url,
+          status: source.status,
+          active: source.active,
+          block_count: source.block_count,
+          chunk_count: source.chunk_count,
+          word_count: source.word_count,
+          summary: source.summary,
+        })),
+        messages: notebook.messages.map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          provider: message.provider,
+          model: message.model,
+          mode: message.mode,
+          claim_stats: message.claim_stats,
+          citations: message.citations,
+          created_at: message.created_at,
+        })),
+        artifacts: notebook.artifacts.map((artifact) => ({
+          id: artifact.id,
+          type: artifact.type,
+          title: artifact.title,
+          content_json: artifact.content_json,
+          source_refs_json: artifact.source_refs_json,
+          created_at: artifact.created_at,
+        })),
+      },
     };
-    speechRef.current = utterance;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utterance);
-    setIsAudioPlaying(true);
-  };
+    downloadText(`${downloadSlug(notebook.title)}-export.json`, JSON.stringify(payload, null, 2));
+    setToast("Notebook export downloaded as JSON.");
+  }
+
+  const sourceCount = notebook?.sources.length || 0;
+  const activeCount = notebook?.active_source_count || 0;
+  const activeProviderLabel = providerLabel(providerStatus);
+  const runningDebugJobs = debugStatus?.debug.running_jobs.length || notebook?.jobs.filter((job) => ["queued", "running"].includes(job.status)).length || 0;
+  const isWorking = isBooting || isAddingSource || isAsking || Boolean(isCreatingArtifact) || runningDebugJobs > 0;
+
+  if (showLanding) {
+    return (
+      <LandingPage
+        activeCount={activeCount}
+        sourceCount={sourceCount}
+        providerLabel={activeProviderLabel}
+        isBooting={isBooting}
+        isAuthenticated={Boolean(authUser)}
+        onOpenWorkspace={() => openWorkspace()}
+        onSignIn={() => openWorkspace("login")}
+        onCreateAccount={() => openWorkspace("signup")}
+      />
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <AuthPage
+        mode={authMode}
+        resetToken={resetToken}
+        providerLabel={activeProviderLabel}
+        isBooting={!authChecked && isBooting}
+        onModeChange={setAuthMode}
+        onResetTokenChange={setResetToken}
+        onAuthenticated={(response) => void handleAuthSuccess(response)}
+        onBackHome={openHome}
+      />
+    );
+  }
 
   return (
     <div className="app-shell">
-      <TopBar
-        title={notebookTitle}
-        selectedCount={selectedSources.length}
-        totalSources={sources.length}
-        llmHealth={llmHealth}
-        onNavigation={() => setUtilityModal("navigation")}
-        onNotebookMenu={() => setUtilityModal("notebook")}
-        onShare={() => setUtilityModal("share")}
-        onConfigure={() => setIsConfigureOpen(true)}
-      />
+      <header className="topbar">
+        <div className="brand-cluster">
+          <button className="title-button brand-menu" type="button" onClick={() => setMobilePanel("sources")} aria-label="Open sources">
+            <PanelLeft size={18} />
+          </button>
+          <button className="brand-mark" type="button" onClick={openHome} aria-label={`${BRAND_EYEBROW} home`} title="Home">
+            <img src={BRAND_LOGO_PATH} alt="" />
+          </button>
+          <div className="notebook-title-cluster">
+            <h1 className="notebook-title" title={notebook?.title || "Untitled notebook"}>
+              {notebook?.title || "Untitled notebook"}
+            </h1>
+            {notebooks.length > 1 ? (
+              <div className="menu-anchor">
+                <button
+                  className="title-switch"
+                  type="button"
+                  onClick={() => setOpenMenu((current) => (current === "notebooks" ? "" : "notebooks"))}
+                  aria-label="Switch notebook"
+                  aria-expanded={openMenu === "notebooks"}
+                >
+                  <ChevronDown size={16} />
+                </button>
+                {openMenu === "notebooks" ? (
+                  <Menu align="start" onClose={() => setOpenMenu("")}>
+                    <p className="menu-label">Your notebooks</p>
+                    {notebooks.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="menu-item"
+                        data-active={item.id === notebook?.id}
+                        onClick={() => void switchNotebook(item.id)}
+                      >
+                        <Library size={15} />
+                        <span>{item.title || "Untitled notebook"}</span>
+                        {item.id === notebook?.id ? <CheckCircle2 size={15} /> : null}
+                      </button>
+                    ))}
+                    <div className="menu-divider" />
+                    <button type="button" className="menu-item" onClick={() => void createNotebook()}>
+                      <Plus size={15} />
+                      <span>Create notebook</span>
+                    </button>
+                  </Menu>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="topbar-actions">
+          <button className="ghost-button create-notebook" type="button" onClick={() => void createNotebook()}>
+            <Plus size={15} />
+            Create notebook
+          </button>
+          <button className="primary-button" type="button" onClick={exportNotebook}>
+            <Share2 size={15} />
+            Share
+          </button>
+          <div className="menu-anchor">
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => setOpenMenu((current) => (current === "settings" ? "" : "settings"))}
+              aria-label="Settings"
+              aria-expanded={openMenu === "settings"}
+            >
+              <Settings size={17} />
+            </button>
+            {openMenu === "settings" ? (
+              <Menu align="end" onClose={() => setOpenMenu("")}>
+                <p className="menu-label">Workspace</p>
+                <button type="button" className="menu-item" onClick={() => { setOpenMenu(""); openHome(); }}>
+                  <Compass size={15} />
+                  <span>Home</span>
+                </button>
+                <button type="button" className="menu-item" onClick={() => { setOpenMenu(""); void handleSeedReset(); }}>
+                  <RefreshCw size={15} />
+                  <span>Rebuild seed</span>
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    setOpenMenu("");
+                    setIsDebugOpen(true);
+                    refreshDebugSilently();
+                  }}
+                >
+                  <ClipboardList size={15} />
+                  <span>Debug activity</span>
+                  {isWorking ? <span className="menu-pill">{Math.max(1, runningDebugJobs)}</span> : null}
+                </button>
+              </Menu>
+            ) : null}
+          </div>
+          <div className="menu-anchor">
+            <button
+              className="avatar-button"
+              type="button"
+              onClick={() => setOpenMenu((current) => (current === "account" ? "" : "account"))}
+              aria-label="Account"
+              aria-expanded={openMenu === "account"}
+              title={authUser.email}
+            >
+              {accountInitials(authUser.name, authUser.email)}
+            </button>
+            {openMenu === "account" ? (
+              <Menu align="end" onClose={() => setOpenMenu("")}>
+                <div className="menu-account">
+                  <strong>{authUser.name}</strong>
+                  <span>{authUser.email}</span>
+                </div>
+                <div className="menu-divider" />
+                <div className="menu-status">
+                  <span><ShieldCheck size={13} /> Source-only mode</span>
+                  <span><Database size={13} /> {activeProviderLabel}</span>
+                </div>
+                <div className="menu-divider" />
+                <button type="button" className="menu-item" onClick={() => { setOpenMenu(""); void handleLogout(); }}>
+                  <LogOut size={15} />
+                  <span>Sign out</span>
+                </button>
+              </Menu>
+            ) : null}
+          </div>
+        </div>
+      </header>
+
+      {error ? (
+        <div className="toast error">
+          <XCircle size={16} />
+          {error}
+          <button type="button" onClick={() => setError("")} aria-label="Dismiss error">
+            <XCircle size={14} />
+          </button>
+        </div>
+      ) : null}
+
+      {toast ? (
+        <div className="toast">
+          <CheckCircle2 size={16} />
+          {toast}
+          <button type="button" onClick={() => setToast("")} aria-label="Dismiss notification">
+            <XCircle size={14} />
+          </button>
+        </div>
+      ) : null}
 
       <main className="workspace" data-active-panel={mobilePanel}>
-        <SourcePanel
-          sources={filteredSources}
-          allSources={sources}
-          activeSource={activeSource}
-          selectedCount={selectedSources.length}
-          selectedWordCount={selectedWordCount}
-          search={sourceSearch}
-          onSearch={setSourceSearch}
-          onAdd={() => {
-            setAddMode("upload");
-            setIsAddOpen(true);
-          }}
-          onDiscover={() => {
-            setAddMode("discover");
-            setIsAddOpen(true);
-          }}
-          onSelectAll={handleSelectAllSources}
-          onOpenSource={setActiveSourceId}
-          onToggleSource={handleToggleSource}
-          onDeleteSource={handleDeleteSource}
-        />
+        <section className="panel source-panel" aria-label="Sources panel">
+          <PanelHeader icon={<Library size={18} />} title="Sources" count={sourceCount} />
 
-        <ChatPanel
-          messages={messages}
-          question={question}
-          selectedSources={selectedSources}
-          chatGoal={chatGoal}
-          answerStyle={answerStyle}
-          isAsking={isAsking}
-          onQuestionChange={setQuestion}
-          onSubmit={handleAsk}
-          onSuggestion={handleSuggestion}
-          onConfigure={() => setIsConfigureOpen(true)}
-          onSaveNote={handleSaveMessageAsNote}
-          onCopy={handleCopy}
-        />
+          <div className="source-add">
+            <button className="primary-button add-sources-button" type="button" onClick={() => openAddSource()}>
+              <Plus size={16} />
+              Add sources
+            </button>
+          </div>
 
-        <StudioPanel
-          artifacts={artifacts}
-          activeArtifact={activeArtifact}
-          notes={notes}
-          selectedCount={selectedSources.length}
-          quickNote={quickNote}
-          isAudioPlaying={isAudioPlaying}
-          generatingKind={generatingKind}
-          onGenerate={handleGenerateArtifact}
-          onSelectArtifact={setActiveArtifactId}
-          onQuickNoteChange={setQuickNote}
-          onAddQuickNote={handleAddQuickNote}
-          onDeleteNote={handleDeleteNote}
-          onToggleAudio={handleToggleAudio}
-          onOpenStudioMenu={() => setUtilityModal("studio")}
-          onCopy={handleCopy}
-        />
+          {sourceCount ? (
+            <div className="source-select-row">
+              <span>{activeCount} of {sourceCount} selected</span>
+              <button
+                type="button"
+                className="select-all-button"
+                onClick={() => void setAllSourcesActive(activeCount !== sourceCount)}
+                aria-pressed={activeCount === sourceCount}
+              >
+                Select all
+                <span className="source-check" data-selected={activeCount === sourceCount} aria-hidden="true">
+                  {activeCount === sourceCount ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+                </span>
+              </button>
+            </div>
+          ) : null}
+
+          <div className="source-list">
+            {isBooting ? <SkeletonRows count={4} /> : null}
+            {!isBooting && !sourceCount ? (
+              <div className="source-empty">
+                <Library size={22} />
+                <p>No sources yet</p>
+                <span>Add a document, note, or website to start grounding answers.</span>
+              </div>
+            ) : null}
+            {notebook?.sources.map((source) => (
+              <article
+                key={source.id}
+                className="source-card"
+                data-active={source.id === activeSourceId}
+                data-selected={source.active}
+              >
+                <button
+                  type="button"
+                  className="source-check"
+                  data-selected={source.active}
+                  onClick={() => void toggleSource(source)}
+                  aria-label={source.active ? "Deselect source" : "Select source"}
+                  aria-pressed={source.active}
+                >
+                  {source.active ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+                </button>
+                <button className="source-card-main" type="button" onClick={() => setActiveSourceId(source.id)}>
+                  <span className="source-icon" data-type={source.type}>{sourceIcon(source.type)}</span>
+                  <span>
+                    <strong>{source.title}</strong>
+                    <small>{sourceStatusLine(source)}</small>
+                  </span>
+                </button>
+                <button className="icon-button subtle source-delete" type="button" onClick={() => void deleteSource(source)} aria-label="Delete source">
+                  <Trash2 size={15} />
+                </button>
+              </article>
+            ))}
+          </div>
+
+          <SourceDetail source={activeSource} blocks={sourceBlocks} highlightedBlockIds={highlightedBlockIds} />
+        </section>
+
+        <section className="panel chat-panel" aria-label="Chat panel">
+          <div className="chat-toolbar">
+            <div>
+              <p className="panel-eyebrow">Chat</p>
+              <h2>Ask your sources</h2>
+            </div>
+            <button className="ghost-button compact" type="button" onClick={() => setIsGroundingDetailOpen(true)}>
+              <ShieldCheck size={15} />
+              Grounding
+            </button>
+          </div>
+
+          <div className="chat-context">
+            <span className="context-chip">
+              <Library size={15} />
+              {activeCount} active sources
+            </span>
+            <span className="context-chip">
+              <GitBranch size={15} />
+              Evidence Pack
+            </span>
+            <span className="context-chip wide" title={notebook?.summary || "Knowledge Layer building from active sources."}>
+              <Sparkles size={15} />
+              {truncate(notebook?.summary || "Knowledge Layer ready", 44)}
+            </span>
+          </div>
+
+          <div className="answer-mode" aria-label="Answer mode">
+            {(["Strict", "Balanced", "Exploratory"] as AnswerStyle[]).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                data-active={answerStyle === mode}
+                onClick={() => setAnswerStyle(mode)}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+
+          <div className="messages" ref={messagesRef} role="log" aria-live="polite">
+            {!notebook?.messages.length ? (
+              <ResearchCanvas
+                activeCount={activeCount}
+                onAsk={(prompt) => void askQuestion(prompt)}
+                topicMap={topicMap || []}
+              />
+            ) : (
+              notebook.messages.map((message) => (
+                <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
+              ))
+            )}
+            {isAsking ? <ThinkingBubble /> : null}
+          </div>
+
+          <div className="prompt-suggestions" aria-label="Suggested prompts">
+            {(notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions).map((prompt) => (
+              <button key={prompt} type="button" onClick={() => void askQuestion(prompt)}>
+                {prompt}
+              </button>
+            ))}
+          </div>
+
+          <form className="chat-input" onSubmit={(event) => {
+            event.preventDefault();
+            void askQuestion();
+          }}>
+            <textarea
+              value={question}
+              placeholder="Ask anything about active sources..."
+              rows={1}
+              onChange={(event) => setQuestion(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void askQuestion();
+                }
+              }}
+            />
+            <button className="send-button" type="submit" disabled={!question.trim() || isAsking}>
+              {isAsking ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+            </button>
+          </form>
+
+          <GroundingPanel message={latestAssistant} />
+        </section>
+
+        <section className="panel studio-panel" aria-label="Studio panel">
+          <PanelHeader icon={<Sparkles size={18} />} title="Studio" count={notebook?.artifacts.length || 0} />
+
+          <section className="audio-config" aria-label="Audio overview settings">
+            <div className="audio-config-row">
+              <label>
+                <span>Format</span>
+                <select
+                  value={audioOptions.format}
+                  onChange={(event) => setAudioOptions((current) => ({ ...current, format: event.target.value as AudioFormat }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {audioFormatOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Length</span>
+                <select
+                  value={audioOptions.length}
+                  onChange={(event) => setAudioOptions((current) => ({ ...current, length: event.target.value as AudioLength }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {audioLengthOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="audio-config-row">
+              <label>
+                <span>Language</span>
+                <select
+                  value={audioOptions.language}
+                  onChange={(event) => setAudioOptions((current) => ({ ...current, language: event.target.value }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {audioLanguageOptions.map((language) => (
+                    <option key={language} value={language}>{language}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="audio-focus">
+              <span>Focus</span>
+              <textarea
+                value={audioOptions.prompt}
+                onChange={(event) => setAudioOptions((current) => ({ ...current, prompt: event.target.value }))}
+                disabled={Boolean(isCreatingArtifact)}
+                placeholder="Topic, audience, or angle"
+                rows={2}
+              />
+            </label>
+          </section>
+
+          <section className="flashcard-config" aria-label="Flashcard settings">
+            <div className="section-heading">
+              <strong>Flashcards</strong>
+              <span>{flashcardOptions.count} cards</span>
+            </div>
+            <div className="flashcard-config-grid">
+              <label>
+                <span>Topic</span>
+                <input
+                  value={flashcardOptions.topic}
+                  onChange={(event) => setFlashcardOptions((current) => ({ ...current, topic: event.target.value }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                  placeholder="Focus"
+                />
+              </label>
+              <label>
+                <span>Difficulty</span>
+                <select
+                  value={flashcardOptions.difficulty}
+                  onChange={(event) => setFlashcardOptions((current) => ({ ...current, difficulty: event.target.value as FlashcardDifficulty }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {flashcardDifficultyOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Amount</span>
+                <select
+                  value={flashcardOptions.countPreset}
+                  onChange={(event) => {
+                    const preset = flashcardCountOptions.find((option) => option.value === event.target.value) || flashcardCountOptions[1];
+                    setFlashcardOptions((current) => ({ ...current, countPreset: preset.value, count: preset.count }));
+                  }}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {flashcardCountOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Language</span>
+                <select
+                  value={flashcardOptions.language}
+                  onChange={(event) => setFlashcardOptions((current) => ({ ...current, language: event.target.value }))}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {audioLanguageOptions.map((language) => (
+                    <option key={language} value={language}>{language}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="flashcard-audience">
+              <span>Audience</span>
+              <input
+                value={flashcardOptions.audience}
+                onChange={(event) => setFlashcardOptions((current) => ({ ...current, audience: event.target.value }))}
+                disabled={Boolean(isCreatingArtifact)}
+                placeholder="general"
+              />
+            </label>
+            <div className="flashcard-token-row" aria-label="Card types">
+              {flashcardCardTypeOptions.map((option) => {
+                const selected = flashcardOptions.cardTypes.includes(option.value);
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    data-selected={selected}
+                    disabled={Boolean(isCreatingArtifact)}
+                    onClick={() =>
+                      setFlashcardOptions((current) => {
+                        const next = selected
+                          ? current.cardTypes.filter((type) => type !== option.value)
+                          : [...current.cardTypes, option.value];
+                        return { ...current, cardTypes: next.length ? next : [option.value] };
+                      })
+                    }
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flashcard-source-controls">
+              <label>
+                <span>Sources</span>
+                <select
+                  value={flashcardOptions.sourceMode}
+                  onChange={(event) => {
+                    const sourceMode = event.target.value as SourceMode;
+                    setFlashcardOptions((current) => ({
+                      ...current,
+                      sourceMode,
+                      selectedSourceIds:
+                        sourceMode === "selected" && !current.selectedSourceIds.length
+                          ? (notebook?.sources.filter((source) => source.active).map((source) => source.id) || [])
+                          : current.selectedSourceIds,
+                    }));
+                  }}
+                  disabled={Boolean(isCreatingArtifact)}
+                >
+                  {sourceModeOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              {flashcardOptions.sourceMode === "selected" ? (
+                <div className="flashcard-source-picks" aria-label="Selected flashcard sources">
+                  {notebook?.sources.slice(0, 6).map((source) => {
+                    const selected = flashcardOptions.selectedSourceIds.includes(source.id);
+                    return (
+                      <button
+                        key={source.id}
+                        type="button"
+                        data-selected={selected}
+                        disabled={Boolean(isCreatingArtifact)}
+                        onClick={() =>
+                          setFlashcardOptions((current) => ({
+                            ...current,
+                            selectedSourceIds: selected
+                              ? current.selectedSourceIds.filter((id) => id !== source.id)
+                              : [...current.selectedSourceIds, source.id],
+                          }))
+                        }
+                      >
+                        {source.title}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+          </section>
+
+          <div className="studio-grid">
+            {artifactTypes.map((artifact) => (
+              <button
+                key={artifact.type}
+                className="studio-tile"
+                data-kind={artifact.type}
+                type="button"
+                onClick={() => void createArtifact(artifact.type)}
+                disabled={Boolean(isCreatingArtifact)}
+              >
+                <span className="studio-icon">{isCreatingArtifact === artifact.type ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
+                <span>
+                  <strong>{artifact.title}</strong>
+                  <small>{artifact.action}</small>
+                </span>
+                <span className="studio-chevron">
+                  <ArrowRight size={14} />
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <div className="studio-divider" />
+
+          <div className="section-heading studio-list-heading">
+            <strong>Artifact gallery</strong>
+            <span>{notebook?.jobs.filter((job) => job.status === "completed").length || 0}</span>
+          </div>
+
+          <div className="artifact-list">
+            {notebook?.artifacts.map((artifact) => (
+              <button
+                key={artifact.id}
+                type="button"
+                className="artifact-row"
+                data-active={artifact.id === selectedArtifact?.id}
+                data-kind={artifact.type}
+                onClick={() => {
+                  setSelectedArtifactId(artifact.id);
+                  setIsArtifactDetailOpen(true);
+                }}
+              >
+                <span className="artifact-icon" data-kind={artifact.type}>{artifactIcon(artifact.type)}</span>
+                <span>
+                  <strong>{artifact.title}</strong>
+                  <small>
+                    {artifact.type} · {artifact.source_refs_json.length} refs
+                  </small>
+                </span>
+                <span className="artifact-row-actions">
+                  {artifact.type === "audio" && artifact.content_json.audio_url ? <PlayCircle size={16} /> : null}
+                  <MoreVertical size={16} />
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <button className="add-note-button" type="button" onClick={startNoteSource}>
+            <NotebookPen size={16} />
+            Add note
+          </button>
+        </section>
       </main>
 
-      <MobileTabs activePanel={mobilePanel} onChange={setMobilePanel} />
+      <nav className="mobile-tabs" aria-label="Workspace panels">
+        <MobileTab panel="sources" active={mobilePanel} onChange={setMobilePanel} icon={<Library size={17} />} label="Sources" />
+        <MobileTab panel="chat" active={mobilePanel} onChange={setMobilePanel} icon={<MessageSquareText size={17} />} label="Chat" />
+        <MobileTab panel="studio" active={mobilePanel} onChange={setMobilePanel} icon={<Sparkles size={17} />} label="Studio" />
+      </nav>
 
-      {isAddOpen ? (
-        <AddSourceModal
-          mode={addMode}
-          onModeChange={setAddMode}
-          onClose={() => setIsAddOpen(false)}
-          onAddSources={handleAddSources}
-          onDiscoverSources={handleDiscoverSources}
-        />
+      {isAddSourceOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsAddSourceOpen(false)}>
+          <section className="modal source-modal" role="dialog" aria-modal="true" aria-label="Add source" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Source ingestion</p>
+                <h2>Add source</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsAddSourceOpen(false)} aria-label="Close add source">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <form className="modal-form source-create" onSubmit={(event) => void handleSourceSubmit(event)}>
+              <div className="source-create-row">
+                <label>
+                  <span>Type</span>
+                  <select
+                    value={sourceForm.type}
+                    onChange={(event) => setSourceForm((current) => ({ ...current, type: event.target.value as SourceType }))}
+                  >
+                    {sourceTypeOptions.map((option) => (
+                      <option key={option.type} value={option.type}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="file-button">
+                  <UploadCloud size={15} />
+                  File
+                  <input type="file" accept={sourceFileAccept(sourceForm.type)} onChange={(event) => void handleFile(event)} />
+                </label>
+              </div>
+              <label>
+                <span>Title</span>
+                <input
+                  value={sourceForm.title}
+                  onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
+                  placeholder={`${sourceTypeLabel(sourceForm.type)} title`}
+                />
+              </label>
+              {sourceNeedsUrl(sourceForm.type) ? (
+                <label>
+                  <span>URL</span>
+                  <input
+                    value={sourceForm.original_url}
+                    onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
+                    placeholder={sourceUrlPlaceholder(sourceForm.type)}
+                    inputMode="url"
+                  />
+                </label>
+              ) : null}
+              <label>
+                <span>{sourceBodyLabel(sourceForm.type)}</span>
+                <textarea
+                  ref={sourceBodyRef}
+                  value={sourceForm.body}
+                  onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
+                  placeholder={sourceBodyPlaceholder(sourceForm.type)}
+                  aria-invalid={Boolean(sourceFormNotice)}
+                  rows={7}
+                />
+              </label>
+              {sourceForm.file_name ? <p className="source-form-note">Attached: {sourceForm.file_name}</p> : null}
+              {sourceFormNotice ? <p className="source-form-help">{sourceFormNotice}</p> : null}
+              <div className="modal-action-grid">
+                <button className="primary-button" type="submit" disabled={isAddingSource}>
+                  {isAddingSource ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+                  Add source
+                </button>
+                <button className="ghost-button compact" type="button" onClick={() => setSourceForm({ ...emptySourceForm, type: sourceForm.type })}>
+                  Clear
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
       ) : null}
 
-      {isConfigureOpen ? (
-        <ConfigureChatModal
-          goal={chatGoal}
-          persona={chatPersona}
-          answerStyle={answerStyle}
-          onGoalChange={setChatGoal}
-          onPersonaChange={setChatPersona}
-          onAnswerStyleChange={setAnswerStyle}
-          onClose={() => setIsConfigureOpen(false)}
-        />
+      {isArtifactDetailOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsArtifactDetailOpen(false)}>
+          <section className="modal artifact-modal" role="dialog" aria-modal="true" aria-label="Artifact preview" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Studio artifact</p>
+                <h2>{selectedArtifact?.title || "Artifact preview"}</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsArtifactDetailOpen(false)} aria-label="Close artifact preview">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <ArtifactPreview
+              artifact={selectedArtifact}
+              onCitationClick={focusCitation}
+              onArtifactRefresh={() => void refreshNotebook()}
+              onToast={setToast}
+              onError={setError}
+            />
+          </section>
+        </div>
       ) : null}
 
-      {utilityModal === "navigation" ? (
-        <NavigationModal
-          title={notebookTitle}
-          sources={sources}
-          artifacts={artifacts}
-          notes={notes}
-          onNewNotebook={handleNewNotebook}
-          onExport={() => {
-            downloadNotebook({ title: notebookTitle, sources, messages, artifacts, notes });
-            setToast("Notebook exported.");
-          }}
-          onClose={() => setUtilityModal(null)}
-        />
+      {isGroundingDetailOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsGroundingDetailOpen(false)}>
+          <section className="modal grounding-modal" role="dialog" aria-modal="true" aria-label="Grounding details" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Citation Ledger</p>
+                <h2>Grounding details</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsGroundingDetailOpen(false)} aria-label="Close grounding details">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <GroundingDetail message={latestAssistant} providerStatus={providerStatus} />
+          </section>
+        </div>
       ) : null}
 
-      {utilityModal === "share" ? (
-        <ShareModal
-          shareUrl={createShareUrl(notebookTitle)}
-          onCopy={(text) => handleCopy(text, "Share link copied.")}
-          onExport={() => {
-            downloadNotebook({ title: notebookTitle, sources, messages, artifacts, notes });
-            setToast("Notebook export downloaded.");
-          }}
-          onClose={() => setUtilityModal(null)}
-        />
+      {isDebugOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsDebugOpen(false)}>
+          <section className="modal debug-modal" role="dialog" aria-modal="true" aria-label="Debug activity" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Runtime diagnostics</p>
+                <h2>Debug activity</h2>
+              </div>
+              <div className="modal-header-actions">
+                <button className="ghost-button compact" type="button" onClick={() => refreshDebugSilently()}>
+                  <RefreshCw size={15} />
+                  Refresh
+                </button>
+                <button className="icon-button subtle" type="button" onClick={() => setIsDebugOpen(false)} aria-label="Close debug activity">
+                  <XCircle size={17} />
+                </button>
+              </div>
+            </div>
+            <DebugPanel status={debugStatus} isWorking={isWorking} />
+          </section>
+        </div>
       ) : null}
-
-      {utilityModal === "notebook" ? (
-        <NotebookMenuModal
-          title={notebookTitle}
-          onTitleChange={setNotebookTitle}
-          onDuplicate={handleDuplicateNotebook}
-          onClearChat={handleClearChat}
-          onClose={() => setUtilityModal(null)}
-        />
-      ) : null}
-
-      {utilityModal === "studio" ? (
-        <StudioMenuModal
-          artifactCount={artifacts.length}
-          onExport={() => {
-            downloadArtifacts(artifacts);
-            setToast("Studio outputs exported.");
-          }}
-          onClear={handleClearArtifacts}
-          onClose={() => setUtilityModal(null)}
-        />
-      ) : null}
-
-      {toast ? <div className="toast" role="status">{toast}</div> : null}
     </div>
   );
 }
 
-interface TopBarProps {
-  title: string;
-  selectedCount: number;
-  totalSources: number;
-  llmHealth: LlmHealth | null;
-  onNavigation: () => void;
-  onNotebookMenu: () => void;
-  onShare: () => void;
-  onConfigure: () => void;
-}
+function AuthPage({
+  mode: rawMode,
+  resetToken,
+  providerLabel,
+  isBooting,
+  onModeChange,
+  onResetTokenChange,
+  onAuthenticated,
+  onBackHome,
+}: {
+  mode: AuthMode;
+  resetToken: string;
+  providerLabel: string;
+  isBooting: boolean;
+  onModeChange: (mode: AuthMode) => void;
+  onResetTokenChange: (token: string) => void;
+  onAuthenticated: (response: AuthResponse) => void;
+  onBackHome: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [notice, setNotice] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const mode = normalizeAuthMode(rawMode);
 
-function TopBar({
-  title,
-  selectedCount,
-  totalSources,
-  llmHealth,
-  onNavigation,
-  onNotebookMenu,
-  onShare,
-  onConfigure,
-}: TopBarProps) {
-  const llmLabel = !llmHealth
-    ? "Checking Claude"
-    : llmHealth.configured
-      ? `${llmHealth.provider} connected`
-      : `${llmHealth.provider} not configured`;
+  const title =
+    {
+      login: `Sign in to ${BRAND_NAME}`,
+      signup: `Create your ${BRAND_NAME} account`,
+      "reset-request": "Reset your password",
+      "reset-confirm": "Set a new password",
+    }[mode] || `${BRAND_NAME} account`;
+  const subtitle =
+    mode === "signup"
+      ? "Create a local account, seed a private notebook, and keep the research workspace scoped to your session."
+      : mode === "reset-request"
+        ? "Request a password reset token for the local demo account database."
+        : mode === "reset-confirm"
+          ? "Use the reset token to replace the password and create a fresh session."
+          : "Use your local account to access notebooks, sources, citations, and generated artifacts.";
 
-  return (
-    <header className="topbar">
-      <div className="brand-cluster">
-        <button className="icon-button brand-menu" type="button" onClick={onNavigation} aria-label="Open navigation">
-          <PanelLeft size={20} />
-        </button>
-        <div className="brand-mark" aria-hidden="true">
-          <img src="/brand/blockresearch-mark.svg" alt="" />
-        </div>
-        <div className="brand-copy">
-          <p className="brand-eyebrow">
-            <img src="/brand/blockresearch-wordmark.svg" alt="blockresearch" />
-            <span>Research workspace</span>
-          </p>
-          <h1>{title}</h1>
-        </div>
-        <button className="title-button" type="button" onClick={onNotebookMenu} aria-label="Notebook menu">
-          <ChevronDown size={16} />
-        </button>
-      </div>
+  async function submitAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSubmitting(true);
+    setLocalError("");
+    setNotice("");
+    try {
+      if (mode === "signup") {
+        if (password !== confirmPassword) throw new Error("Passwords do not match.");
+        const response = await api<AuthResponse>("/api/auth/signup", {
+          method: "POST",
+          body: JSON.stringify({ name, email, password }),
+        });
+        onAuthenticated(response);
+        return;
+      }
 
-      <div className="topbar-status" aria-label="Notebook status">
-        <span className="status-pill">
-          <Library size={15} />
-          {selectedCount}/{totalSources} sources
-        </span>
-        <span className="status-pill success" title={llmHealth?.model}>
-          <Sparkles size={15} />
-          {llmLabel}
-        </span>
-      </div>
+      if (mode === "login") {
+        const response = await api<AuthResponse>("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        onAuthenticated(response);
+        return;
+      }
 
-      <div className="topbar-actions">
-        <button className="ghost-button" type="button" onClick={onConfigure}>
-          <Settings2 size={17} />
-          Configure
-        </button>
-        <button className="primary-button" type="button" onClick={onShare}>
-          <Share2 size={17} />
-          Share
-        </button>
-      </div>
-    </header>
-  );
-}
-
-interface SourcePanelProps {
-  sources: Source[];
-  allSources: Source[];
-  activeSource?: Source;
-  selectedCount: number;
-  selectedWordCount: number;
-  search: string;
-  onSearch: (search: string) => void;
-  onAdd: () => void;
-  onDiscover: () => void;
-  onSelectAll: () => void;
-  onOpenSource: (sourceId: string) => void;
-  onToggleSource: (sourceId: string) => void;
-  onDeleteSource: (sourceId: string) => void;
-}
-
-function SourcePanel({
-  sources,
-  allSources,
-  activeSource,
-  selectedCount,
-  selectedWordCount,
-  search,
-  onSearch,
-  onAdd,
-  onDiscover,
-  onSelectAll,
-  onOpenSource,
-  onToggleSource,
-  onDeleteSource,
-}: SourcePanelProps) {
-  return (
-    <section className="panel source-panel" aria-label="Sources panel">
-      <PanelHeader
-        icon={Library}
-        title="Sources"
-        count={allSources.length}
-        action={
-          <button className="icon-button filled" type="button" onClick={onAdd} aria-label="Add source">
-            <Plus size={18} />
-          </button>
+      if (mode === "reset-request") {
+        const response = await api<PasswordResetResponse>("/api/auth/password-reset", {
+          method: "POST",
+          body: JSON.stringify({ email }),
+        });
+        if (response.reset_token) {
+          onResetTokenChange(response.reset_token);
+          onModeChange("reset-confirm");
+          setNotice("Local reset token generated. Set a new password below.");
+        } else {
+          setNotice("If the email exists, a reset flow has been created.");
         }
-      />
+        return;
+      }
 
-      <div className="source-metrics">
-        <div>
-          <strong>{selectedCount}</strong>
-          <span>selected</span>
-        </div>
-        <div>
-          <strong>{formatNumber(selectedWordCount)}</strong>
-          <span>words</span>
-        </div>
-      </div>
+      if (password !== confirmPassword) throw new Error("Passwords do not match.");
+      const response = await api<AuthResponse>("/api/auth/password-reset/confirm", {
+        method: "POST",
+        body: JSON.stringify({ token: resetToken, password }),
+      });
+      onAuthenticated(response);
+    } catch (authError) {
+      setLocalError(messageFromError(authError));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
 
-      <div className="source-actions">
-        <button className="secondary-button" type="button" onClick={onAdd}>
-          <UploadCloud size={16} />
-          Add
+  return (
+    <div className="auth-shell">
+      <header className="auth-nav">
+        <button className="landing-brand auth-brand-button" type="button" onClick={onBackHome}>
+          <span className="landing-brand-mark">
+            <img src={BRAND_LOGO_PATH} alt="" />
+          </span>
+          <span>{BRAND_NAME}</span>
         </button>
-        <button className="secondary-button" type="button" onClick={onDiscover}>
-          <Compass size={16} />
-          Discover
+        <button className="landing-secondary small" type="button" onClick={onBackHome}>
+          Home
         </button>
-      </div>
+      </header>
 
-      <label className="search-box">
-        <Search size={17} />
-        <input
-          value={search}
-          placeholder="Search sources"
-          onChange={(event) => onSearch(event.target.value)}
-        />
-      </label>
-
-      <div className="source-list-toolbar">
-        <span>All sources</span>
-        <button type="button" onClick={onSelectAll}>
-          {selectedCount === allSources.length ? "Deselect all" : "Select all"}
-        </button>
-      </div>
-
-      <div className="source-list">
-        {sources.map((source) => (
-          <SourceCard
-            key={source.id}
-            source={source}
-            isActive={activeSource?.id === source.id}
-            onOpen={() => onOpenSource(source.id)}
-            onToggle={() => onToggleSource(source.id)}
-            onDelete={() => onDeleteSource(source.id)}
-          />
-        ))}
-        {!sources.length ? (
-          <div className="empty-compact">
-            <FileText size={28} />
-            <p>No matching sources.</p>
+      <main className="auth-layout">
+        <section className="auth-copy" aria-label="Account security overview">
+          <p className="landing-kicker">Account workspace</p>
+          <h1>Private notebooks need real accounts.</h1>
+          <p>
+            {BRAND_NAME} keeps the research workspace behind an HTTP-only session. Notebooks, sources, chats, citation
+            ledgers, and artifacts are scoped to the signed-in user.
+          </p>
+          <div className="auth-proof-grid">
+            <span>
+              <Database size={16} />
+              SQLite account store
+            </span>
+            <span>
+              <ShieldCheck size={16} />
+              HTTP-only session
+            </span>
+            <span>
+              <KeyRound size={16} />
+              Password reset flow
+            </span>
+            <span>
+              <Sparkles size={16} />
+              {providerLabel}
+            </span>
           </div>
-        ) : null}
-      </div>
+        </section>
 
-      {activeSource ? (
-        <article className="source-viewer">
-          <div className="source-viewer-top">
+        <section className="auth-card" aria-labelledby="auth-title">
+          <div className="auth-card-top">
+            <span className="auth-card-icon">
+              {mode === "signup" ? <UserPlus size={20} /> : mode.startsWith("reset") ? <KeyRound size={20} /> : <Lock size={20} />}
+            </span>
             <div>
-              <p>{sourceKindConfig[activeSource.kind].label}</p>
-              <h3>{activeSource.title}</h3>
+              <p className="panel-eyebrow">Secure local access</p>
+              <h2 id="auth-title">{title}</h2>
             </div>
-            <span
-              className="source-accent"
-              style={{ backgroundColor: activeSource.accent }}
-            />
           </div>
-          <p>{truncate(activeSource.body, 520)}</p>
-        </article>
-      ) : null}
-    </section>
+          <p className="auth-subtitle">{subtitle}</p>
+
+          <form className="auth-form" onSubmit={submitAuth}>
+            {mode === "signup" ? (
+              <label>
+                <span>Name</span>
+                <div className="auth-input">
+                  <UserCircle size={16} />
+                  <input value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" placeholder="Timo Bautsch" />
+                </div>
+              </label>
+            ) : null}
+
+            {mode !== "reset-confirm" ? (
+              <label>
+                <span>Email</span>
+                <div className="auth-input">
+                  <Mail size={16} />
+                  <input value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" inputMode="email" placeholder="you@example.com" />
+                </div>
+              </label>
+            ) : null}
+
+            {mode === "reset-confirm" ? (
+              <label>
+                <span>Reset token</span>
+                <div className="auth-input">
+                  <KeyRound size={16} />
+                  <input value={resetToken} onChange={(event) => onResetTokenChange(event.target.value)} autoComplete="one-time-code" placeholder="Paste reset token" />
+                </div>
+              </label>
+            ) : null}
+
+            {mode !== "reset-request" ? (
+              <label>
+                <span>{mode === "reset-confirm" ? "New password" : "Password"}</span>
+                <div className="auth-input">
+                  <Lock size={16} />
+                  <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} />
+                </div>
+              </label>
+            ) : null}
+
+            {mode === "signup" || mode === "reset-confirm" ? (
+              <label>
+                <span>Confirm password</span>
+                <div className="auth-input">
+                  <Lock size={16} />
+                  <input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} type="password" autoComplete="new-password" />
+                </div>
+              </label>
+            ) : null}
+
+            {localError ? (
+              <p className="auth-message error" role="alert">
+                {localError}
+              </p>
+            ) : null}
+            {notice ? <p className="auth-message">{notice}</p> : null}
+
+            <button className="primary-button auth-submit" type="submit" disabled={isSubmitting || isBooting}>
+              {isSubmitting || isBooting ? <Loader2 className="spin" size={16} /> : <ArrowRight size={16} />}
+              {mode === "signup"
+                ? "Create account"
+                : mode === "reset-request"
+                  ? "Request reset"
+                  : mode === "reset-confirm"
+                    ? "Set password"
+                    : "Sign in"}
+            </button>
+          </form>
+
+          <div className="auth-switcher">
+            {mode !== "login" ? (
+              <button type="button" onClick={() => onModeChange("login")}>
+                Sign in
+              </button>
+            ) : null}
+            {mode !== "signup" ? (
+              <button type="button" onClick={() => onModeChange("signup")}>
+                Create account
+              </button>
+            ) : null}
+            {mode !== "reset-request" ? (
+              <button type="button" onClick={() => onModeChange("reset-request")}>
+                Forgot password?
+              </button>
+            ) : null}
+          </div>
+        </section>
+      </main>
+    </div>
   );
 }
 
-interface SourceCardProps {
-  source: Source;
-  isActive: boolean;
-  onOpen: () => void;
-  onToggle: () => void;
-  onDelete: () => void;
-}
-
-function SourceCard({
-  source,
-  isActive,
-  onOpen,
-  onToggle,
-  onDelete,
-}: SourceCardProps) {
-  const Icon = sourceKindConfig[source.kind].icon;
+function PanelHeader({ icon, title, count }: { icon: ReactNode; title: string; count: number }) {
   return (
-    <article
-      className="source-card"
-      data-active={isActive}
-      style={{ "--source-color": source.accent } as CSSProperties}
-    >
-      <button
-        className="source-check"
-        type="button"
-        data-selected={source.selected}
-        onClick={onToggle}
-        aria-label={source.selected ? "Deselect source" : "Select source"}
-      >
-        {source.selected ? <Check size={13} /> : null}
-      </button>
-      <button className="source-card-main" type="button" onClick={onOpen}>
-        <span className="source-icon">
-          <Icon size={17} />
-        </span>
-        <span>
-          <strong>{source.title}</strong>
-          <small>
-            {sourceKindConfig[source.kind].label} · {formatNumber(countWords(source.body))} words
-          </small>
-        </span>
-      </button>
-      <button
-        className="icon-button subtle"
-        type="button"
-        onClick={onDelete}
-        aria-label={`Delete ${source.title}`}
-      >
-        <Trash2 size={15} />
-      </button>
-    </article>
+    <div className="panel-header">
+      <div>
+        <span className="panel-icon">{icon}</span>
+        <h2>{title}</h2>
+      </div>
+      <span className="count-badge">{count}</span>
+    </div>
   );
 }
 
-interface ChatPanelProps {
-  messages: ChatMessage[];
-  question: string;
-  selectedSources: Source[];
-  chatGoal: string;
-  answerStyle: string;
-  isAsking: boolean;
-  onQuestionChange: (value: string) => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
-  onSuggestion: (suggestion: string) => void;
-  onConfigure: () => void;
-  onSaveNote: (message: ChatMessage) => void;
-  onCopy: (text: string, successMessage: string) => void;
+function Menu({
+  children,
+  align,
+  onClose,
+}: {
+  children: ReactNode;
+  align: "start" | "end";
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <button className="menu-scrim" type="button" aria-label="Close menu" onClick={onClose} />
+      <div className={`menu menu-${align}`} role="menu">
+        {children}
+      </div>
+    </>
+  );
 }
 
-function ChatPanel({
-  messages,
-  question,
-  selectedSources,
-  chatGoal,
-  answerStyle,
-  isAsking,
-  onQuestionChange,
-  onSubmit,
-  onSuggestion,
-  onConfigure,
-  onSaveNote,
-  onCopy,
-}: ChatPanelProps) {
+function accountInitials(name: string, email: string) {
+  const source = String(name || email || "?").trim();
+  const parts = source.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return source.slice(0, 2).toUpperCase();
+}
+
+function LandingPage({
+  activeCount,
+  sourceCount,
+  providerLabel,
+  isBooting,
+  isAuthenticated,
+  onOpenWorkspace,
+  onSignIn,
+  onCreateAccount,
+}: {
+  activeCount: number;
+  sourceCount: number;
+  providerLabel: string;
+  isBooting: boolean;
+  isAuthenticated: boolean;
+  onOpenWorkspace: () => void;
+  onSignIn: () => void;
+  onCreateAccount: () => void;
+}) {
+  const landingMetrics = [
+    { value: isBooting ? "..." : String(sourceCount || 4), label: "seed sources" },
+    { value: isBooting ? "..." : String(activeCount || 4), label: "active evidence streams" },
+    { value: providerLabel.includes("Anthropic") ? "Claude" : "Local", label: "grounded answer route" },
+  ];
+  const steps = [
+    {
+      icon: <UploadCloud size={18} />,
+      title: "Upload sources",
+      body: "Markdown, notes, URLs and PDF text extraction become stable source blocks.",
+    },
+    {
+      icon: <GitBranch size={18} />,
+      title: "Build Evidence Packs",
+      body: "Retrieval is scoped to active sources and saved as auditable evidence.",
+    },
+    {
+      icon: <ShieldCheck size={18} />,
+      title: "Verify every claim",
+      body: "Citation Ledgers check support before answers and artifacts are shown.",
+    },
+  ];
+  const outputs = [
+    "Audio briefings",
+    "Reports",
+    "Mind maps",
+    "Flashcards",
+    "Quizzes",
+    "Slide decks",
+  ];
   return (
-    <section className="panel chat-panel" aria-label="Chat panel">
-      <div className="chat-toolbar">
-        <div>
-          <p className="panel-eyebrow">Chat</p>
-          <h2>Ask your sources</h2>
+    <div className="landing-shell">
+      <header className="landing-nav" aria-label="Homepage navigation">
+        <a className="landing-brand" href="#top" aria-label={`${BRAND_NAME} homepage`}>
+          <span className="landing-brand-mark">
+            <img src={BRAND_LOGO_PATH} alt="" />
+          </span>
+          <span>{BRAND_NAME}</span>
+        </a>
+        <nav>
+          <a href="#overview">Overview</a>
+          <a href="#audio">Audio</a>
+          <a href="#plans">Plans</a>
+        </nav>
+        <div className="landing-auth-actions">
+          {isAuthenticated ? (
+            <button className="landing-nav-cta" type="button" onClick={onOpenWorkspace}>
+              Open workspace
+            </button>
+          ) : (
+            <>
+              <button className="landing-secondary small" type="button" onClick={onSignIn}>
+                Sign in
+              </button>
+              <button className="landing-nav-cta" type="button" onClick={onCreateAccount}>
+                Create account
+              </button>
+            </>
+          )}
         </div>
-        <button className="ghost-button compact" type="button" onClick={onConfigure}>
-          <Target size={16} />
-          Goal
-        </button>
-      </div>
+      </header>
 
-      <div className="chat-context">
-        <span className="context-chip">
-          <Library size={15} />
-          {selectedSources.length} selected sources
-        </span>
-        <span className="context-chip">
-          <MessageSquareText size={15} />
-          {answerStyle}
-        </span>
-        <span className="context-chip wide" title={chatGoal}>
-          <Target size={15} />
-          {truncate(chatGoal, 58)}
-        </span>
-      </div>
+      <main id="top">
+        <section className="landing-hero" aria-labelledby="landing-title">
+          <div className="hero-product-scene" aria-hidden="true">
+            <div className="scene-window scene-sources">
+              <span>Sources</span>
+              <strong>4 active</strong>
+              <p>Notebook architecture notes</p>
+              <p>SME automation playbook</p>
+              <p>Grounding best practices</p>
+            </div>
+            <div className="scene-window scene-chat">
+              <span>Evidence Pack</span>
+              <strong>Ask anything from your sources</strong>
+              <p>{BRAND_NAME} uses source blocks, retrieval runs and Citation Ledgers to keep answers auditable. [1]</p>
+              <div>
+                <mark>[1]</mark>
+                <mark>[2]</mark>
+                <mark>[3]</mark>
+              </div>
+            </div>
+            <div className="scene-window scene-studio">
+              <span>Studio</span>
+              <strong>Audio Overview</strong>
+              <p>Host A and Host B explain the Evidence Pack in a conversational briefing.</p>
+            </div>
+          </div>
 
-      <div className="messages" role="log" aria-live="polite">
-        {messages.length === 1 ? (
-          <ResearchCanvas
-            selectedCount={selectedSources.length}
-            answerStyle={answerStyle}
-            onSuggestion={onSuggestion}
-          />
-        ) : (
-          messages.map((message) => (
-            <ChatBubble
-              key={message.id}
-              message={message}
-              onSaveNote={() => onSaveNote(message)}
-              onCopy={() => onCopy(message.content, "Answer copied.")}
-            />
-          ))
-        )}
-      </div>
+          <div className="landing-hero-copy">
+            <p className="landing-kicker">Source-grounded AI research</p>
+            <h1 id="landing-title">Understand anything in your sources.</h1>
+            <p>
+              Upload research material, ask grounded questions, and generate reusable briefings from the same verified
+              Evidence Pack.
+            </p>
+            <div className="landing-hero-actions">
+              <button className="landing-primary" type="button" onClick={onOpenWorkspace}>
+                {isAuthenticated ? `Open ${BRAND_NAME}` : "Start with an account"}
+                <ArrowRight size={18} />
+              </button>
+              <a className="landing-secondary" href="#overview">
+                <PlayCircle size={18} />
+                See how it works
+              </a>
+            </div>
+          </div>
 
-      <div className="prompt-suggestions" aria-label="Suggested prompts">
-        {promptSuggestions.map((suggestion) => (
-          <button
-            key={suggestion}
-            type="button"
-            onClick={() => onSuggestion(suggestion)}
-          >
-            {suggestion}
+          <div className="landing-metrics" aria-label="Live demo metrics">
+            {landingMetrics.map((metric) => (
+              <div key={metric.label}>
+                <strong>{metric.value}</strong>
+                <span>{metric.label}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="landing-section intro-band" id="overview">
+          <div>
+            <p className="landing-kicker">Research, not generic PDF chat</p>
+            <h2>Learn more about any subject with the help of your own sources.</h2>
+          </div>
+          <p>
+            {BRAND_NAME} turns notes, documents and URLs into a controlled knowledge workspace. Responses stay
+            grounded in the information you provide, and every generated output keeps source references attached.
+          </p>
+        </section>
+
+        <section className="landing-section process-grid" aria-label={`How ${BRAND_NAME} works`}>
+          {steps.map((step) => (
+            <article key={step.title}>
+              <span>{step.icon}</span>
+              <h3>{step.title}</h3>
+              <p>{step.body}</p>
+            </article>
+          ))}
+        </section>
+
+        <section className="landing-section audio-band" id="audio">
+          <div className="audio-copy">
+            <p className="landing-kicker">Audio Overview</p>
+            <h2>Turn source evidence into a podcast-style briefing.</h2>
+            <p>
+              The current demo creates a verified two-host transcript. The provider boundary is ready for ElevenLabs
+              rendering while keeping citations and the transcript visible in the artifact.
+            </p>
+          </div>
+          <div className="audio-script" aria-label="Audio overview example">
+            <div>
+              <span>Host A</span>
+              <p>Let's anchor this in the source: Evidence Packs make retrieval auditable. [1]</p>
+            </div>
+            <div>
+              <span>Host B</span>
+              <p>And the Citation Ledger checks whether each answer claim is supported before the user relies on it. [2]</p>
+            </div>
+          </div>
+        </section>
+
+        <section className="landing-section output-band" id="plans">
+          <div>
+            <p className="landing-kicker">Studio outputs</p>
+            <h2>One evidence layer, many reusable artifacts.</h2>
+          </div>
+          <div className="output-list">
+            {outputs.map((output) => (
+              <span key={output}>
+                <CheckCircle size={16} />
+                {output}
+              </span>
+            ))}
+          </div>
+        </section>
+
+        <section className="landing-final">
+          <h2>Open the workspace and inspect the evidence.</h2>
+          <p>Sources, chat, citations, artifacts and provider status are already wired into the local demo.</p>
+          <button className="landing-primary" type="button" onClick={onOpenWorkspace}>
+            Open {BRAND_NAME}
+            <ArrowRight size={18} />
           </button>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+function SourceDetail({
+  source,
+  blocks,
+  highlightedBlockIds,
+}: {
+  source: Source | null;
+  blocks: SourceBlock[];
+  highlightedBlockIds: string[];
+}) {
+  if (!source) {
+    return (
+      <div className="source-viewer">
+        <p>Select or add a source to inspect citation blocks.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="source-viewer">
+      <div className="source-viewer-top">
+        <div>
+          <p>{source.type}</p>
+          <h3>{source.title}</h3>
+        </div>
+        <span className="source-accent" />
+      </div>
+      <p>{source.summary || "Source indexed. Summary will appear after parsing."}</p>
+      <div className="source-block-list">
+        {blocks.slice(0, 24).map((block) => (
+          <article key={block.block_id} data-highlight={highlightedBlockIds.includes(block.block_id)}>
+            <small>
+              {block.type} · {block.heading_path.join(" / ") || "Overview"} · {block.block_id}
+            </small>
+            <p>{block.text}</p>
+          </article>
         ))}
       </div>
-
-      <form className="chat-input" onSubmit={onSubmit}>
-        <textarea
-          value={question}
-          placeholder="Ask anything about your selected sources..."
-          rows={1}
-          onChange={(event) => onQuestionChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              const form = event.currentTarget.form;
-              form?.requestSubmit();
-            }
-          }}
-        />
-        <button
-          className="send-button"
-          type="submit"
-          disabled={!question.trim() || isAsking}
-          aria-label="Send message"
-        >
-          {isAsking ? <Sparkles size={18} /> : <Send size={18} />}
-        </button>
-      </form>
-
-      <p className="ai-disclaimer">
-        Claude answers are grounded in selected sources. If the API is unavailable,
-        a local source-matched fallback keeps the notebook usable.
-      </p>
-    </section>
+    </div>
   );
-}
-
-interface ResearchCanvasProps {
-  selectedCount: number;
-  answerStyle: string;
-  onSuggestion: (suggestion: string) => void;
 }
 
 function ResearchCanvas({
-  selectedCount,
-  answerStyle,
-  onSuggestion,
-}: ResearchCanvasProps) {
+  activeCount,
+  onAsk,
+  topicMap,
+}: {
+  activeCount: number;
+  onAsk: (prompt: string) => void;
+  topicMap: Array<{ label: string; weight: number }>;
+}) {
   return (
     <section className="research-canvas" aria-label="Research workspace start">
       <div className="canvas-kicker">
         <Sparkles size={16} />
-        blockresearch AI desk
+        {ASSISTANT_NAME} desk
       </div>
-      <h3>{selectedCount || "No"} selected sources ready for synthesis</h3>
+      <h3>{activeCount || "No"} active sources ready for grounded synthesis</h3>
       <p>
-        Grounded answers, citations, and Studio outputs are prepared from the
-        active notebook context.
+        Evidence Packs, Citation Ledgers, and Studio artifacts are built from active source blocks.
       </p>
       <div className="canvas-actions">
-        <button
-          type="button"
-          onClick={() => onSuggestion("Summarize the selected sources with citations")}
-        >
+        <button type="button" aria-label="Summarize active sources" title="Summarize active sources" onClick={() => onAsk("Summarize the active sources with citations.")}>
           <ClipboardList size={16} />
-          Summarize
+          <span className="canvas-action-label">Summarize</span>
         </button>
-        <button
-          type="button"
-          onClick={() => onSuggestion("Where do the sources disagree?")}
-        >
+        <button type="button" aria-label="Find contradictions" title="Find contradictions" onClick={() => onAsk("Find contradictions or open questions in the sources.")}>
           <GitBranch size={16} />
-          Compare evidence
+          <span className="canvas-action-label">Compare evidence</span>
         </button>
-        <button
-          type="button"
-          onClick={() => onSuggestion("What should I create in Studio first?")}
-        >
+        <button type="button" aria-label="Explain product coverage" title="Explain product coverage" onClick={() => onAsk("What does Block Research AI appear to offer across the website and blog sources?")}>
           <Sparkles size={16} />
-          Studio plan
+          <span className="canvas-action-label">Coverage</span>
         </button>
       </div>
-      <div className="canvas-metrics" aria-label="Current notebook context">
-        <span>
-          <Library size={15} />
-          {selectedCount} active
-        </span>
-        <span>
-          <MessageSquareText size={15} />
-          {answerStyle}
-        </span>
-        <span>
-          <Target size={15} />
-          Citation-first
-        </span>
-      </div>
+      {topicMap.length ? (
+        <div className="canvas-metrics">
+          {topicMap.slice(0, 4).map((topic) => (
+            <span key={topic.label}>
+              <Compass size={13} />
+              {topic.label}
+            </span>
+          ))}
+        </div>
+      ) : null}
     </section>
   );
 }
 
-interface ChatBubbleProps {
+function ChatBubble({
+  message,
+  onCitationClick,
+}: {
   message: ChatMessage;
-  onSaveNote: () => void;
-  onCopy: () => void;
-}
-
-function ChatBubble({ message, onSaveNote, onCopy }: ChatBubbleProps) {
-  const isAssistant = message.role === "assistant";
-  const Icon = isAssistant ? Bot : UserRound;
-
+  onCitationClick: (citation: Citation) => void;
+}) {
   return (
     <article className="chat-bubble" data-role={message.role}>
-      <div className="avatar" aria-hidden="true">
-        <Icon size={18} />
-      </div>
+      <span className="avatar">{message.role === "assistant" ? <Bot size={17} /> : <NotebookPen size={17} />}</span>
       <div className="bubble-body">
-        <div className="bubble-topline">
-          <span>{isAssistant ? message.provider || "Notebook" : "You"}</span>
-          <time>{formatRelativeTime(message.createdAt)}</time>
+        <div className="bubble-meta">
+          <strong>{message.role === "assistant" ? ASSISTANT_NAME : "You"}</strong>
+          {message.role === "assistant" && message.provider ? <span>{providerMeta(message)}</span> : null}
+          {message.mode === "abstained" ? <span>Abstained</span> : null}
         </div>
-        <FormattedText text={message.content} />
+        <div className="answer-text">{renderMessageContent(message.content, message.citations || [], onCitationClick)}</div>
         {message.citations?.length ? (
-          <div className="citation-list" aria-label="Citations">
+          <div className="citation-list">
             {message.citations.map((citation) => (
-              <div className="citation-card" key={`${message.id}-${citation.index}`}>
-                <span>{citation.index}</span>
-                <div>
-                  <strong>{citation.sourceTitle}</strong>
-                  <p>{citation.quote}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        {isAssistant && message.id !== "message-welcome" ? (
-          <div className="bubble-actions">
-            <button type="button" onClick={onSaveNote}>
-              <StickyNote size={15} />
-              Save to note
-            </button>
-            <button
-              type="button"
-              onClick={onCopy}
-            >
-              <Copy size={15} />
-              Copy
-            </button>
-          </div>
-        ) : null}
-      </div>
-    </article>
-  );
-}
-
-interface StudioPanelProps {
-  artifacts: Artifact[];
-  activeArtifact?: Artifact;
-  notes: Note[];
-  selectedCount: number;
-  quickNote: string;
-  isAudioPlaying: boolean;
-  generatingKind: ArtifactKind | null;
-  onGenerate: (kind: ArtifactKind) => void;
-  onSelectArtifact: (artifactId: string) => void;
-  onQuickNoteChange: (value: string) => void;
-  onAddQuickNote: () => void;
-  onDeleteNote: (noteId: string) => void;
-  onToggleAudio: () => void;
-  onOpenStudioMenu: () => void;
-  onCopy: (text: string, successMessage: string) => void;
-}
-
-function StudioPanel({
-  artifacts,
-  activeArtifact,
-  notes,
-  selectedCount,
-  quickNote,
-  isAudioPlaying,
-  generatingKind,
-  onGenerate,
-  onSelectArtifact,
-  onQuickNoteChange,
-  onAddQuickNote,
-  onDeleteNote,
-  onToggleAudio,
-  onOpenStudioMenu,
-  onCopy,
-}: StudioPanelProps) {
-  const primaryTiles: ArtifactKind[] = ["audio", "video", "mindmap", "report"];
-  const secondaryTiles: ArtifactKind[] = ["flashcards", "quiz", "infographic"];
-
-  return (
-    <section className="panel studio-panel" aria-label="Studio panel">
-      <PanelHeader
-        icon={Sparkles}
-        title="Studio"
-        count={artifacts.length}
-        action={
-          <button className="icon-button subtle" type="button" onClick={onOpenStudioMenu} aria-label="Studio menu">
-            <MoreHorizontal size={18} />
-          </button>
-        }
-      />
-
-      <div className="studio-source-banner">
-        <Sparkles size={17} />
-        <div>
-          <strong>{selectedCount || "No"} selected sources</strong>
-          <span>Generate new outputs from the active source set.</span>
-        </div>
-      </div>
-
-      <div className="studio-grid primary">
-        {primaryTiles.map((kind) => (
-          <StudioTile key={kind} kind={kind} loading={generatingKind === kind} disabled={Boolean(generatingKind)} onGenerate={onGenerate} />
-        ))}
-      </div>
-
-      <div className="studio-grid secondary">
-        {secondaryTiles.map((kind) => (
-          <StudioTile key={kind} kind={kind} loading={generatingKind === kind} disabled={Boolean(generatingKind)} onGenerate={onGenerate} compact />
-        ))}
-      </div>
-
-      <div className="artifact-section">
-        <div className="section-heading">
-          <h3>Generated outputs</h3>
-          <span>{artifacts.length}</span>
-        </div>
-
-        {activeArtifact ? (
-          <ArtifactPreview
-            artifact={activeArtifact}
-            isAudioPlaying={isAudioPlaying}
-            onToggleAudio={onToggleAudio}
-            onCopy={() => onCopy(activeArtifact.body, "Artifact copied.")}
-          />
-        ) : (
-          <div className="empty-compact">
-            <Sparkles size={28} />
-            <p>Create an output to preview it here.</p>
-          </div>
-        )}
-
-        <div className="artifact-list">
-          {artifacts.map((artifact) => (
-            <button
-              key={artifact.id}
-              className="artifact-row"
-              data-active={artifact.id === activeArtifact?.id}
-              type="button"
-              onClick={() => onSelectArtifact(artifact.id)}
-            >
-              <ArtifactIcon kind={artifact.kind} />
-              <span>
-                <strong>{artifact.title}</strong>
-                <small>{artifact.subtitle}</small>
-              </span>
-              <time>{formatRelativeTime(artifact.createdAt)}</time>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="notes-section">
-        <div className="section-heading">
-          <h3>Notes</h3>
-          <span>{notes.length}</span>
-        </div>
-        <div className="quick-note">
-          <textarea
-            value={quickNote}
-            rows={3}
-            placeholder="Save a note..."
-            onChange={(event) => onQuickNoteChange(event.target.value)}
-          />
-          <button type="button" onClick={onAddQuickNote} disabled={!quickNote.trim()}>
-            <Plus size={16} />
-            Add note
-          </button>
-        </div>
-        <div className="note-list">
-          {notes.map((note) => (
-            <article className="note-card" key={note.id}>
-              <div>
-                <strong>{note.title}</strong>
-                <time>{formatRelativeTime(note.createdAt)}</time>
-              </div>
-              <p>{truncate(note.body, 180)}</p>
-              <button
-                type="button"
-                onClick={() => onDeleteNote(note.id)}
-                aria-label={`Delete note ${note.title}`}
-              >
-                <Trash2 size={14} />
+              <button key={citation.evidence_id} type="button" className="citation-card" onClick={() => onCitationClick(citation)}>
+                <strong>[{citation.index}] {citation.source_title || citation.sourceTitle}</strong>
+                <p>{truncate(citation.quote, 150)}</p>
               </button>
-            </article>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-interface StudioTileProps {
-  kind: ArtifactKind;
-  compact?: boolean;
-  loading?: boolean;
-  disabled?: boolean;
-  onGenerate: (kind: ArtifactKind) => void;
-}
-
-function StudioTile({
-  kind,
-  compact = false,
-  loading = false,
-  disabled = false,
-  onGenerate,
-}: StudioTileProps) {
-  const config = artifactConfig[kind];
-  const Icon = config.icon;
-  return (
-    <button
-      className="studio-tile"
-      data-kind={kind}
-      data-compact={compact}
-      type="button"
-      disabled={disabled}
-      onClick={() => onGenerate(kind)}
-    >
-      <span className="studio-icon">
-        {loading ? <Sparkles size={compact ? 18 : 21} /> : <Icon size={compact ? 18 : 21} />}
-      </span>
-      <span>
-        <strong>{config.title}</strong>
-        {!compact ? <small>{config.description}</small> : null}
-      </span>
-      <em>{loading ? "Generating" : config.action}</em>
-    </button>
-  );
-}
-
-interface ArtifactPreviewProps {
-  artifact: Artifact;
-  isAudioPlaying: boolean;
-  onToggleAudio: () => void;
-  onCopy: () => void;
-}
-
-function ArtifactPreview({
-  artifact,
-  isAudioPlaying,
-  onToggleAudio,
-  onCopy,
-}: ArtifactPreviewProps) {
-  return (
-    <article className="artifact-preview" data-kind={artifact.kind}>
-      <div className="artifact-preview-top">
-        <div>
-          <p>{artifactConfig[artifact.kind].title}</p>
-          <h3>{artifact.title}</h3>
-        </div>
-        <span className="ready-pill">{artifact.status}</span>
-      </div>
-
-      {artifact.kind === "audio" ? (
-        <div className="audio-player">
-          <button type="button" onClick={onToggleAudio} aria-label="Play audio">
-            {isAudioPlaying ? <Pause size={18} /> : <Play size={18} />}
-          </button>
-          <div className="waveform" data-playing={isAudioPlaying}>
-            {Array.from({ length: 28 }).map((_, index) => (
-              <span key={index} style={{ "--bar": `${20 + (index % 7) * 7}%` } as CSSProperties} />
             ))}
           </div>
-          <span>12:48</span>
-        </div>
-      ) : null}
-
-      {artifact.kind === "video" ? (
-        <div className="video-board">
-          <div className="video-scene large" />
-          <div className="video-scene" />
-          <div className="video-scene accent" />
-          <div className="video-caption">Scene outline</div>
-        </div>
-      ) : null}
-
-      {artifact.kind === "mindmap" ? <MindMapGraphic /> : null}
-
-      <FormattedText text={artifact.body} />
-
-      <div className="artifact-actions">
-        <button
-          type="button"
-          onClick={onCopy}
-        >
-          <Copy size={15} />
-          Copy
-        </button>
-        <button type="button" onClick={() => downloadText(artifact)}>
-          <Download size={15} />
-          Export
-        </button>
+        ) : null}
       </div>
     </article>
   );
 }
 
-function MindMapGraphic() {
+function renderMessageContent(
+  content: string,
+  citations: Citation[],
+  onCitationClick: (citation: Citation) => void,
+) {
+  return content.split("\n").map((line, lineIndex) => (
+    <p key={`${line}-${lineIndex}`}>
+      {line.split(/(\[\d+\])/g).map((part, partIndex) => {
+        const match = /^\[(\d+)\]$/.exec(part);
+        if (!match) return <span key={`${part}-${partIndex}`}>{part}</span>;
+        const citation = citations[Number(match[1]) - 1];
+        if (!citation) return <span key={`${part}-${partIndex}`}>{part}</span>;
+        return (
+          <button key={`${part}-${partIndex}`} type="button" className="inline-citation" onClick={() => onCitationClick(citation)}>
+            {part}
+          </button>
+        );
+      })}
+    </p>
+  ));
+}
+
+function ThinkingBubble() {
   return (
-    <div className="mind-map" aria-hidden="true">
-      <span className="node root">Sources</span>
-      <span className="node n1">Themes</span>
-      <span className="node n2">Evidence</span>
-      <span className="node n3">Outputs</span>
-      <span className="node n4">Actions</span>
-      <span className="link l1" />
-      <span className="link l2" />
-      <span className="link l3" />
-      <span className="link l4" />
+    <article className="chat-bubble">
+      <span className="avatar">
+        <Loader2 className="spin" size={17} />
+      </span>
+      <div className="bubble-body">
+        <div className="bubble-meta">
+          <strong>{ASSISTANT_NAME}</strong>
+          <span>Retrieving evidence</span>
+        </div>
+        <p>Building Evidence Pack, verifying citations, and preparing source-only answer...</p>
+      </div>
+    </article>
+  );
+}
+
+function GroundingPanel({ message }: { message?: ChatMessage }) {
+  if (!message?.claim_stats) {
+    return (
+      <p className="ai-disclaimer">
+        Source-only mode is enforced server-side. Answers abstain when active sources do not support the question.
+      </p>
+    );
+  }
+  const stats = message.claim_stats;
+  const citationCoverage = Math.round((stats.citation_coverage ?? 0) * 100);
+  const supportScore = Math.round((stats.support_score ?? 0) * 100);
+  return (
+    <div className="ai-disclaimer grounding-strip">
+      <span>
+        <ShieldCheck size={14} />
+        {stats.claims_checked} claims checked
+      </span>
+      <span>{stats.supported} supported</span>
+      <span>{stats.partially_supported} partial</span>
+      <span>{stats.unsupported} unsupported</span>
+      <span>{citationCoverage}% citation coverage</span>
+      <span>{supportScore}% support score</span>
     </div>
   );
 }
 
-interface AddSourceModalProps {
-  mode: AddMode;
-  onModeChange: (mode: AddMode) => void;
-  onClose: () => void;
-  onAddSources: (sources: Source[]) => void;
-  onDiscoverSources: (topic: string) => Promise<void>;
-}
-
-function AddSourceModal({
-  mode,
-  onModeChange,
-  onClose,
-  onAddSources,
-  onDiscoverSources,
-}: AddSourceModalProps) {
-  const [pasteTitle, setPasteTitle] = useState("");
-  const [pasteText, setPasteText] = useState("");
-  const [linkUrl, setLinkUrl] = useState("");
-  const [linkNotes, setLinkNotes] = useState("");
-  const [discoverTopic, setDiscoverTopic] = useState("AI study tools");
-  const [uploadMessage, setUploadMessage] = useState("");
-  const [isDiscovering, setIsDiscovering] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const addPastedSource = () => {
-    const body = pasteText.trim();
-    if (!body) return;
-    onAddSources([
-      buildSource({
-        title: pasteTitle.trim() || "Pasted source",
-        body,
-        kind: "text",
-      }),
-    ]);
-  };
-
-  const addLinkSource = () => {
-    const url = linkUrl.trim();
-    if (!url) return;
-    const title = getReadableUrlTitle(url);
-    onAddSources([
-      buildSource({
-        title,
-        kind: inferKindFromUrl(url),
-        body: `${url}
-
-${linkNotes.trim() || "Imported linked source. Add notes here or paste page text for grounded chat."}`,
-      }),
-    ]);
-  };
-
-  const addDiscoveredSources = async () => {
-    const topic = discoverTopic.trim() || "research topic";
-    setIsDiscovering(true);
-    await onDiscoverSources(topic);
-    setIsDiscovering(false);
-  };
-
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? []);
-    if (!files.length) return;
-    setUploadMessage(`Reading ${files.length} file${files.length === 1 ? "" : "s"}...`);
-    const nextSources = await Promise.all(files.map(readFileAsSource));
-    onAddSources(nextSources);
-    setUploadMessage("");
-  };
-
+function GroundingDetail({ message, providerStatus }: { message?: ChatMessage; providerStatus: ProviderStatus | null }) {
+  const stats = message?.claim_stats;
   return (
-    <Modal title="Add sources" onClose={onClose}>
-      <div className="modal-tabs" role="tablist" aria-label="Source add modes">
-        <ModeTab icon={UploadCloud} label="Upload" mode="upload" active={mode} onClick={onModeChange} />
-        <ModeTab icon={NotebookPen} label="Paste text" mode="paste" active={mode} onClick={onModeChange} />
-        <ModeTab icon={Link2} label="Link" mode="link" active={mode} onClick={onModeChange} />
-        <ModeTab icon={Compass} label="Discover" mode="discover" active={mode} onClick={onModeChange} />
+    <div className="grounding-detail">
+      <div className="grounding-meta-grid">
+        <span>
+          <strong>Provider</strong>
+          {providerLabel(providerStatus)}
+        </span>
+        <span>
+          <strong>Model</strong>
+          {message?.model || providerStatus?.grounded_answer_model || "local-grounded-v1"}
+        </span>
+        <span>
+          <strong>Mode</strong>
+          {message?.mode || "source-only"}
+        </span>
+        <span>
+          <strong>Citations</strong>
+          {message?.citations?.length || 0}
+        </span>
+        <span>
+          <strong>Coverage</strong>
+          {stats?.citation_coverage !== undefined ? `${Math.round(stats.citation_coverage * 100)}%` : "n/a"}
+        </span>
       </div>
 
-      {mode === "upload" ? (
-        <div className="upload-dropzone" onClick={() => fileInputRef.current?.click()}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            hidden
-            accept=".txt,.md,.csv,.json,.html,.pdf,.doc,.docx,.epub,.ppt,.pptx"
-            onChange={handleFileChange}
-          />
-          <UploadCloud size={34} />
-          <strong>Upload sources</strong>
-          <p>Choose documents, transcripts, text files, EPUBs, slides, or PDFs. Text-like files are read directly in the browser.</p>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              fileInputRef.current?.click();
-            }}
-          >
-            Select files
-          </button>
-          {uploadMessage ? <small>{uploadMessage}</small> : null}
-        </div>
-      ) : null}
+      {stats ? <GroundingPanel message={message} /> : (
+        <p className="ai-disclaimer">
+          Ask a grounded question to create the next Citation Ledger. The server verifies cited claims before the answer is shown.
+        </p>
+      )}
 
-      {mode === "paste" ? (
-        <div className="modal-form">
-          <label>
-            Title
-            <input
-              value={pasteTitle}
-              placeholder="Example: Market research notes"
-              onChange={(event) => setPasteTitle(event.target.value)}
-            />
-          </label>
-          <label>
-            Source text
-            <textarea
-              value={pasteText}
-              rows={9}
-              placeholder="Paste article text, notes, transcripts, or documents..."
-              onChange={(event) => setPasteText(event.target.value)}
-            />
-          </label>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={addPastedSource}
-            disabled={!pasteText.trim()}
-          >
-            <Plus size={17} />
-            Add source
-          </button>
+      {message?.citations?.length ? (
+        <div className="ledger-list">
+          {message.citations.map((citation) => (
+            <article key={citation.evidence_id}>
+              <strong>[{citation.index}] {citation.source_title || citation.sourceTitle}</strong>
+              <p>{citation.quote}</p>
+              <small>
+                {(citation.heading_path || []).join(" / ") || "Source passage"} · {citation.block_ids?.length || 0} source block{citation.block_ids?.length === 1 ? "" : "s"} referenced
+              </small>
+            </article>
+          ))}
         </div>
-      ) : null}
-
-      {mode === "link" ? (
-        <div className="modal-form">
-          <label>
-            URL
-            <input
-              value={linkUrl}
-              placeholder="https://example.com/research"
-              onChange={(event) => setLinkUrl(event.target.value)}
-            />
-          </label>
-          <label>
-            Notes or copied page text
-            <textarea
-              value={linkNotes}
-              rows={7}
-              placeholder="Browser security may block direct page extraction. Paste important text here for grounded chat."
-              onChange={(event) => setLinkNotes(event.target.value)}
-            />
-          </label>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={addLinkSource}
-            disabled={!linkUrl.trim()}
-          >
-            <Link2 size={17} />
-            Add link
-          </button>
+      ) : (
+        <div className="ledger-empty">
+          <ShieldCheck size={18} />
+          <p>No citation cards are attached to the latest answer yet.</p>
         </div>
-      ) : null}
+      )}
+    </div>
+  );
+}
 
-      {mode === "discover" ? (
-        <div className="modal-form">
-          <label>
-            Topic
-            <input
-              value={discoverTopic}
-              placeholder="What do you want sources about?"
-              onChange={(event) => setDiscoverTopic(event.target.value)}
-            />
-          </label>
-          <div className="discover-preview">
-            <Compass size={24} />
-            <div>
-              <strong>Claude source discovery</strong>
-              <p>Asks Claude to create three research starter sources for the topic, then adds them to the notebook as selected sources.</p>
-            </div>
+function DebugPanel({ status, isWorking }: { status: DebugStatusResponse | null; isWorking: boolean }) {
+  const debug = status?.debug;
+  const events = status?.events || [];
+  const runningJobs = debug?.running_jobs || [];
+  const recentJobs = debug?.recent_jobs || [];
+  const modelRuns = debug?.recent_model_runs || [];
+
+  if (!debug) {
+    return (
+      <div className="debug-panel">
+        <div className="debug-empty">
+          <Loader2 className="spin" size={18} />
+          <p>Loading runtime diagnostics...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="debug-panel">
+      <div className="debug-summary" data-working={isWorking}>
+        <span>
+          {isWorking ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}
+          <strong>{isWorking ? "Working" : "Idle"}</strong>
+        </span>
+        <span>
+          <Database size={16} />
+          {debug.storage_dir}
+        </span>
+        <span>{formatDebugTime(debug.server_time)}</span>
+      </div>
+
+      <div className="debug-count-grid">
+        {Object.entries(debug.counts).map(([key, value]) => (
+          <span key={key}>
+            <strong>{value}</strong>
+            {key.replaceAll("_", " ")}
+          </span>
+        ))}
+      </div>
+
+      <section className="debug-section">
+        <div className="section-heading">
+          <strong>Running jobs</strong>
+          <span>{runningJobs.length}</span>
+        </div>
+        {runningJobs.length ? (
+          <div className="debug-job-list">
+            {runningJobs.map((job) => <DebugJobRow key={job.id} job={job} />)}
           </div>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={addDiscoveredSources}
-            disabled={!discoverTopic.trim() || isDiscovering}
-          >
-            <Sparkles size={17} />
-            {isDiscovering ? "Discovering..." : "Discover sources"}
-          </button>
+        ) : (
+          <p className="debug-muted">No queued or running artifact jobs.</p>
+        )}
+      </section>
+
+      <section className="debug-section">
+        <div className="section-heading">
+          <strong>Recent jobs</strong>
+          <span>{recentJobs.length}</span>
         </div>
-      ) : null}
-    </Modal>
-  );
-}
-
-interface ConfigureChatModalProps {
-  goal: string;
-  persona: string;
-  answerStyle: string;
-  onGoalChange: (goal: string) => void;
-  onPersonaChange: (persona: string) => void;
-  onAnswerStyleChange: (style: string) => void;
-  onClose: () => void;
-}
-
-function ConfigureChatModal({
-  goal,
-  persona,
-  answerStyle,
-  onGoalChange,
-  onPersonaChange,
-  onAnswerStyleChange,
-  onClose,
-}: ConfigureChatModalProps) {
-  return (
-    <Modal title="Configure chat" onClose={onClose}>
-      <div className="modal-form">
-        <label>
-          Role
-          <select value={persona} onChange={(event) => onPersonaChange(event.target.value)}>
-            <option>Research analyst</option>
-            <option>Study tutor</option>
-            <option>Product strategist</option>
-            <option>Executive briefer</option>
-            <option>Skeptical reviewer</option>
-          </select>
-        </label>
-        <label>
-          Response style
-          <select value={answerStyle} onChange={(event) => onAnswerStyleChange(event.target.value)}>
-            <option>Balanced</option>
-            <option>Concise</option>
-            <option>Detailed</option>
-            <option>Study guide</option>
-            <option>Action-oriented</option>
-          </select>
-        </label>
-        <label>
-          Goal instructions
-          <textarea
-            value={goal}
-            rows={6}
-            onChange={(event) => onGoalChange(event.target.value)}
-          />
-        </label>
-        <button className="primary-button" type="button" onClick={onClose}>
-          <Check size={17} />
-          Save
-        </button>
-      </div>
-    </Modal>
-  );
-}
-
-interface NavigationModalProps {
-  title: string;
-  sources: Source[];
-  artifacts: Artifact[];
-  notes: Note[];
-  onNewNotebook: () => void;
-  onExport: () => void;
-  onClose: () => void;
-}
-
-function NavigationModal({
-  title,
-  sources,
-  artifacts,
-  notes,
-  onNewNotebook,
-  onExport,
-  onClose,
-}: NavigationModalProps) {
-  return (
-    <Modal title="Navigation" onClose={onClose}>
-      <div className="modal-form">
-        <div className="notebook-summary">
-          <FolderOpen size={28} />
-          <div>
-            <strong>{title}</strong>
-            <p>{sources.length} sources · {artifacts.length} outputs · {notes.length} notes</p>
-          </div>
+        <div className="debug-job-list compact">
+          {recentJobs.slice(0, 6).map((job) => <DebugJobRow key={job.id} job={job} />)}
         </div>
-        <div className="modal-action-grid">
-          <button className="secondary-button" type="button" onClick={onNewNotebook}>
-            <Plus size={17} />
-            New notebook
-          </button>
-          <button className="secondary-button" type="button" onClick={onExport}>
-            <Download size={17} />
-            Export notebook
-          </button>
+      </section>
+
+      <section className="debug-section">
+        <div className="section-heading">
+          <strong>Model runs</strong>
+          <span>{modelRuns.length}</span>
         </div>
-      </div>
-    </Modal>
-  );
-}
-
-interface ShareModalProps {
-  shareUrl: string;
-  onCopy: (text: string) => void;
-  onExport: () => void;
-  onClose: () => void;
-}
-
-function ShareModal({ shareUrl, onCopy, onExport, onClose }: ShareModalProps) {
-  return (
-    <Modal title="Share notebook" onClose={onClose}>
-      <div className="modal-form">
-        <label>
-          Share link
-          <input value={shareUrl} readOnly />
-        </label>
-        <div className="modal-action-grid">
-          <button className="primary-button" type="button" onClick={() => onCopy(shareUrl)}>
-            <Copy size={17} />
-            Copy link
-          </button>
-          <button className="secondary-button" type="button" onClick={onExport}>
-            <Download size={17} />
-            Export JSON
-          </button>
+        <div className="debug-run-list">
+          {modelRuns.slice(0, 8).map((run) => (
+            <article key={run.id} data-status={run.status}>
+              <span>
+                <strong>{run.role}</strong>
+                {run.provider} · {run.model}
+              </span>
+              <span>{run.status}</span>
+              <span>{run.latency_ms} ms</span>
+              {run.error ? <small>{run.error}</small> : null}
+            </article>
+          ))}
         </div>
-      </div>
-    </Modal>
-  );
-}
+      </section>
 
-interface NotebookMenuModalProps {
-  title: string;
-  onTitleChange: (title: string) => void;
-  onDuplicate: () => void;
-  onClearChat: () => void;
-  onClose: () => void;
-}
-
-function NotebookMenuModal({
-  title,
-  onTitleChange,
-  onDuplicate,
-  onClearChat,
-  onClose,
-}: NotebookMenuModalProps) {
-  const [draftTitle, setDraftTitle] = useState(title);
-  return (
-    <Modal title="Notebook menu" onClose={onClose}>
-      <div className="modal-form">
-        <label>
-          Notebook title
-          <input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} />
-        </label>
-        <div className="modal-action-grid">
-          <button
-            className="primary-button"
-            type="button"
-            onClick={() => {
-              onTitleChange(draftTitle.trim() || "Untitled notebook");
-              onClose();
-            }}
-          >
-            <Check size={17} />
-            Save title
-          </button>
-          <button className="secondary-button" type="button" onClick={onDuplicate}>
-            <Copy size={17} />
-            Duplicate
-          </button>
-          <button className="secondary-button" type="button" onClick={onClearChat}>
-            <Trash2 size={17} />
-            Clear chat
-          </button>
+      <section className="debug-section">
+        <div className="section-heading">
+          <strong>Event log</strong>
+          <span>{events.length}</span>
         </div>
-      </div>
-    </Modal>
-  );
-}
-
-interface StudioMenuModalProps {
-  artifactCount: number;
-  onExport: () => void;
-  onClear: () => void;
-  onClose: () => void;
-}
-
-function StudioMenuModal({
-  artifactCount,
-  onExport,
-  onClear,
-  onClose,
-}: StudioMenuModalProps) {
-  return (
-    <Modal title="Studio menu" onClose={onClose}>
-      <div className="modal-form">
-        <div className="discover-preview">
-          <Sparkles size={24} />
-          <div>
-            <strong>{artifactCount} generated outputs</strong>
-            <p>Export generated artifacts or clear the Studio list for this local notebook.</p>
-          </div>
+        <div className="debug-event-list">
+          {events.map((event) => (
+            <article key={event.id} data-level={event.level}>
+              <header>
+                <span>{formatDebugTime(event.timestamp)}</span>
+                <strong>{event.event}</strong>
+                <em>{event.level}</em>
+              </header>
+              <pre>{formatDebugDetails(event.details)}</pre>
+            </article>
+          ))}
         </div>
-        <div className="modal-action-grid">
-          <button className="secondary-button" type="button" onClick={onExport} disabled={!artifactCount}>
-            <Download size={17} />
-            Export outputs
-          </button>
-          <button className="secondary-button" type="button" onClick={onClear} disabled={!artifactCount}>
-            <Trash2 size={17} />
-            Clear outputs
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-interface ModalProps {
-  title: string;
-  children: ReactNode;
-  onClose: () => void;
-}
-
-function Modal({ title, children, onClose }: ModalProps) {
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal" role="dialog" aria-modal="true" aria-label={title}>
-        <div className="modal-header">
-          <h2>{title}</h2>
-          <button className="icon-button subtle" type="button" onClick={onClose} aria-label="Close modal">
-            <X size={19} />
-          </button>
-        </div>
-        {children}
       </section>
     </div>
   );
 }
 
-interface ModeTabProps {
-  icon: LucideIcon;
-  label: string;
-  mode: AddMode;
-  active: AddMode;
-  onClick: (mode: AddMode) => void;
+function DebugJobRow({ job }: { job: DebugJob }) {
+  return (
+    <article data-status={job.status}>
+      <span>
+        <strong>{job.type}</strong>
+        {job.id}
+      </span>
+      <span>{job.status}</span>
+      <span>{job.progress}%</span>
+      <small>{formatDebugTime(job.updated_at || job.created_at)}</small>
+      {job.error ? <p>{job.error}</p> : null}
+    </article>
+  );
 }
 
-function ModeTab({ icon: Icon, label, mode, active, onClick }: ModeTabProps) {
+function providerLabel(status: ProviderStatus | null) {
+  if (!status) return "Provider status";
+  const label =
+    {
+      anthropic: "Anthropic grounded answer",
+      openai: "OpenAI grounded answer",
+      google: "Gemini grounded answer",
+      local: "Local fallback",
+    }[status.active_grounded_answer_provider] || "Local fallback";
+  return status.external_grounded_answer_enabled ? label : "Local fallback";
+}
+
+function providerMeta(message: ChatMessage) {
+  const provider =
+    {
+      anthropic: "Anthropic",
+      openai: "OpenAI",
+      google: "Gemini",
+      local: "Local",
+    }[message.provider || ""] || message.provider;
+  return [provider, message.model].filter(Boolean).join(" · ");
+}
+
+function ArtifactPreview({
+  artifact,
+  onCitationClick,
+  onArtifactRefresh,
+  onToast,
+  onError,
+}: {
+  artifact: Artifact | null;
+  onCitationClick: (citation: Citation) => void;
+  onArtifactRefresh: () => void;
+  onToast: (message: string) => void;
+  onError: (message: string) => void;
+}) {
+  if (!artifact) {
+    return (
+      <div className="artifact-preview">
+        <p>Generate a source-backed Studio artifact to preview it here.</p>
+      </div>
+    );
+  }
+  const payload = artifact.content_json;
+  const svgMarkup = typeof payload.svg_markup === "string" ? payload.svg_markup : "";
   return (
-    <button type="button" role="tab" aria-selected={mode === active} onClick={() => onClick(mode)}>
-      <Icon size={16} />
-      {label}
+    <div className="artifact-preview">
+      <div className="artifact-preview-top">
+        <div>
+          <p>{artifact.type}</p>
+          <h3>{artifact.title}</h3>
+        </div>
+        <div className="artifact-downloads">
+          {svgMarkup ? (
+            <button className="icon-button subtle" type="button" onClick={() => downloadText(`${downloadSlug(artifact.title)}.svg`, svgMarkup, "image/svg+xml")} aria-label="Download infographic SVG">
+              <Download size={15} />
+            </button>
+          ) : null}
+          <button className="icon-button subtle" type="button" onClick={() => downloadText(`${downloadSlug(artifact.title)}.json`, JSON.stringify(payload, null, 2))} aria-label="Download artifact JSON">
+            <Download size={15} />
+          </button>
+        </div>
+      </div>
+      <ArtifactPayload
+        artifact={artifact}
+        payload={payload}
+        onCitationClick={onCitationClick}
+        onArtifactRefresh={onArtifactRefresh}
+        onToast={onToast}
+        onError={onError}
+      />
+      <ArtifactEvidenceAuditView audit={payload.evidence_audit as ArtifactEvidenceAudit | undefined} />
+    </div>
+  );
+}
+
+function ArtifactPayload({
+  artifact,
+  payload,
+  onCitationClick,
+  onArtifactRefresh,
+  onToast,
+  onError,
+}: {
+  artifact: Artifact;
+  payload: Record<string, unknown>;
+  onCitationClick: (citation: Citation) => void;
+  onArtifactRefresh: () => void;
+  onToast: (message: string) => void;
+  onError: (message: string) => void;
+}) {
+  if (Array.isArray(payload.tldr) || Array.isArray(payload.key_points)) {
+    return (
+      <div className="report-preview">
+        {Array.isArray(payload.tldr) ? (
+          <section>
+            <h4>TL;DR</h4>
+            <ul>
+              {(payload.tldr as string[]).slice(0, 5).map((item, index) => (
+                <li key={`${item}-${index}`}>{item}</li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+        {Array.isArray(payload.key_points) ? (
+          <section>
+            <h4>Key points</h4>
+            <div className="artifact-json">
+              {(payload.key_points as ReportPointPayload[]).slice(0, 8).map((point, index) => (
+                <article key={`${point.text}-${index}`}>
+                  <strong>{point.citation || `[${index + 1}]`}</strong>
+                  <p>{point.text}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (Array.isArray(payload.panels)) {
+    return <InfographicPreview payload={payload} panels={payload.panels as InfographicPanelPayload[]} />;
+  }
+
+  if (Array.isArray(payload.nodes) && Array.isArray(payload.edges)) {
+    return (
+      <MindMapPreview
+        nodes={payload.nodes as MindMapNode[]}
+        edges={payload.edges as MindMapEdge[]}
+        onCitationClick={onCitationClick}
+      />
+    );
+  }
+  if (Array.isArray(payload.cards)) {
+    return (
+      <FlashcardSession
+        artifact={artifact}
+        fallbackCards={payload.cards as FlashcardPayload[]}
+        fallbackProgress={payload.progress as FlashcardProgressPayload | undefined}
+        onCitationClick={onCitationClick}
+        onArtifactRefresh={onArtifactRefresh}
+        onToast={onToast}
+        onError={onError}
+      />
+    );
+  }
+  if (Array.isArray(payload.questions)) {
+    return <QuizSession payload={payload} questions={payload.questions as QuizPayload[]} />;
+  }
+  if (Array.isArray(payload.rows)) {
+    return (
+      <div className="schema-table">
+        {(payload.rows as TableRowPayload[]).slice(0, 6).map((row, index) => (
+          <article key={index}>
+            {Object.entries(row.cells || {}).map(([key, value]) => (
+              <span key={key}>
+                <strong>{key}</strong>
+                {String(value)}
+              </span>
+            ))}
+          </article>
+        ))}
+      </div>
+    );
+  }
+  if (Array.isArray(payload.slides)) {
+    return (
+      <SlideDeckPreview slides={payload.slides as SlidePayload[]} onCitationClick={onCitationClick} />
+    );
+  }
+  if (Array.isArray(payload.transcript)) {
+    const audioUrl = typeof payload.audio_url === "string" ? payload.audio_url : "";
+    const audioStatus = typeof payload.audio_status === "string" ? payload.audio_status : "";
+    const ttsStatus = typeof payload.tts_status === "string" ? payload.tts_status : "";
+    const transcript = payload.transcript as TranscriptPayload[];
+    const outline = Array.isArray(payload.episode_outline) ? payload.episode_outline : [];
+    const sourceCoverage = typeof payload.source_coverage === "object" && payload.source_coverage
+      ? payload.source_coverage as Record<string, unknown>
+      : {};
+    const qualityChecks = typeof payload.quality_checks === "object" && payload.quality_checks
+      ? payload.quality_checks as Record<string, unknown>
+      : {};
+    return (
+      <div className="artifact-json audio-artifact">
+        <article className="audio-player-card">
+          <strong>Audio rendering</strong>
+          <p>{ttsStatus || audioStatus || "Transcript ready."}</p>
+          {audioUrl ? <audio controls preload="metadata" src={audioUrl} /> : null}
+          {audioUrl ? <a className="audio-download-link" href={audioUrl} download>Download audio</a> : null}
+        </article>
+        <div className="audio-meta-grid">
+          <article>
+            <strong>{String(payload.mode || "Audio Overview")}</strong>
+            <p>{String(payload.language || "English")} · {String(payload.length || "Default")} · {transcript.length} turns</p>
+          </article>
+          <article>
+            <strong>Source coverage</strong>
+            <p>
+              {String(sourceCoverage.cited_sources || 0)} cited sources · {String(sourceCoverage.evidence_items || 0)} evidence items · {String(qualityChecks.cited_turn_ratio || "0")} cited ratio
+            </p>
+          </article>
+        </div>
+        {outline.length ? (
+          <div className="audio-outline">
+            {outline.slice(0, 6).map((item, index) => (
+              <span key={`${item}-${index}`}>{String(item)}</span>
+            ))}
+          </div>
+        ) : null}
+        <div className="audio-transcript">
+          {transcript.slice(0, 12).map((line, index) => (
+            <article key={index}>
+              <strong>{line.host}</strong>
+              <p>{line.text}</p>
+            </article>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (Array.isArray(payload.storyboard)) {
+    return (
+      <div className="artifact-json">
+        {(payload.storyboard as StoryboardPayload[]).slice(0, 6).map((scene, index) => (
+          <article key={index}>
+            <strong>Scene {scene.scene}: {scene.title}</strong>
+            <p>{scene.narration}</p>
+          </article>
+        ))}
+      </div>
+    );
+  }
+  return <pre className="artifact-json">{JSON.stringify(payload, null, 2)}</pre>;
+}
+
+function MindMapPreview({
+  nodes,
+  edges,
+  onCitationClick,
+}: {
+  nodes: MindMapNode[];
+  edges: MindMapEdge[];
+  onCitationClick: (citation: Citation) => void;
+}) {
+  const [selectedId, setSelectedId] = useState(nodes[0]?.id || "center");
+  const selected = nodes.find((node) => node.id === selectedId) || nodes[0];
+  const connectedEdges = edges.filter((edge) => edge.source === selected?.id || edge.target === selected?.id);
+  const connectedNodes = connectedEdges
+    .map((edge) => nodes.find((node) => node.id === (edge.source === selected?.id ? edge.target : edge.source)))
+    .filter((node): node is MindMapNode => Boolean(node));
+  const sourceRef = selected?.source_refs?.[0];
+
+  return (
+    <div className="mindmap-interactive">
+      <div className="mindmap-node-list">
+        {nodes.slice(0, 14).map((node, index) => (
+          <button
+            key={node.id || index}
+            type="button"
+            data-selected={(node.id || "") === selectedId}
+            onClick={() => setSelectedId(node.id || "")}
+          >
+            <span>{node.type || "node"}</span>
+            <strong>{node.label || "Node"}</strong>
+          </button>
+        ))}
+      </div>
+      {selected ? (
+        <article className="mindmap-detail">
+          <span>{selected.type || "node"}</span>
+          <strong>{selected.label || "Node"}</strong>
+          {connectedNodes.length ? (
+            <p>{connectedNodes.slice(0, 5).map((node) => node.label || "Node").join(" · ")}</p>
+          ) : (
+            <p>No connected child nodes in this artifact.</p>
+          )}
+          {sourceRef ? (
+            <button type="button" onClick={() => onCitationClick(citationFromSourceRef(sourceRef, selected.label || "Mind map evidence"))}>
+              <ShieldCheck size={15} />
+              Open source
+            </button>
+          ) : null}
+        </article>
+      ) : null}
+    </div>
+  );
+}
+
+function SlideDeckPreview({
+  slides,
+  onCitationClick,
+}: {
+  slides: SlidePayload[];
+  onCitationClick: (citation: Citation) => void;
+}) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const activeSlide = slides[Math.min(activeIndex, Math.max(0, slides.length - 1))];
+  if (!activeSlide) {
+    return (
+      <div className="artifact-json">
+        <article>
+          <strong>No slides available</strong>
+          <p>The artifact did not include slide payloads.</p>
+        </article>
+      </div>
+    );
+  }
+
+  return (
+    <div className="slide-preview">
+      <div className="slide-stage">
+        <span>{activeSlide.layout_type || "slide"} · {activeIndex + 1}/{slides.length}</span>
+        <h4>{activeSlide.title}</h4>
+        {activeSlide.subtitle ? <p>{activeSlide.subtitle}</p> : null}
+        <ul>
+          {(activeSlide.bullets || []).slice(0, 5).map((bullet, index) => (
+            <li key={`${bullet}-${index}`}>{bullet}</li>
+          ))}
+        </ul>
+      </div>
+      <div className="slide-notes">
+        {activeSlide.visual_suggestion ? <p><strong>Visual</strong>{activeSlide.visual_suggestion}</p> : null}
+        {activeSlide.speaker_notes ? <p><strong>Notes</strong>{activeSlide.speaker_notes}</p> : null}
+        {activeSlide.citations?.length ? (
+          <div className="slide-citations">
+            {activeSlide.citations.slice(0, 4).map((citation, index) => (
+              <button key={citation.evidence_id || index} type="button" onClick={() => onCitationClick(citation)}>
+                [{citation.index || index + 1}] {citation.source_title || citation.sourceTitle || "Source"}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <div className="slide-controls">
+        <button type="button" onClick={() => setActiveIndex((index) => Math.max(0, index - 1))} disabled={activeIndex === 0}>
+          Previous
+        </button>
+        <div>
+          {slides.slice(0, 10).map((slide, index) => (
+            <button
+              key={`${slide.title}-${index}`}
+              type="button"
+              data-active={index === activeIndex}
+              onClick={() => setActiveIndex(index)}
+              aria-label={`Open slide ${index + 1}`}
+            >
+              {index + 1}
+            </button>
+          ))}
+        </div>
+        <button type="button" onClick={() => setActiveIndex((index) => Math.min(slides.length - 1, index + 1))} disabled={activeIndex >= slides.length - 1}>
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FlashcardSession({
+  artifact,
+  fallbackCards,
+  fallbackProgress,
+  onCitationClick,
+  onArtifactRefresh,
+  onToast,
+  onError,
+}: {
+  artifact: Artifact;
+  fallbackCards: FlashcardPayload[];
+  fallbackProgress?: FlashcardProgressPayload;
+  onCitationClick: (citation: Citation) => void;
+  onArtifactRefresh: () => void;
+  onToast: (message: string) => void;
+  onError: (message: string) => void;
+}) {
+  const [deck, setDeck] = useState<FlashcardDeck | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [isAnswerVisible, setIsAnswerVisible] = useState(false);
+  const [isExplanationVisible, setIsExplanationVisible] = useState(false);
+  const [mode, setMode] = useState<"all" | "missed">("all");
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [order, setOrder] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadDeck() {
+      setIsLoading(true);
+      try {
+        const response = await api<{ deck: FlashcardDeck }>(`/api/artifacts/${artifact.id}/flashcard-deck`);
+        if (!cancelled) setDeck(response.deck);
+      } catch (deckError) {
+        if (!cancelled) onError(messageFromError(deckError));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+    void loadDeck();
+    return () => {
+      cancelled = true;
+    };
+  }, [artifact.id, onError]);
+
+  const cards = deck?.cards?.length ? deck.cards : fallbackCards;
+  const progress = deck?.progress || normalizeFlashcardProgress(fallbackProgress, cards.length);
+  const baseCards = mode === "missed" ? cards.filter((card) => card.review_state === "missed") : cards;
+  const visibleCards = order.length
+    ? [
+        ...order.map((id) => baseCards.find((card) => card.id === id)).filter((card): card is FlashcardPayload => Boolean(card)),
+        ...baseCards.filter((card) => !order.includes(card.id || "")),
+      ]
+    : baseCards;
+  const activeCard = visibleCards[activeIndex] || visibleCards[0] || null;
+
+  useEffect(() => {
+    if (activeIndex > Math.max(0, visibleCards.length - 1)) setActiveIndex(Math.max(0, visibleCards.length - 1));
+  }, [activeIndex, visibleCards.length]);
+
+  async function refreshDeckFromResponse(request: Promise<{ deck: FlashcardDeck }>) {
+    try {
+      const response = await request;
+      setDeck(response.deck);
+      onArtifactRefresh();
+      return response.deck;
+    } catch (deckError) {
+      onError(messageFromError(deckError));
+      return null;
+    }
+  }
+
+  async function markCard(result: "got_it" | "missed") {
+    if (!deck || !activeCard?.id) return;
+    const updated = await refreshDeckFromResponse(
+      api<{ deck: FlashcardDeck }>(`/api/flashcard-decks/${deck.id}/reviews`, {
+        method: "POST",
+        body: JSON.stringify({ card_id: activeCard.id, result }),
+      }),
+    );
+    if (!updated) return;
+    setIsAnswerVisible(false);
+    setIsExplanationVisible(false);
+    setActiveIndex((current) => Math.min(current + 1, Math.max(0, visibleCards.length - 1)));
+  }
+
+  async function resetDeck() {
+    if (!deck) return;
+    const updated = await refreshDeckFromResponse(
+      api<{ deck: FlashcardDeck }>(`/api/flashcard-decks/${deck.id}/reset`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+    );
+    if (updated) {
+      setActiveIndex(0);
+      setIsAnswerVisible(false);
+      setIsExplanationVisible(false);
+      onToast("Flashcard session restarted.");
+    }
+  }
+
+  async function deleteCard() {
+    if (!deck || !activeCard?.id) return;
+    const updated = await refreshDeckFromResponse(
+      api<{ deck: FlashcardDeck }>(`/api/flashcard-decks/${deck.id}/cards/${activeCard.id}`, { method: "DELETE" }),
+    );
+    if (updated) {
+      setIsAnswerVisible(false);
+      setIsExplanationVisible(false);
+      onToast("Flashcard removed from deck.");
+    }
+  }
+
+  async function createAdaptive() {
+    if (!deck) return;
+    const updated = await refreshDeckFromResponse(
+      api<{ deck: FlashcardDeck }>(`/api/flashcard-decks/${deck.id}/adaptive`, {
+        method: "POST",
+        body: JSON.stringify({ limit: 3 }),
+      }),
+    );
+    if (updated) onToast("Adaptive review cards added.");
+  }
+
+  function shuffleCards() {
+    const ids = [...baseCards].map((card) => card.id || card.question || "").filter(Boolean);
+    for (let index = ids.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(Math.random() * (index + 1));
+      [ids[index], ids[swapIndex]] = [ids[swapIndex], ids[index]];
+    }
+    setOrder(ids);
+    setActiveIndex(0);
+    setIsAnswerVisible(false);
+    setIsExplanationVisible(false);
+  }
+
+  function exportCsv() {
+    const rows = [
+      ["Question", "Answer", "Explanation", "Difficulty", "Tags", "Citation", "Source"],
+      ...cards.map((card) => [
+        card.question || "",
+        card.answer || "",
+        card.explanation || "",
+        card.difficulty || "",
+        (card.tags || []).join("; "),
+        card.citation || "",
+        card.source_title || card.source_refs?.[0]?.source_id || "",
+      ]),
+    ];
+    downloadText(`${downloadSlug(artifact.title)}-flashcards.csv`, rows.map((row) => row.map(csvTextCell).join(",")).join("\n"), "text/csv");
+  }
+
+  function openCardCitation(card: FlashcardPayload) {
+    const ref = card.source_refs?.[0];
+    if (!ref?.source_id) return;
+    onCitationClick({
+      index: citationIndex(card.citation),
+      evidence_id: card.evidence_id || card.id || "flashcard",
+      source_id: ref.source_id,
+      source_title: card.source_title || "Flashcard source",
+      block_ids: ref.block_ids || [],
+      chunk_id: ref.chunk_id || "",
+      quote: ref.quote || card.evidence_quote || card.answer || "",
+      heading_path: [],
+      page_number: null,
+    });
+  }
+
+  return (
+    <div className="flashcard-session" data-expanded={isExpanded}>
+      <div className="flashcard-session-top">
+        <div className="quiz-summary">
+          <span>
+            <strong>{progress.reviewed}/{progress.total}</strong>
+            reviewed
+          </span>
+          <span>
+            <strong>{progress.missed}</strong>
+            missed
+          </span>
+          <span>
+            <strong>{Math.round((progress.mastery_score || 0) * 100)}%</strong>
+            mastery
+          </span>
+          <span>
+            <strong>{deck?.source_coverage?.cited_source_count ?? "n/a"}</strong>
+            sources
+          </span>
+        </div>
+        {isLoading ? <Loader2 className="spin" size={16} /> : null}
+      </div>
+
+      <div className="flashcard-toolbar">
+        <button type="button" data-active={mode === "all"} onClick={() => { setMode("all"); setActiveIndex(0); setIsAnswerVisible(false); setIsExplanationVisible(false); }}>All</button>
+        <button type="button" data-active={mode === "missed"} onClick={() => { setMode("missed"); setActiveIndex(0); setIsAnswerVisible(false); setIsExplanationVisible(false); }}>Missed</button>
+        <button type="button" onClick={shuffleCards} aria-label="Shuffle flashcards" title="Shuffle">
+          <Shuffle size={15} />
+        </button>
+        <button type="button" onClick={() => void resetDeck()} disabled={!deck} aria-label="Restart flashcards" title="Restart">
+          <RefreshCw size={15} />
+        </button>
+        <button type="button" onClick={() => void createAdaptive()} disabled={!deck} aria-label="Add adaptive flashcards" title="Adaptive">
+          <Sparkles size={15} />
+        </button>
+        <button type="button" onClick={exportCsv} aria-label="Download flashcards CSV" title="CSV">
+          <Download size={15} />
+        </button>
+        <button type="button" onClick={() => setIsExpanded((current) => !current)} aria-label={isExpanded ? "Collapse flashcards" : "Expand flashcards"} title={isExpanded ? "Collapse" : "Full screen"}>
+          {isExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+        </button>
+      </div>
+
+      {activeCard ? (
+        <>
+          <article className="flashcard-study-card" data-side={isAnswerVisible ? "answer" : "question"}>
+            <div className="flashcard-card-meta">
+              <span>{activeCard.difficulty || "mixed"}</span>
+              <span>{activeCard.card_type || "concept"}</span>
+              <span>{activeCard.support_level || "supported"}</span>
+            </div>
+            <button type="button" className="flashcard-card-face" onClick={() => setIsAnswerVisible((current) => !current)}>
+              <strong>{isAnswerVisible ? "Answer" : `Card ${activeIndex + 1} of ${visibleCards.length}`}</strong>
+              <p>{isAnswerVisible ? activeCard.answer : activeCard.question}</p>
+              {isAnswerVisible && isExplanationVisible && activeCard.explanation ? <small>{activeCard.explanation}</small> : null}
+              {!isAnswerVisible && activeCard.hint ? <small>{activeCard.hint}</small> : null}
+            </button>
+            <div className="flashcard-card-footer">
+              <button type="button" onClick={() => openCardCitation(activeCard)} disabled={!activeCard.source_refs?.length}>
+                <ShieldCheck size={15} />
+                {activeCard.citation || "Source"}
+              </button>
+              <button type="button" onClick={() => { setIsAnswerVisible(true); setIsExplanationVisible((current) => !current); }} disabled={!activeCard.explanation}>
+                <Sparkles size={15} />
+                Explain
+              </button>
+              <button type="button" onClick={() => void deleteCard()} disabled={!deck}>
+                <Trash2 size={15} />
+              </button>
+            </div>
+          </article>
+
+          <div className="flashcard-nav">
+            <button type="button" onClick={() => { setActiveIndex((current) => Math.max(0, current - 1)); setIsAnswerVisible(false); setIsExplanationVisible(false); }} disabled={activeIndex === 0}>
+              Previous
+            </button>
+            <button type="button" className="primary-button" onClick={() => { setIsAnswerVisible((current) => !current); setIsExplanationVisible(false); }}>
+              {isAnswerVisible ? "Hide answer" : "Show answer"}
+            </button>
+            <button type="button" onClick={() => { setActiveIndex((current) => Math.min(visibleCards.length - 1, current + 1)); setIsAnswerVisible(false); setIsExplanationVisible(false); }} disabled={activeIndex >= visibleCards.length - 1}>
+              Next
+            </button>
+          </div>
+
+          <div className="flashcard-grade-row">
+            <button type="button" onClick={() => void markCard("missed")} disabled={!deck}>
+              <XCircle size={16} />
+              Missed it
+            </button>
+            <button type="button" onClick={() => void markCard("got_it")} disabled={!deck}>
+              <CheckCircle2 size={16} />
+              Got it
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="flashcard-empty">
+          <Layers3 size={18} />
+          <p>{mode === "missed" ? "No missed cards." : "No flashcards in this deck."}</p>
+        </div>
+      )}
+
+      {progress.session_complete ? (
+        <div className="flashcard-review-complete">
+          <strong>Review complete</strong>
+          <button type="button" onClick={() => void resetDeck()} disabled={!deck}>Same cards</button>
+          <button type="button" onClick={() => { setMode("missed"); setActiveIndex(0); }}>Only missed</button>
+          <button type="button" onClick={() => void createAdaptive()} disabled={!deck}>Adaptive set</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function InfographicPreview({ payload, panels }: { payload: Record<string, unknown>; panels: InfographicPanelPayload[] }) {
+  const svgMarkup = typeof payload.svg_markup === "string" ? payload.svg_markup : "";
+  const svgSrc = svgMarkup ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}` : "";
+  const meta = [
+    typeof payload.orientation === "string" ? payload.orientation : "",
+    typeof payload.detail_level === "string" ? payload.detail_level : "",
+    typeof payload.visual_style === "string" ? payload.visual_style : "",
+    typeof payload.render_status === "string" ? payload.render_status.replaceAll("_", " ") : "",
+  ].filter(Boolean);
+
+  return (
+    <div className="infographic-artifact">
+      {svgSrc ? (
+        <figure className="infographic-frame">
+          <img src={svgSrc} alt={typeof payload.title === "string" ? payload.title : "Source-grounded infographic"} />
+        </figure>
+      ) : null}
+      {meta.length ? (
+        <div className="infographic-meta">
+          {meta.map((item) => <span key={item}>{item}</span>)}
+        </div>
+      ) : null}
+      <div className="infographic-preview">
+        {panels.slice(0, 8).map((panel, index) => (
+          <article key={`${panel.headline}-${index}`}>
+            <span>{String(panel.panel || index + 1).padStart(2, "0")}</span>
+            <strong>{panel.headline}</strong>
+            <p>{panel.copy}</p>
+            {panel.source_title ? <small>{panel.source_title}{panel.citation ? ` · ${panel.citation}` : ""}</small> : null}
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function QuizSession({ payload, questions }: { payload: Record<string, unknown>; questions: QuizPayload[] }) {
+  const quizKey = questions.map((question, index) => question.id || question.question || index).join("|");
+  const preparedQuestions = questions.filter((question) => question.question && (question.options || []).length >= 2);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [answers, setAnswers] = useState<Record<number, number>>({});
+
+  useEffect(() => {
+    setCurrentIndex(0);
+    setAnswers({});
+  }, [quizKey]);
+
+  if (!preparedQuestions.length) {
+    return (
+      <div className="artifact-json">
+        <article>
+          <strong>No quiz questions available</strong>
+          <p>The artifact did not contain answerable multiple-choice questions.</p>
+        </article>
+      </div>
+    );
+  }
+
+  const current = preparedQuestions[Math.min(currentIndex, preparedQuestions.length - 1)];
+  const correctIndex = normalizedCorrectIndex(current);
+  const selected = answers[currentIndex];
+  const answeredCount = Object.keys(answers).length;
+  const correctCount = preparedQuestions.reduce((sum, question, index) => (
+    answers[index] === normalizedCorrectIndex(question) ? sum + 1 : sum
+  ), 0);
+  const progressPercent = Math.round((answeredCount / preparedQuestions.length) * 100);
+  const scorePercent = preparedQuestions.length ? Math.round((correctCount / preparedQuestions.length) * 100) : 0;
+  const passingScore = typeof payload.passing_score === "number" ? payload.passing_score : 0.8;
+  const isComplete = answeredCount === preparedQuestions.length;
+  const passed = preparedQuestions.length ? correctCount / preparedQuestions.length >= passingScore : false;
+
+  function chooseAnswer(optionIndex: number) {
+    if (selected !== undefined) return;
+    setAnswers((currentAnswers) => ({ ...currentAnswers, [currentIndex]: optionIndex }));
+  }
+
+  function resetQuiz() {
+    setAnswers({});
+    setCurrentIndex(0);
+  }
+
+  return (
+    <div className="quiz-session">
+      <div className="quiz-summary">
+        <span>
+          <strong>{answeredCount}/{preparedQuestions.length}</strong>
+          answered
+        </span>
+        <span>
+          <strong>{scorePercent}%</strong>
+          score
+        </span>
+        <span>
+          <strong>{Math.round(passingScore * 100)}%</strong>
+          pass
+        </span>
+      </div>
+
+      <div className="quiz-progress" aria-label="Quiz progress">
+        <span style={{ width: `${progressPercent}%` }} />
+      </div>
+
+      <article className="quiz-card">
+        <div className="quiz-card-top">
+          <span>Question {currentIndex + 1} · {current.difficulty || "medium"}</span>
+          {current.learning_goal ? <small>{current.learning_goal}</small> : null}
+          <strong>{current.question}</strong>
+        </div>
+
+        <div className="quiz-options">
+          {(current.options || []).map((option, optionIndex) => {
+            const state = quizOptionState(selected, correctIndex, optionIndex);
+            return (
+              <button
+                key={`${option}-${optionIndex}`}
+                type="button"
+                data-state={state}
+                onClick={() => chooseAnswer(optionIndex)}
+                disabled={selected !== undefined}
+              >
+                <span>{String.fromCharCode(65 + optionIndex)}</span>
+                <strong>{option}</strong>
+                {state === "correct" ? <CheckCircle2 size={16} /> : null}
+                {state === "wrong" ? <XCircle size={16} /> : null}
+              </button>
+            );
+          })}
+        </div>
+
+        {selected !== undefined ? (
+          <div className="quiz-explanation" data-correct={selected === correctIndex}>
+            <strong>{selected === correctIndex ? "Correct" : "Review the evidence"}</strong>
+            <p>{current.explanation}</p>
+            {current.evidence_quote ? <small>{current.evidence_quote}</small> : null}
+            {current.tags?.length ? (
+              <div className="quiz-tags">
+                {current.tags.slice(0, 5).map((tag) => <span key={tag}>{tag}</span>)}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </article>
+
+      <div className="quiz-actions">
+        <button type="button" onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))} disabled={currentIndex === 0}>
+          Previous
+        </button>
+        <button
+          type="button"
+          onClick={() => setCurrentIndex((index) => Math.min(preparedQuestions.length - 1, index + 1))}
+          disabled={currentIndex === preparedQuestions.length - 1}
+        >
+          Next
+        </button>
+        <button type="button" onClick={resetQuiz}>
+          <RefreshCw size={14} />
+          Reset
+        </button>
+      </div>
+
+      {isComplete ? (
+        <div className="quiz-result" data-passed={passed}>
+          <strong>{passed ? "Passed" : "Needs review"}</strong>
+          <p>{correctCount} of {preparedQuestions.length} answers matched the cited evidence.</p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function normalizedCorrectIndex(question: QuizPayload) {
+  const options = question.options || [];
+  const index = Number(question.correct_index ?? 0);
+  if (!Number.isFinite(index) || index < 0 || index >= options.length) return 0;
+  return index;
+}
+
+function quizOptionState(selected: number | undefined, correctIndex: number, optionIndex: number) {
+  if (selected === undefined) return "idle";
+  if (optionIndex === correctIndex) return "correct";
+  if (selected === optionIndex) return "wrong";
+  return "muted";
+}
+
+function ArtifactEvidenceAuditView({ audit }: { audit?: ArtifactEvidenceAudit }) {
+  if (!audit || typeof audit !== "object") return null;
+  const sourceCoverage = Math.round((audit.source_coverage || 0) * 100);
+  const evidenceCoverage = Math.round((audit.evidence_coverage || 0) * 100);
+  const itemCoverage = Math.round((audit.item_citation_coverage || 0) * 100);
+  const status = audit.status || "needs_review";
+  return (
+    <section className="artifact-audit" data-status={status}>
+      <div className="section-heading">
+        <strong>Evidence audit</strong>
+        <span>{status.replaceAll("_", " ")}</span>
+      </div>
+      {audit.summary ? <p className="artifact-audit-summary">{audit.summary}</p> : null}
+      <div className="artifact-audit-grid">
+        <span>
+          <strong>{audit.evidence_items || 0}</strong>
+          evidence items
+        </span>
+        <span>
+          <strong>{audit.cited_evidence_items || 0}</strong>
+          cited items
+        </span>
+        <span>
+          <strong>{evidenceCoverage}%</strong>
+          evidence coverage
+        </span>
+        <span>
+          <strong>{sourceCoverage}%</strong>
+          source coverage
+        </span>
+        <span>
+          <strong>{itemCoverage}%</strong>
+          item citations
+        </span>
+        <span>
+          <strong>{audit.invalid_citation_count || 0}</strong>
+          invalid refs
+        </span>
+        <span>
+          <strong>{audit.retrieval_intent || "artifact"}</strong>
+          intent
+        </span>
+        <span>
+          <strong>{audit.artifact_items || 0}</strong>
+          audited items
+        </span>
+      </div>
+      {audit.top_sources?.length ? (
+        <div className="artifact-audit-sources">
+          {audit.top_sources.slice(0, 4).map((source) => (
+            <span key={source.source_id || source.title}>
+              {source.title || "Source"} · {source.cited_items || 0}/{source.references || source.evidence_items || 0}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {audit.uncited_evidence_ids?.length ? (
+        <small className="artifact-audit-muted">
+          Unused evidence: {audit.uncited_evidence_ids.slice(0, 6).join(", ")}
+          {audit.uncited_evidence_ids.length > 6 ? "..." : ""}
+        </small>
+      ) : null}
+    </section>
+  );
+}
+
+function MobileTab({
+  panel,
+  active,
+  onChange,
+  icon,
+  label,
+}: {
+  panel: MobilePanel;
+  active: MobilePanel;
+  onChange: (panel: MobilePanel) => void;
+  icon: ReactNode;
+  label: string;
+}) {
+  return (
+    <button type="button" data-active={active === panel} onClick={() => onChange(panel)}>
+      {icon}
+      <span>{label}</span>
     </button>
   );
 }
 
-interface PanelHeaderProps {
-  icon: LucideIcon;
-  title: string;
-  count?: number;
-  action?: ReactNode;
-}
-
-function PanelHeader({ icon: Icon, title, count, action }: PanelHeaderProps) {
+function SkeletonRows({ count }: { count: number }) {
   return (
-    <div className="panel-header">
-      <div>
-        <span className="panel-icon">
-          <Icon size={18} />
-        </span>
-        <h2>{title}</h2>
-        {typeof count === "number" ? <span className="count-badge">{count}</span> : null}
-      </div>
-      {action}
-    </div>
+    <>
+      {Array.from({ length: count }).map((_, index) => (
+        <div className="skeleton-row" key={index} />
+      ))}
+    </>
   );
 }
 
-interface MobileTabsProps {
-  activePanel: MobilePanel;
-  onChange: (panel: MobilePanel) => void;
+const defaultQuestions = [
+  "What does Block Research AI appear to offer across the website and blog sources?",
+  "Which trading-bot and automation themes appear most often in the sources?",
+  "Find contradictions or open questions in the sources.",
+  "Create an executive brief from all active sources.",
+];
+
+function sourceIcon(type: SourceType) {
+  if (type === "url") return <Globe size={16} />;
+  if (type === "youtube") return <Video size={16} />;
+  if (type === "audio") return <AudioLines size={16} />;
+  if (type === "google_doc") return <FileText size={16} />;
+  if (type === "note") return <NotebookPen size={16} />;
+  if (type === "pdf") return <FileText size={16} />;
+  if (type === "docx") return <FileText size={16} />;
+  return <FileText size={16} />;
 }
 
-function MobileTabs({ activePanel, onChange }: MobileTabsProps) {
-  const items: Array<{ panel: MobilePanel; label: string; icon: LucideIcon }> = [
-    { panel: "sources", label: "Sources", icon: Library },
-    { panel: "chat", label: "Chat", icon: MessageSquareText },
-    { panel: "studio", label: "Studio", icon: Sparkles },
-  ];
-
+function sourceTypeLabel(type: SourceType) {
   return (
-    <nav className="mobile-tabs" aria-label="Workspace panels">
-      {items.map((item) => {
-        const Icon = item.icon;
-        return (
-          <button
-            key={item.panel}
-            type="button"
-            data-active={activePanel === item.panel}
-            onClick={() => onChange(item.panel)}
-          >
-            <Icon size={18} />
-            {item.label}
-          </button>
-        );
-      })}
-    </nav>
-  );
+    {
+      markdown: "Document",
+      text: "Document",
+      pdf: "PDF",
+      url: "Website",
+      note: "Note",
+      docx: "DOCX",
+      youtube: "YouTube",
+      audio: "Audio",
+      google_doc: "Google Doc",
+    } as Record<string, string>
+  )[type] || "Source";
 }
 
-function ArtifactIcon({ kind }: { kind: ArtifactKind }) {
-  const Icon = artifactConfig[kind].icon;
-  return (
-    <span className="artifact-icon" data-kind={kind}>
-      <Icon size={17} />
-    </span>
-  );
+function sourceNeedsUrl(type: SourceType) {
+  return ["url", "youtube", "google_doc"].includes(type);
 }
 
-function FormattedText({ text }: { text: string }) {
-  const lines = text.split("\n");
-  return (
-    <div className="formatted-text">
-      {lines.map((line, index) => {
-        const cleanLine = line.trim();
-        if (!cleanLine) return <br key={index} />;
-        if (cleanLine.startsWith("# ")) {
-          return <h4 key={index}>{cleanLine.replace("# ", "")}</h4>;
-        }
-        if (cleanLine.startsWith("- ")) {
-          return <p className="bullet-line" key={index}>{cleanLine}</p>;
-        }
-        return <p key={index}>{cleanLine}</p>;
-      })}
-    </div>
-  );
+function sourceAcceptsFile(type: SourceType) {
+  return ["pdf", "docx", "audio", "markdown", "text"].includes(type);
 }
 
-async function askClaudeForAnswer(payload: {
-  question: string;
-  selectedSources: Source[];
-  chatGoal: string;
-  chatPersona: string;
-  answerStyle: string;
-  history: ChatMessage[];
-}): Promise<ApiChatResponse> {
-  return postJson<ApiChatResponse>("/api/chat", {
-    question: payload.question,
-    selectedSources: payload.selectedSources.map(toApiSource),
-    chatGoal: payload.chatGoal,
-    chatPersona: payload.chatPersona,
-    answerStyle: payload.answerStyle,
-    history: payload.history
-      .filter((message) => message.id !== "message-welcome")
-      .map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-  });
+function sourceFileAccept(type: SourceType) {
+  if (type === "pdf") return ".pdf,application/pdf";
+  if (type === "docx") return ".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (type === "audio") return "audio/*,.mp3,.m4a,.wav,.aac,.ogg";
+  return ".md,.txt,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 }
 
-async function createClaudeArtifact(payload: {
-  kind: ArtifactKind;
-  title: string;
-  selectedSources: Source[];
-  notes: Note[];
-}): Promise<ApiArtifactResponse> {
-  return postJson<ApiArtifactResponse>("/api/artifact", {
-    kind: payload.kind,
-    title: payload.title,
-    selectedSources: payload.selectedSources.map(toApiSource),
-    notes: payload.notes.map((note) => ({
-      title: note.title,
-      body: note.body,
-    })),
-  });
+function sourceTypeFromFile(file: File): SourceType {
+  const name = file.name.toLowerCase();
+  if (file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (name.endsWith(".docx")) return "docx";
+  if (file.type.startsWith("audio/") || /\.(mp3|m4a|wav|aac|ogg)$/i.test(name)) return "audio";
+  if (name.endsWith(".txt")) return "text";
+  return "markdown";
 }
 
-async function discoverClaudeSources(topic: string): Promise<ApiDiscoverResponse> {
-  const response = await postJson<ApiDiscoverResponse>("/api/discover", { topic });
+function sourceUrlPlaceholder(type: SourceType) {
+  if (type === "youtube") return "https://www.youtube.com/watch?v=...";
+  if (type === "google_doc") return "https://docs.google.com/document/d/...";
+  return "https://example.com/research-page";
+}
+
+function sourceBodyLabel(type: SourceType) {
+  if (type === "youtube") return "Transcript fallback";
+  if (type === "audio") return "Transcript";
+  if (type === "pdf" || type === "docx") return "Extracted text fallback";
+  return "Text";
+}
+
+function sourceBodyPlaceholder(type: SourceType) {
+  if (type === "youtube") return "Paste transcript here if public captions are unavailable.";
+  if (type === "audio") return "Paste transcript text for the audio file.";
+  if (type === "google_doc") return "Paste document text if export is not accessible.";
+  if (type === "pdf" || type === "docx") return "Paste extracted text if local parsing cannot read the file.";
+  if (type === "note") return "Write a note that should become a citable source.";
+  return "Paste source text or markdown.";
+}
+
+function sourceStatusLine(source: Source) {
+  if (source.status === "failed") return "Failed to index";
+  if (source.status === "parsing") return "Indexing…";
+  if (source.status === "pending") return "Pending";
+  const words = source.word_count ? `${formatCount(source.word_count)} words` : "";
+  return [sourceTypeLabel(source.type), words].filter(Boolean).join(" · ");
+}
+
+function formatCount(value: number) {
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k`;
+  return String(value);
+}
+
+function artifactIcon(type: ArtifactType) {
+  return artifactTypes.find((artifact) => artifact.type === type)?.icon || <Sparkles size={18} />;
+}
+
+function artifactTitle(type: ArtifactType) {
+  return artifactTypes.find((artifact) => artifact.type === type)?.title || type;
+}
+
+function normalizeFlashcardProgress(progress: FlashcardProgressPayload | undefined, total: number): FlashcardProgress {
+  const reviewed = progress?.reviewed ?? 0;
+  const normalizedTotal = progress?.total ?? total;
+  const remaining = progress?.remaining ?? Math.max(0, normalizedTotal - reviewed);
   return {
-    ...response,
-    sources: response.sources.map((source) => ({
-      ...source,
-      kind: normalizeSourceKind(source.kind),
-    })),
+    total: normalizedTotal,
+    active: progress?.active ?? normalizedTotal,
+    deleted: progress?.deleted ?? 0,
+    reviewed,
+    remaining,
+    due: progress?.due ?? remaining,
+    got_it: progress?.got_it ?? 0,
+    missed: progress?.missed ?? 0,
+    mastery_score: progress?.mastery_score ?? 0,
+    session_complete: progress?.session_complete ?? Boolean(normalizedTotal && reviewed >= normalizedTotal),
   };
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+function citationIndex(citation?: string) {
+  const match = /\[(\d+)\]/.exec(citation || "");
+  return match ? Number(match[1]) : 1;
+}
+
+function citationFromSourceRef(ref: Record<string, unknown>, fallbackTitle: string): Citation {
+  return {
+    index: 1,
+    evidence_id: String(ref.evidence_id || ref.chunk_id || "source-ref"),
+    source_id: String(ref.source_id || ref.sourceId || ""),
+    source_title: String(ref.source_title || ref.sourceTitle || fallbackTitle),
+    block_ids: Array.isArray(ref.block_ids) ? ref.block_ids.map(String) : [],
+    chunk_id: String(ref.chunk_id || ""),
+    quote: String(ref.quote || fallbackTitle),
+    heading_path: Array.isArray(ref.heading_path) ? ref.heading_path.map(String) : [],
+    page_number: null,
+  };
+}
+
+function csvTextCell(value: unknown) {
+  const text = String(value ?? "");
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+async function api<T>(path: string, init?: ApiInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: {
+      "content-type": "application/json",
+      ...(init?.headers || {}),
+    },
   });
-  const data = await response.json().catch(() => ({}));
+  const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(typeof data?.error === "string" ? data.error : `${response.status} ${response.statusText}`);
+    throw new Error(body.error || `Request failed with ${response.status}`);
   }
-  return data as T;
+  return body as T;
 }
 
-function toApiSource(source: Source) {
-  return {
-    id: source.id,
-    title: source.title,
-    kind: source.kind,
-    body: source.body,
-  };
+function messageFromError(error: unknown) {
+  return error instanceof Error ? error.message : "Request failed.";
 }
 
-function normalizeSourceKind(kind: string): SourceKind {
-  const allowed: SourceKind[] = ["doc", "pdf", "url", "youtube", "text", "slide", "ebook", "image"];
-  return allowed.includes(kind as SourceKind) ? (kind as SourceKind) : "doc";
+async function fileToBase64(file: File) {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
 }
 
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fall through to the textarea fallback.
-  }
-
-  try {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.position = "fixed";
-    textarea.style.left = "-9999px";
-    document.body.append(textarea);
-    textarea.focus();
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    return copied;
-  } catch {
-    return false;
-  }
-}
-
-function createShareUrl(title: string): string {
-  const url = new URL(window.location.href);
-  url.hash = `notebook=${encodeURIComponent(title)}`;
-  return url.toString();
-}
-
-function downloadNotebook({
-  title,
-  sources,
-  messages,
-  artifacts,
-  notes,
-}: {
-  title: string;
-  sources: Source[];
-  messages: ChatMessage[];
-  artifacts: Artifact[];
-  notes: Note[];
-}) {
-  downloadJson(`${title || "notebook"}.json`, {
-    title,
-    exportedAt: new Date().toISOString(),
-    sources,
-    messages,
-    artifacts,
-    notes,
-  });
-}
-
-function downloadArtifacts(artifacts: Artifact[]) {
-  downloadJson("studio-outputs.json", {
-    exportedAt: new Date().toISOString(),
-    artifacts,
-  });
-}
-
-function downloadJson(fileName: string, data: unknown) {
-  const safeName = fileName.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
-  const blob = new Blob([JSON.stringify(data, null, 2)], {
-    type: "application/json;charset=utf-8",
-  });
+function downloadText(fileName: string, text: string, mimeType = "application/json") {
+  const blob = new Blob([text], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = safeName;
-  document.body.append(anchor);
+  anchor.download = fileName;
   anchor.click();
-  anchor.remove();
   URL.revokeObjectURL(url);
 }
 
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Unknown error.";
-}
-
-function createGroundedResponse(
-  query: string,
-  selectedSources: Source[],
-  goal: string,
-  persona: string,
-  answerStyle: string,
-): { content: string; citations: Citation[] } {
-  if (!selectedSources.length) {
-    return {
-      citations: [],
-      content:
-        "No sources are selected yet. Select one or more sources in the Sources panel, then ask again so the answer can be grounded in your material.",
-    };
-  }
-
-  const rankedSnippets = rankSnippets(query, selectedSources).slice(0, 4);
-  const snippets = rankedSnippets.length
-    ? rankedSnippets
-    : selectedSources.slice(0, 3).map((source) => ({
-        source,
-        text: getChunks(source.body)[0] ?? source.body,
-        score: 1,
-      }));
-
-  const citations: Citation[] = snippets.map((snippet, index) => ({
-    index: index + 1,
-    sourceId: snippet.source.id,
-    sourceTitle: snippet.source.title,
-    quote: truncate(snippet.text, 180),
-  }));
-
-  const styleInstruction =
-    answerStyle === "Concise"
-      ? "short answer"
-      : answerStyle === "Detailed"
-        ? "detailed synthesis"
-        : answerStyle === "Study guide"
-          ? "study guide"
-          : answerStyle === "Action-oriented"
-            ? "action plan"
-            : "balanced answer";
-
-  const mainPoints = snippets.map((snippet, index) => {
-    const citationNumber = index + 1;
-    return `- ${rewriteSnippet(snippet.text)} [${citationNumber}]`;
-  });
-
-  const nextStep = inferNextStep(query);
-  const sourceTitles = selectedSources
-    .slice(0, 3)
-    .map((source) => source.title)
-    .join(", ");
-
-  return {
-    citations,
-    content: `${persona} response (${styleInstruction}) based on ${selectedSources.length} selected source${selectedSources.length === 1 ? "" : "s"}: ${sourceTitles}${selectedSources.length > 3 ? ", and more" : ""}.
-
-${mainPoints.join("\n")}
-
-Suggested next step: ${nextStep}
-
-Configuration used: ${truncate(goal, 120)}`,
-  };
-}
-
-function rankSnippets(query: string, selectedSources: Source[]): RankedSnippet[] {
-  const terms = tokenize(query);
-  if (!terms.length) return [];
-
-  return selectedSources
-    .flatMap((source) =>
-      getChunks(source.body).map((text) => {
-        const textTokens = tokenize(`${source.title} ${text}`);
-        const score = terms.reduce(
-          (total, term) =>
-            total + textTokens.filter((token) => token === term || token.includes(term)).length,
-          0,
-        );
-        return { source, text, score };
-      }),
-    )
-    .filter((snippet) => snippet.score > 0)
-    .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
-}
-
-function tokenize(input: string): string[] {
-  return input
+function downloadSlug(input: string) {
+  return String(input || "sourcestudio-notebook")
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "sourcestudio-notebook";
 }
 
-function getChunks(body: string): string[] {
-  const paragraphs = body
-    .split(/\n{2,}/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean);
-
-  return paragraphs.flatMap((paragraph) => {
-    if (paragraph.length <= 520) return [paragraph];
-    const chunks = paragraph.match(/.{1,520}(\s|$)/g);
-    return chunks?.map((chunk) => chunk.trim()).filter(Boolean) ?? [paragraph];
-  });
+function truncate(input: string, maxLength: number) {
+  const clean = String(input || "").replace(/\s+/g, " ").trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trim()}...` : clean;
 }
 
-function rewriteSnippet(snippet: string): string {
-  const clean = snippet.replace(/\s+/g, " ").trim();
-  if (clean.length < 150) return clean;
-  return truncate(clean, 230);
+function formatDebugTime(value: string) {
+  if (!value) return "n/a";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function inferNextStep(query: string): string {
-  const lower = query.toLowerCase();
-  if (lower.includes("studio") || lower.includes("create") || lower.includes("artifact")) {
-    return "open Studio and generate the output type that matches the audience.";
-  }
-  if (lower.includes("study") || lower.includes("learn")) {
-    return "generate flashcards or a quiz, then save missed items as notes.";
-  }
-  if (lower.includes("disagree") || lower.includes("risk")) {
-    return "ask a follow-up that compares evidence source by source.";
-  }
-  if (lower.includes("summar")) {
-    return "save this answer as a note and turn it into a Report in Studio.";
-  }
-  return "ask a narrower follow-up or create a Studio output from the current answer.";
+function formatDebugDetails(details: Record<string, unknown>) {
+  const text = JSON.stringify(details || {}, null, 2);
+  return text.length > 1200 ? `${text.slice(0, 1200)}\n...` : text;
 }
-
-function createArtifact(
-  kind: ArtifactKind,
-  selectedSources: Source[],
-  sequence: number,
-): Artifact {
-  const sourceCount = selectedSources.length;
-  const title = `${artifactConfig[kind].title} ${sequence}`;
-  const subtitle =
-    sourceCount > 0
-      ? `Generated from ${sourceCount} selected source${sourceCount === 1 ? "" : "s"}`
-      : "Generated without selected sources";
-  const body = createArtifactBody(kind, selectedSources);
-
-  return {
-    id: makeId("artifact"),
-    kind,
-    title,
-    subtitle,
-    sourceCount,
-    body,
-    status: "ready",
-    createdAt: Date.now(),
-  };
-}
-
-function createArtifactBody(kind: ArtifactKind, selectedSources: Source[]): string {
-  const sourceLine = selectedSources.length
-    ? selectedSources.map((source) => source.title).join(", ")
-    : "No selected sources";
-  const themes = extractThemes(selectedSources);
-
-  if (kind === "audio") {
-    return `# Audio Overview script
-
-Hosts open with the central question: what do these sources help us understand?
-
-- Segment 1: introduce the source set (${sourceLine}).
-- Segment 2: explain the top themes: ${themes.slice(0, 4).join(", ")}.
-- Segment 3: compare evidence and identify practical takeaways.
-- Closing: invite the listener to inspect citations and create a follow-up report.`;
-  }
-
-  if (kind === "video") {
-    return `# Video Overview outline
-
-- Scene 1: title card with the source collection.
-- Scene 2: animated source stack showing ${selectedSources.length || "no"} active items.
-- Scene 3: visual map of themes: ${themes.slice(0, 5).join(", ")}.
-- Scene 4: summary board with recommended next actions.
-
-Use the video board above as a storyboard reference for generated visuals.`;
-  }
-
-  if (kind === "mindmap") {
-    return `# Mind Map
-
-- Center: ${selectedSources[0]?.title ?? "Source collection"}.
-- Branch: source grounding and citations.
-- Branch: generated outputs and reusable notes.
-- Branch: user workflows and responsive panels.
-- Branch: risks, gaps, and follow-up questions.
-
-Promising connection: ${themes[0] ?? "source selection"} influences ${themes[1] ?? "answer quality"} and should shape each Studio output.`;
-  }
-
-  if (kind === "flashcards") {
-    return `# Flashcards
-
-- Front: Why are citations important in this workspace?
-  Back: They let users verify generated answers against source evidence.
-- Front: What are the three main workspace areas?
-  Back: Sources, Chat, and Studio.
-- Front: What should happen on mobile?
-  Back: The desktop panels should become tabs while preserving state.
-- Front: Name one expected Studio output.
-  Back: Audio overview, video overview, mind map, report, flashcards, quiz, or infographic.`;
-  }
-
-  if (kind === "quiz") {
-    return `# Quiz
-
-1. Which action keeps chat answers grounded?
-- Correct: selecting relevant sources before asking.
-
-2. What does Studio produce?
-- Correct: reusable outputs such as reports, audio overviews, videos, and mind maps.
-
-3. What is the main trust signal?
-- Correct: citations and clear generation disclosure.`;
-  }
-
-  if (kind === "infographic") {
-    return `# Infographic copy
-
-- Header: From sources to grounded outputs
-- Block 1: Collect documents, links, transcripts, and notes.
-- Block 2: Ask focused questions with citations.
-- Block 3: Generate Studio artifacts for different audiences.
-- Block 4: Save notes and continue the project history.`;
-  }
-
-  return `# Report
-
-Source set: ${sourceLine}
-
-Summary:
-- The selected sources point to a workspace built around source control, grounded chat, and generated artifacts.
-- Users need clear evidence trails, fast switching between panels, and persistent outputs.
-- Studio should support multiple artifacts of the same type for different audiences.
-
-Recommended actions:
-- Use selected sources for every important answer.
-- Save strong chat responses as notes.
-- Generate a report and study tools for downstream use.`;
-}
-
-function extractThemes(selectedSources: Source[]): string[] {
-  const allTokens = selectedSources.flatMap((source) => tokenize(source.body));
-  const counts = new Map<string, number>();
-  allTokens.forEach((token) => counts.set(token, (counts.get(token) ?? 0) + 1));
-  const themes = Array.from(counts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([token]) => token);
-  return themes.length ? themes : ["sources", "chat", "studio", "citations"];
-}
-
-function readFileAsSource(file: File): Promise<Source> {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      resolve(
-        buildSource({
-          title: file.name,
-          kind: inferKindFromName(file.name),
-          body:
-            result.trim() ||
-            `${file.name}\n\nThe browser could not extract readable text from this file. Paste important passages manually for grounded chat.`,
-        }),
-      );
-    };
-    reader.onerror = () => {
-      resolve(
-        buildSource({
-          title: file.name,
-          kind: inferKindFromName(file.name),
-          body: `${file.name}\n\nThis file could not be read locally. Paste source text to make it available to chat.`,
-        }),
-      );
-    };
-    reader.readAsText(file);
-  });
-}
-
-function buildSource({
-  title,
-  body,
-  kind,
-}: {
-  title: string;
-  body: string;
-  kind: SourceKind;
-}): Source {
-  const id = makeId("source");
-  return {
-    id,
-    title,
-    body,
-    kind,
-    selected: true,
-    createdAt: Date.now(),
-    accent: ACCENTS[Math.floor(Math.random() * ACCENTS.length)],
-  };
-}
-
-function createDiscoveredSources(topic: string): Source[] {
-  return [
-    buildSource({
-      title: `${topic}: overview`,
-      kind: "url",
-      body: `${topic} overview
-
-This generated starter source introduces the main vocabulary, known stakeholders, and practical use cases around ${topic}. It highlights the need to compare multiple sources before making decisions.
-
-Useful research questions include: what changed recently, who is affected, what evidence is strongest, and what remains uncertain?`,
-    }),
-    buildSource({
-      title: `${topic}: expert notes`,
-      kind: "doc",
-      body: `${topic} expert notes
-
-Experts describe ${topic} as a topic where synthesis matters more than collecting raw links. A useful notebook should preserve source provenance and separate direct evidence from interpretation.
-
-The strongest outputs combine concise summaries, clear citations, and next-step recommendations for the reader's role.`,
-    }),
-    buildSource({
-      title: `${topic}: study prompts`,
-      kind: "text",
-      body: `${topic} study prompts
-
-Key prompts:
-- Define the core terms in plain language.
-- Compare benefits, risks, and open questions.
-- Create a timeline of important changes.
-- Generate flashcards and a quiz for retention.
-
-These prompts are designed for chat, reports, and Studio study tools.`,
-    }),
-  ];
-}
-
-function inferKindFromName(fileName: string): SourceKind {
-  const lower = fileName.toLowerCase();
-  if (lower.endsWith(".pdf")) return "pdf";
-  if (lower.endsWith(".epub")) return "ebook";
-  if (lower.endsWith(".ppt") || lower.endsWith(".pptx")) return "slide";
-  if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image";
-  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "url";
-  return "doc";
-}
-
-function inferKindFromUrl(url: string): SourceKind {
-  const lower = url.toLowerCase();
-  if (lower.includes("youtube.com") || lower.includes("youtu.be")) return "youtube";
-  if (lower.endsWith(".pdf")) return "pdf";
-  if (lower.endsWith(".epub")) return "ebook";
-  return "url";
-}
-
-function getReadableUrlTitle(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return parsed.hostname.replace(/^www\./, "");
-  } catch {
-    return "Linked source";
-  }
-}
-
-function downloadText(artifact: Artifact) {
-  const blob = new Blob([artifact.body], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `${artifact.title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.txt`;
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
-}
-
-function countWords(input: string): number {
-  const words = input.match(/\b[\w-]+\b/g);
-  return words?.length ?? 0;
-}
-
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat("en", { notation: value > 9999 ? "compact" : "standard" }).format(value);
-}
-
-function formatRelativeTime(timestamp: number): string {
-  const diff = Date.now() - timestamp;
-  const minutes = Math.max(0, Math.round(diff / 60000));
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.round(hours / 24)}d`;
-}
-
-function truncate(input: string, maxLength: number): string {
-  const clean = input.replace(/\s+/g, " ").trim();
-  if (clean.length <= maxLength) return clean;
-  return `${clean.slice(0, maxLength - 1).trim()}...`;
-}
-
-function makeId(prefix: string): string {
-  if ("crypto" in window && typeof window.crypto.randomUUID === "function") {
-    return `${prefix}-${window.crypto.randomUUID()}`;
-  }
-  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-export default App;
