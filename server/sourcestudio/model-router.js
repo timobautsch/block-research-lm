@@ -232,8 +232,17 @@ export function createModelRouter({
 
   function providerModel(provider, role = "grounded_answer") {
     const artifactRole = role === "artifact_generation";
-    if (provider === "anthropic") return (artifactRole && env.ANTHROPIC_ARTIFACT_MODEL) || env.ANTHROPIC_MODEL || "claude-3-5-haiku-latest";
-    if (provider === "openai") return (artifactRole && env.OPENAI_ARTIFACT_MODEL) || env.OPENAI_MODEL || "gpt-4o-mini";
+    const groundedRole = role === "grounded_answer";
+    if (provider === "anthropic") {
+      if (artifactRole) return env.ANTHROPIC_ARTIFACT_MODEL || env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+      if (groundedRole) return env.ANTHROPIC_GROUNDED_MODEL || env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+      return env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+    }
+    if (provider === "openai") {
+      if (artifactRole) return env.OPENAI_ARTIFACT_MODEL || env.OPENAI_MODEL || "gpt-4o";
+      if (groundedRole) return env.OPENAI_GROUNDED_MODEL || env.OPENAI_MODEL || "gpt-4o";
+      return env.OPENAI_MODEL || "gpt-4o-mini";
+    }
     if (provider === "google") return (artifactRole && env.GOOGLE_ARTIFACT_MODEL) || env.GOOGLE_MODEL || "gemini-1.5-flash";
     return LOCAL_MODEL;
   }
@@ -257,13 +266,15 @@ export function createModelRouter({
       body: JSON.stringify({
         model,
         max_tokens: options.maxTokens || 1200,
-        temperature: 0,
         system: options.systemPrompt || groundedSystemPrompt(),
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const body = await safeJson(response);
-    if (!response.ok) throw new Error(`Anthropic ${options.role || "generation"} failed with ${response.status}.`);
+    if (!response.ok) {
+      const detail = body?.error?.message ? `: ${String(body.error.message).slice(0, 160)}` : "";
+      throw new Error(`Anthropic ${options.role || "generation"} failed with ${response.status}${detail}.`);
+    }
     return (body.content || []).map((part) => part.text || "").join("\n").trim();
   }
 
@@ -372,12 +383,29 @@ export function createModelRouter({
     delete run.started_at_ms;
   }
 
+  async function generateStructured({ role = "artifact_generation", systemPrompt, prompt, maxTokens = 1800, startRun } = {}) {
+    const selected = selectProvider(role);
+    if (selected.provider === "local") {
+      return { text: "", provider: "local", model: LOCAL_MODEL };
+    }
+    const run = startRun ? startRun(role, selected.provider, selected.model, prompt) : null;
+    try {
+      const text = await callProvider(selected.provider, selected.model, prompt, { role, systemPrompt, maxTokens });
+      if (run) finishRun(run, "completed", text);
+      return { text, provider: selected.provider, model: selected.model, run };
+    } catch (error) {
+      if (run) finishRun(run, "failed", "", safeError(error));
+      return { text: "", provider: selected.provider, model: selected.model, run, error: safeError(error) };
+    }
+  }
+
   return {
     status,
     selectProvider,
     generateGroundedAnswer,
     generateAudioScript,
     generateArtifactPayload,
+    generateStructured,
   };
 }
 
@@ -503,9 +531,9 @@ function collectJsonStrings(value) {
 }
 
 function artifactMaxTokens(type) {
-  if (["report", "slide-deck", "audio", "video"].includes(type)) return 2600;
-  if (["mindmap", "quiz", "infographic"].includes(type)) return 2000;
-  return 1600;
+  if (["report", "slide-deck", "audio", "video"].includes(type)) return 4096;
+  if (["mindmap", "quiz", "infographic", "data-table", "flashcards"].includes(type)) return 3200;
+  return 2400;
 }
 
 function groundedSystemPrompt() {

@@ -240,10 +240,11 @@ app.use((error, req, res, next) => {
   });
 });
 
-app.listen(port, "127.0.0.1", () => {
+const host = process.env.HOST || (isProduction ? "0.0.0.0" : "127.0.0.1");
+app.listen(port, host, () => {
   const health = engine.health();
   console.log(
-    `Nanas Block Research LM running at http://127.0.0.1:${port}/ (${health.provider}, storage: ${health.providers.storage_dir})`,
+    `Nanas Block Research LM running at http://${host}:${port}/ (${health.provider}, storage: ${health.providers.storage_dir})`,
   );
 });
 

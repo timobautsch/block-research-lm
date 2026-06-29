@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent, ReactNode } from "react";
+import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
 import {
   ArrowRight,
   AudioLines,
@@ -10,11 +10,13 @@ import {
   Circle,
   ClipboardList,
   Compass,
+  Copy,
   Database,
   Download,
   FileText,
   GitBranch,
   Globe,
+  Image,
   KeyRound,
   Layers3,
   Library,
@@ -46,10 +48,12 @@ import {
   UserCircle,
   UserPlus,
   Video,
+  X,
   XCircle,
+  Youtube,
 } from "lucide-react";
 
-type SourceType = "markdown" | "text" | "pdf" | "url" | "note" | "docx" | "youtube" | "audio" | "google_doc";
+type SourceType = "markdown" | "text" | "pdf" | "url" | "note" | "docx" | "youtube" | "audio" | "google_doc" | "image";
 type SourceStatus = "pending" | "parsing" | "indexed" | "failed";
 type AnswerStyle = "Strict" | "Balanced" | "Exploratory";
 type ArtifactType =
@@ -61,7 +65,9 @@ type ArtifactType =
   | "slide-deck"
   | "audio"
   | "video"
-  | "infographic";
+  | "infographic"
+  | "youtube-kit"
+  | "thumbnail";
 type AudioFormat = "deep_dive" | "brief" | "critique" | "debate";
 type AudioLength = "short" | "default" | "long";
 type FlashcardDifficulty = "mixed" | "easy" | "medium" | "hard";
@@ -494,6 +500,8 @@ const artifactTypes: Array<{
   action: string;
   icon: ReactNode;
 }> = [
+  { type: "youtube-kit", title: "Title & Description", action: "YouTube", icon: <Youtube size={18} /> },
+  { type: "thumbnail", title: "Thumbnail", action: "Image", icon: <Image size={18} /> },
   { type: "audio", title: "Audio Overview", action: "Script", icon: <AudioLines size={18} /> },
   { type: "slide-deck", title: "Slide Deck", action: "Beta", icon: <Presentation size={18} /> },
   { type: "video", title: "Video Overview", action: "Storyboard", icon: <Video size={18} /> },
@@ -514,6 +522,13 @@ const sourceTypeOptions: Array<{ type: SourceType; label: string }> = [
   { type: "pdf", label: "PDF" },
   { type: "docx", label: "DOCX" },
   { type: "audio", label: "Audio" },
+];
+
+const sourceTabs: Array<{ type: SourceType; label: string; icon: ReactNode }> = [
+  { type: "markdown", label: "Paste text", icon: <FileText size={15} /> },
+  { type: "url", label: "Website", icon: <Globe size={15} /> },
+  { type: "youtube", label: "YouTube", icon: <Youtube size={15} /> },
+  { type: "note", label: "Note", icon: <NotebookPen size={15} /> },
 ];
 
 const audioFormatOptions: Array<{ value: AudioFormat; label: string }> = [
@@ -630,6 +645,10 @@ export default function App() {
   const [isArtifactDetailOpen, setIsArtifactDetailOpen] = useState(false);
   const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
+  const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail">("");
+  const [thumbnailPrompt, setThumbnailPrompt] = useState("");
+  const [thumbnailRefs, setThumbnailRefs] = useState<string[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
   const [openMenu, setOpenMenu] = useState<"" | "settings" | "account" | "notebooks">("");
   const [isDebugOpen, setIsDebugOpen] = useState(false);
   const [debugStatus, setDebugStatus] = useState<DebugStatusResponse | null>(null);
@@ -658,10 +677,6 @@ export default function App() {
   const latestAssistant = useMemo(
     () => [...(notebook?.messages || [])].reverse().find((message) => message.role === "assistant"),
     [notebook?.messages],
-  );
-  const topicMap = useMemo(
-    () => notebook?.knowledge.find((item) => item.type === "topic_map")?.data?.topics as Array<{ label: string; weight: number }> | undefined,
-    [notebook],
   );
   const isSourceReady = useMemo(() => {
     const body = sourceForm.body.trim();
@@ -778,7 +793,8 @@ export default function App() {
       setActiveSourceId("");
       setSelectedArtifactId("");
       await refreshNotebookList();
-      setToast("New notebook created.");
+      setMobilePanel("sources");
+      openAddSource();
     } catch (createError) {
       setError(messageFromError(createError));
     } finally {
@@ -955,9 +971,7 @@ export default function App() {
     }
   }
 
-  async function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  async function processFile(file: File) {
     const base64 = await fileToBase64(file);
     const text = file.type.includes("text") || file.name.endsWith(".md") ? await file.text() : "";
     setSourceFormNotice("");
@@ -970,6 +984,18 @@ export default function App() {
       base64,
       body: text || current.body,
     }));
+  }
+
+  async function handleFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) await processFile(file);
+  }
+
+  async function handleDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    setIsDragging(false);
+    const file = event.dataTransfer?.files?.[0];
+    if (file) await processFile(file);
   }
 
   async function toggleSource(source: Source) {
@@ -1044,7 +1070,9 @@ export default function App() {
               }
             : type === "flashcards"
               ? flashcardArtifactOptions(flashcardOptions)
-              : {},
+              : type === "thumbnail"
+                ? { prompt: thumbnailPrompt.trim(), reference_images: thumbnailRefs }
+                : {},
         }),
       });
       await refreshNotebook();
@@ -1080,6 +1108,21 @@ export default function App() {
   function startNoteSource() {
     setMobilePanel("sources");
     openAddSource("note");
+  }
+
+  async function handleThumbnailRefs(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    const urls = await Promise.all(
+      files.map(
+        (file) =>
+          new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.readAsDataURL(file);
+          }),
+      ),
+    );
+    setThumbnailRefs((current) => [...current, ...urls.filter(Boolean)].slice(0, 4));
   }
 
   function exportNotebook() {
@@ -1391,38 +1434,16 @@ export default function App() {
               </article>
             ))}
           </div>
-
-          <SourceDetail source={activeSource} blocks={sourceBlocks} highlightedBlockIds={highlightedBlockIds} />
         </section>
 
         <section className="panel chat-panel" aria-label="Chat panel">
           <div className="chat-toolbar">
-            <div>
-              <p className="panel-eyebrow">Chat</p>
-              <h2>Ask your sources</h2>
+            <div className="panel-header-lead">
+              <span className="panel-icon"><MessageSquareText size={18} /></span>
+              <h2>Chat</h2>
             </div>
-            <button className="ghost-button compact" type="button" onClick={() => setIsGroundingDetailOpen(true)}>
-              <ShieldCheck size={15} />
-              Grounding
-            </button>
-          </div>
-
-          <div className="chat-context">
-            <span className="context-chip">
-              <Library size={15} />
-              {activeCount} active sources
-            </span>
-            <span className="context-chip">
-              <GitBranch size={15} />
-              Evidence Pack
-            </span>
-            <span className="context-chip wide" title={notebook?.summary || "Knowledge Layer building from active sources."}>
-              <Sparkles size={15} />
-              {truncate(notebook?.summary || "Knowledge Layer ready", 44)}
-            </span>
-          </div>
-
-          <div className="answer-mode" aria-label="Answer mode">
+            <div className="chat-toolbar-actions">
+              <div className="answer-mode" aria-label="Answer style">
             {(["Strict", "Balanced", "Exploratory"] as AnswerStyle[]).map((mode) => (
               <button
                 key={mode}
@@ -1433,14 +1454,20 @@ export default function App() {
                 {mode}
               </button>
             ))}
+              </div>
+              <button className="ghost-button compact grounding-button" type="button" onClick={() => setIsGroundingDetailOpen(true)}>
+                <ShieldCheck size={15} />
+                Grounding
+              </button>
+            </div>
           </div>
 
           <div className="messages" ref={messagesRef} role="log" aria-live="polite">
             {!notebook?.messages.length ? (
               <ResearchCanvas
                 activeCount={activeCount}
+                suggestions={notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions}
                 onAsk={(prompt) => void askQuestion(prompt)}
-                topicMap={topicMap || []}
               />
             ) : (
               notebook.messages.map((message) => (
@@ -1450,21 +1477,13 @@ export default function App() {
             {isAsking ? <ThinkingBubble /> : null}
           </div>
 
-          <div className="prompt-suggestions" aria-label="Suggested prompts">
-            {(notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions).map((prompt) => (
-              <button key={prompt} type="button" onClick={() => void askQuestion(prompt)}>
-                {prompt}
-              </button>
-            ))}
-          </div>
-
           <form className="chat-input" onSubmit={(event) => {
             event.preventDefault();
             void askQuestion();
           }}>
             <textarea
               value={question}
-              placeholder="Ask anything about active sources..."
+              placeholder={activeCount ? "Ask anything about your sources…" : "Add a source to start asking…"}
               rows={1}
               onChange={(event) => setQuestion(event.target.value)}
               onKeyDown={(event) => {
@@ -1474,17 +1493,32 @@ export default function App() {
                 }
               }}
             />
-            <button className="send-button" type="submit" disabled={!question.trim() || isAsking}>
-              {isAsking ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-            </button>
+            <div className="chat-input-tools">
+              <span className="source-count-chip" title={`${activeCount} active source${activeCount === 1 ? "" : "s"}`}>
+                <Library size={13} />
+                {activeCount} {activeCount === 1 ? "source" : "sources"}
+              </span>
+              <button className="send-button" type="submit" disabled={!question.trim() || isAsking} aria-label="Send message">
+                {isAsking ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+              </button>
+            </div>
           </form>
 
-          <GroundingPanel message={latestAssistant} />
+          <p className="ai-disclaimer">
+            {ASSISTANT_NAME} can be inaccurate — answers stay grounded in your active sources, but double-check anything important.
+          </p>
         </section>
 
         <section className="panel studio-panel" aria-label="Studio panel">
           <PanelHeader icon={<Sparkles size={18} />} title="Studio" count={notebook?.artifacts.length || 0} />
 
+          {customizeType === "audio" ? (
+          <div className="modal-backdrop" role="presentation" onClick={() => setCustomizeType("")}>
+          <section className="modal customize-modal" role="dialog" aria-modal="true" aria-label="Customize audio overview" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-header">
+            <div><h2>Customize Audio Overview</h2></div>
+            <button className="icon-button subtle" type="button" onClick={() => setCustomizeType("")} aria-label="Close customize"><X size={18} /></button>
+          </div>
           <section className="audio-config" aria-label="Audio overview settings">
             <div className="audio-config-row">
               <label>
@@ -1537,10 +1571,26 @@ export default function App() {
               />
             </label>
           </section>
+          <div className="modal-actions">
+            <button className="secondary-button" type="button" onClick={() => setCustomizeType("")}>Cancel</button>
+            <button className="primary-button" type="button" onClick={() => { setCustomizeType(""); void createArtifact("audio"); }}>
+              <Sparkles size={15} /> Generate
+            </button>
+          </div>
+          </section>
+          </div>
+          ) : null}
 
+          {customizeType === "flashcards" ? (
+          <div className="modal-backdrop" role="presentation" onClick={() => setCustomizeType("")}>
+          <section className="modal customize-modal" role="dialog" aria-modal="true" aria-label="Customize flashcards" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-header">
+            <div><h2>Customize Flashcards</h2></div>
+            <button className="icon-button subtle" type="button" onClick={() => setCustomizeType("")} aria-label="Close customize"><X size={18} /></button>
+          </div>
           <section className="flashcard-config" aria-label="Flashcard settings">
             <div className="section-heading">
-              <strong>Flashcards</strong>
+              <strong>Card options</strong>
               <span>{flashcardOptions.count} cards</span>
             </div>
             <div className="flashcard-config-grid">
@@ -1675,6 +1725,61 @@ export default function App() {
               ) : null}
             </div>
           </section>
+          <div className="modal-actions">
+            <button className="secondary-button" type="button" onClick={() => setCustomizeType("")}>Cancel</button>
+            <button className="primary-button" type="button" onClick={() => { setCustomizeType(""); void createArtifact("flashcards"); }}>
+              <Sparkles size={15} /> Generate
+            </button>
+          </div>
+          </section>
+          </div>
+          ) : null}
+
+          {customizeType === "thumbnail" ? (
+          <div className="modal-backdrop" role="presentation" onClick={() => setCustomizeType("")}>
+          <section className="modal customize-modal" role="dialog" aria-modal="true" aria-label="Create thumbnail" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-header">
+            <div><h2>Create Thumbnail</h2></div>
+            <button className="icon-button subtle" type="button" onClick={() => setCustomizeType("")} aria-label="Close customize"><X size={18} /></button>
+          </div>
+          <div className="thumbnail-config">
+            <label className="modal-field">
+              <span>Style / prompt (optional)</span>
+              <textarea
+                value={thumbnailPrompt}
+                onChange={(event) => setThumbnailPrompt(event.target.value)}
+                rows={3}
+                placeholder="e.g. dramatic, big face on the left, bold colors, space for text on the right. Leave empty to auto-build from the video."
+              />
+            </label>
+            <label className="upload-dropzone thumb-dropzone">
+              <UploadCloud size={22} />
+              <strong>{thumbnailRefs.length ? `${thumbnailRefs.length} reference image(s) attached` : "Add reference images (optional)"}</strong>
+              <p>Face, logo, product — gpt-image-1 blends them into the thumbnail.</p>
+              <input type="file" accept="image/*" multiple onChange={(event) => void handleThumbnailRefs(event)} />
+            </label>
+            {thumbnailRefs.length ? (
+              <div className="thumb-ref-row">
+                {thumbnailRefs.map((src, index) => (
+                  <span key={index} className="thumb-ref">
+                    <img src={src} alt="" />
+                    <button type="button" onClick={() => setThumbnailRefs(thumbnailRefs.filter((_, position) => position !== index))} aria-label="Remove reference">
+                      <X size={12} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <div className="modal-actions">
+            <button className="secondary-button" type="button" onClick={() => setCustomizeType("")}>Cancel</button>
+            <button className="primary-button" type="button" onClick={() => { setCustomizeType(""); void createArtifact("thumbnail"); }}>
+              <Image size={15} /> Generate
+            </button>
+          </div>
+          </section>
+          </div>
+          ) : null}
 
           <div className="studio-grid">
             {artifactTypes.map((artifact) => (
@@ -1683,13 +1788,21 @@ export default function App() {
                 className="studio-tile"
                 data-kind={artifact.type}
                 type="button"
-                onClick={() => void createArtifact(artifact.type)}
+                onClick={() => {
+                  if (artifact.type === "audio" || artifact.type === "flashcards" || artifact.type === "thumbnail") {
+                    setCustomizeType(artifact.type);
+                  } else {
+                    void createArtifact(artifact.type);
+                  }
+                }}
                 disabled={Boolean(isCreatingArtifact)}
               >
+                {artifact.type === "slide-deck" || artifact.type === "infographic" ? (
+                  <span className="beta-badge">Beta</span>
+                ) : null}
                 <span className="studio-icon">{isCreatingArtifact === artifact.type ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
                 <span>
                   <strong>{artifact.title}</strong>
-                  <small>{artifact.action}</small>
                 </span>
                 <span className="studio-chevron">
                   <ArrowRight size={14} />
@@ -1698,40 +1811,40 @@ export default function App() {
             ))}
           </div>
 
-          <div className="studio-divider" />
-
-          <div className="section-heading studio-list-heading">
-            <strong>Artifact gallery</strong>
-            <span>{notebook?.jobs.filter((job) => job.status === "completed").length || 0}</span>
-          </div>
-
-          <div className="artifact-list">
-            {notebook?.artifacts.map((artifact) => (
-              <button
-                key={artifact.id}
-                type="button"
-                className="artifact-row"
-                data-active={artifact.id === selectedArtifact?.id}
-                data-kind={artifact.type}
-                onClick={() => {
-                  setSelectedArtifactId(artifact.id);
-                  setIsArtifactDetailOpen(true);
-                }}
-              >
-                <span className="artifact-icon" data-kind={artifact.type}>{artifactIcon(artifact.type)}</span>
-                <span>
-                  <strong>{artifact.title}</strong>
-                  <small>
-                    {artifact.type} · {artifact.source_refs_json.length} refs
-                  </small>
-                </span>
-                <span className="artifact-row-actions">
-                  {artifact.type === "audio" && artifact.content_json.audio_url ? <PlayCircle size={16} /> : null}
-                  <MoreVertical size={16} />
-                </span>
-              </button>
-            ))}
-          </div>
+          {notebook?.artifacts.length ? (
+            <>
+              <div className="studio-divider" />
+              <div className="section-heading studio-list-heading">
+                <strong>Outputs</strong>
+                <span>{notebook.artifacts.length}</span>
+              </div>
+              <div className="artifact-list">
+                {notebook.artifacts.map((artifact) => (
+                  <button
+                    key={artifact.id}
+                    type="button"
+                    className="artifact-row"
+                    data-active={artifact.id === selectedArtifact?.id}
+                    data-kind={artifact.type}
+                    onClick={() => {
+                      setSelectedArtifactId(artifact.id);
+                      setIsArtifactDetailOpen(true);
+                    }}
+                  >
+                    <span className="artifact-icon" data-kind={artifact.type}>{artifactIcon(artifact.type)}</span>
+                    <span>
+                      <strong>{artifact.title}</strong>
+                      <small>{artifactMetaLine(artifact)}</small>
+                    </span>
+                    <span className="artifact-row-actions">
+                      {artifact.type === "audio" || artifact.type === "video" ? <PlayCircle size={16} /> : null}
+                      <MoreVertical size={16} />
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : null}
 
           <button className="add-note-button" type="button" onClick={startNoteSource}>
             <NotebookPen size={16} />
@@ -1748,46 +1861,64 @@ export default function App() {
 
       {isAddSourceOpen ? (
         <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsAddSourceOpen(false)}>
-          <section className="modal source-modal" role="dialog" aria-modal="true" aria-label="Add source" onClick={(event) => event.stopPropagation()}>
+          <section className="modal add-source-modal" role="dialog" aria-modal="true" aria-label="Add sources" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <div>
-                <p className="panel-eyebrow">Source ingestion</p>
-                <h2>Add source</h2>
+                <h2>Add sources</h2>
               </div>
-              <button className="icon-button subtle" type="button" onClick={() => setIsAddSourceOpen(false)} aria-label="Close add source">
-                <XCircle size={17} />
+              <button className="icon-button subtle" type="button" onClick={() => setIsAddSourceOpen(false)} aria-label="Close add sources">
+                <X size={18} />
               </button>
             </div>
-            <form className="modal-form source-create" onSubmit={(event) => void handleSourceSubmit(event)}>
-              <div className="source-create-row">
-                <label>
-                  <span>Type</span>
-                  <select
-                    value={sourceForm.type}
-                    onChange={(event) => setSourceForm((current) => ({ ...current, type: event.target.value as SourceType }))}
-                  >
-                    {sourceTypeOptions.map((option) => (
-                      <option key={option.type} value={option.type}>{option.label}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="file-button">
-                  <UploadCloud size={15} />
-                  File
-                  <input type="file" accept={sourceFileAccept(sourceForm.type)} onChange={(event) => void handleFile(event)} />
-                </label>
-              </div>
-              <label>
-                <span>Title</span>
-                <input
-                  value={sourceForm.title}
-                  onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
-                  placeholder={`${sourceTypeLabel(sourceForm.type)} title`}
-                />
+            <p className="modal-intro">
+              {ASSISTANT_NAME} grounds every answer in the sources you add — upload files, paste text, or link a website or YouTube video.
+            </p>
+            <form className="add-source-form" onSubmit={(event) => void handleSourceSubmit(event)}>
+              <label
+                className="add-source-dropzone"
+                data-drag={isDragging}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setIsDragging(true);
+                }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={(event) => void handleDrop(event)}
+              >
+                <UploadCloud size={30} />
+                <strong>Drop a file here, or click to upload</strong>
+                <p>PDF, Markdown, text, DOCX, images, audio — and more.</p>
+                {sourceForm.file_name ? (
+                  <span className="add-source-attached">
+                    <CheckCircle2 size={14} /> {sourceForm.file_name}
+                  </span>
+                ) : null}
+                <input type="file" accept={sourceFileAccept(sourceForm.type)} onChange={(event) => void handleFile(event)} />
               </label>
+
+              <div className="add-source-or"><span>or</span></div>
+
+              <div className="add-source-types" role="tablist" aria-label="Source type">
+                {sourceTabs.map((tab) => (
+                  <button
+                    key={tab.type}
+                    type="button"
+                    role="tab"
+                    aria-selected={sourceForm.type === tab.type}
+                    onClick={() => {
+                      setSourceFormNotice("");
+                      setSourceForm((current) => ({ ...current, type: tab.type, file_name: "", base64: undefined }));
+                      window.requestAnimationFrame(() => sourceBodyRef.current?.focus());
+                    }}
+                  >
+                    {tab.icon}
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
               {sourceNeedsUrl(sourceForm.type) ? (
-                <label>
-                  <span>URL</span>
+                <label className="modal-field">
+                  <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
                   <input
                     value={sourceForm.original_url}
                     onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
@@ -1796,26 +1927,36 @@ export default function App() {
                   />
                 </label>
               ) : null}
-              <label>
-                <span>{sourceBodyLabel(sourceForm.type)}</span>
-                <textarea
-                  ref={sourceBodyRef}
-                  value={sourceForm.body}
-                  onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
-                  placeholder={sourceBodyPlaceholder(sourceForm.type)}
-                  aria-invalid={Boolean(sourceFormNotice)}
-                  rows={7}
+
+              {sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note" ? (
+                <label className="modal-field">
+                  <span>{sourceBodyLabel(sourceForm.type)}</span>
+                  <textarea
+                    ref={sourceBodyRef}
+                    value={sourceForm.body}
+                    onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
+                    placeholder={sourceBodyPlaceholder(sourceForm.type)}
+                    aria-invalid={Boolean(sourceFormNotice)}
+                    rows={5}
+                  />
+                </label>
+              ) : null}
+
+              <label className="modal-field">
+                <span>Title (optional)</span>
+                <input
+                  value={sourceForm.title}
+                  onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
+                  placeholder="We infer one from the content"
                 />
               </label>
-              {sourceForm.file_name ? <p className="source-form-note">Attached: {sourceForm.file_name}</p> : null}
+
               {sourceFormNotice ? <p className="source-form-help">{sourceFormNotice}</p> : null}
-              <div className="modal-action-grid">
+              <div className="modal-actions">
+                <button className="secondary-button" type="button" onClick={() => setIsAddSourceOpen(false)}>Cancel</button>
                 <button className="primary-button" type="submit" disabled={isAddingSource}>
                   {isAddingSource ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
                   Add source
-                </button>
-                <button className="ghost-button compact" type="button" onClick={() => setSourceForm({ ...emptySourceForm, type: sourceForm.type })}>
-                  Clear
                 </button>
               </div>
             </form>
@@ -2420,44 +2561,31 @@ function SourceDetail({
 
 function ResearchCanvas({
   activeCount,
+  suggestions,
   onAsk,
-  topicMap,
 }: {
   activeCount: number;
+  suggestions: string[];
   onAsk: (prompt: string) => void;
-  topicMap: Array<{ label: string; weight: number }>;
 }) {
   return (
-    <section className="research-canvas" aria-label="Research workspace start">
-      <div className="canvas-kicker">
-        <Sparkles size={16} />
-        {ASSISTANT_NAME} desk
-      </div>
-      <h3>{activeCount || "No"} active sources ready for grounded synthesis</h3>
+    <section className="research-canvas" aria-label="Start a conversation">
+      <span className="canvas-mark">
+        <Sparkles size={22} />
+      </span>
+      <h3>{activeCount ? "Ask anything about your sources" : "Add a source to get started"}</h3>
       <p>
-        Evidence Packs, Citation Ledgers, and Studio artifacts are built from active source blocks.
+        {activeCount
+          ? `${ASSISTANT_NAME} answers only from your ${activeCount} active source${activeCount === 1 ? "" : "s"} — with a citation for every claim.`
+          : "Upload a document, paste text, add a note, or link a website. Every answer stays grounded in what you add."}
       </p>
-      <div className="canvas-actions">
-        <button type="button" aria-label="Summarize active sources" title="Summarize active sources" onClick={() => onAsk("Summarize the active sources with citations.")}>
-          <ClipboardList size={16} />
-          <span className="canvas-action-label">Summarize</span>
-        </button>
-        <button type="button" aria-label="Find contradictions" title="Find contradictions" onClick={() => onAsk("Find contradictions or open questions in the sources.")}>
-          <GitBranch size={16} />
-          <span className="canvas-action-label">Compare evidence</span>
-        </button>
-        <button type="button" aria-label="Explain product coverage" title="Explain product coverage" onClick={() => onAsk("What does Block Research AI appear to offer across the website and blog sources?")}>
-          <Sparkles size={16} />
-          <span className="canvas-action-label">Coverage</span>
-        </button>
-      </div>
-      {topicMap.length ? (
-        <div className="canvas-metrics">
-          {topicMap.slice(0, 4).map((topic) => (
-            <span key={topic.label}>
-              <Compass size={13} />
-              {topic.label}
-            </span>
+      {activeCount && suggestions.length ? (
+        <div className="canvas-suggestions">
+          {suggestions.slice(0, 4).map((prompt) => (
+            <button key={prompt} type="button" onClick={() => onAsk(prompt)}>
+              <MessageSquareText size={15} />
+              <span>{prompt}</span>
+            </button>
           ))}
         </div>
       ) : null}
@@ -2476,7 +2604,7 @@ function ChatBubble({
     <article className="chat-bubble" data-role={message.role}>
       <span className="avatar">{message.role === "assistant" ? <Bot size={17} /> : <NotebookPen size={17} />}</span>
       <div className="bubble-body">
-        <div className="bubble-meta">
+        <div className="bubble-topline">
           <strong>{message.role === "assistant" ? ASSISTANT_NAME : "You"}</strong>
           {message.role === "assistant" && message.provider ? <span>{providerMeta(message)}</span> : null}
           {message.mode === "abstained" ? <span>Abstained</span> : null}
@@ -2497,26 +2625,83 @@ function ChatBubble({
   );
 }
 
+function renderInline(
+  text: string,
+  citations: Citation[],
+  onCitationClick: (citation: Citation) => void,
+  keyPrefix: string,
+) {
+  return text.split(/(\*\*[^*]+\*\*|\[\d+\])/g).map((token, index) => {
+    const key = `${keyPrefix}-${index}`;
+    const bold = /^\*\*([^*]+)\*\*$/.exec(token);
+    if (bold) return <strong key={key}>{bold[1]}</strong>;
+    const cite = /^\[(\d+)\]$/.exec(token);
+    if (cite) {
+      const citation = citations[Number(cite[1]) - 1];
+      if (citation) {
+        return (
+          <button key={key} type="button" className="inline-citation" onClick={() => onCitationClick(citation)}>
+            {token}
+          </button>
+        );
+      }
+    }
+    return token ? <span key={key}>{token}</span> : null;
+  });
+}
+
 function renderMessageContent(
   content: string,
   citations: Citation[],
   onCitationClick: (citation: Citation) => void,
 ) {
-  return content.split("\n").map((line, lineIndex) => (
-    <p key={`${line}-${lineIndex}`}>
-      {line.split(/(\[\d+\])/g).map((part, partIndex) => {
-        const match = /^\[(\d+)\]$/.exec(part);
-        if (!match) return <span key={`${part}-${partIndex}`}>{part}</span>;
-        const citation = citations[Number(match[1]) - 1];
-        if (!citation) return <span key={`${part}-${partIndex}`}>{part}</span>;
-        return (
-          <button key={`${part}-${partIndex}`} type="button" className="inline-citation" onClick={() => onCitationClick(citation)}>
-            {part}
-          </button>
-        );
-      })}
-    </p>
-  ));
+  const blocks: ReactNode[] = [];
+  let list: { ordered: boolean; items: string[] } | null = null;
+
+  const flushList = () => {
+    if (!list) return;
+    const current = list;
+    const key = `list-${blocks.length}`;
+    const items = current.items.map((item, i) => (
+      <li key={`${key}-${i}`}>{renderInline(item, citations, onCitationClick, `${key}-${i}`)}</li>
+    ));
+    blocks.push(current.ordered ? <ol key={key}>{items}</ol> : <ul key={key}>{items}</ul>);
+    list = null;
+  };
+
+  content.split("\n").forEach((raw, index) => {
+    const line = raw.trim();
+    const key = `b-${index}`;
+    if (!line) {
+      flushList();
+      return;
+    }
+    const heading = /^(#{1,3})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushList();
+      const inner = renderInline(heading[2], citations, onCitationClick, key);
+      blocks.push(heading[1].length === 1 ? <h4 key={key}>{inner}</h4> : <h5 key={key}>{inner}</h5>);
+      return;
+    }
+    const unordered = /^[-*]\s+(.*)$/.exec(line);
+    const ordered = /^(\d+)\.\s+(.*)$/.exec(line);
+    if (unordered) {
+      if (list?.ordered) flushList();
+      if (!list) list = { ordered: false, items: [] };
+      list.items.push(unordered[1]);
+      return;
+    }
+    if (ordered) {
+      if (list && !list.ordered) flushList();
+      if (!list) list = { ordered: true, items: [] };
+      list.items.push(ordered[2]);
+      return;
+    }
+    flushList();
+    blocks.push(<p key={key}>{renderInline(line, citations, onCitationClick, key)}</p>);
+  });
+  flushList();
+  return blocks;
 }
 
 function ThinkingBubble() {
@@ -2526,7 +2711,7 @@ function ThinkingBubble() {
         <Loader2 className="spin" size={17} />
       </span>
       <div className="bubble-body">
-        <div className="bubble-meta">
+        <div className="bubble-topline">
           <strong>{ASSISTANT_NAME}</strong>
           <span>Retrieving evidence</span>
         </div>
@@ -2830,6 +3015,93 @@ function ArtifactPayload({
   onToast: (message: string) => void;
   onError: (message: string) => void;
 }) {
+  if (typeof payload.image_data === "string" || typeof payload.image_prompt === "string") {
+    const image = String(payload.image_data || "");
+    return (
+      <div className="thumbnail-preview">
+        {image ? (
+          <img src={image} alt="Generated thumbnail" />
+        ) : (
+          <div className="thumb-empty">
+            <Image size={28} />
+            <p>{String(payload.image_status || "No image generated.")}</p>
+          </div>
+        )}
+        <div className="thumbnail-preview-actions">
+          {image ? (
+            <a className="secondary-button" href={image} download="thumbnail.png">
+              <Download size={15} /> Download
+            </a>
+          ) : null}
+        </div>
+        {payload.image_prompt ? <p className="thumb-prompt">{String(payload.image_prompt)}</p> : null}
+      </div>
+    );
+  }
+
+  if (Array.isArray(payload.titles) && Array.isArray(payload.chapters)) {
+    const titles = (payload.titles as string[]) || [];
+    const description = String(payload.description || "");
+    const chapters = (payload.chapters as Array<{ time?: string; label?: string }>) || [];
+    const tags = (payload.tags as string[]) || [];
+    const copy = (text: string, label: string) => {
+      void navigator.clipboard?.writeText(text);
+      onToast(`${label} copied.`);
+    };
+    return (
+      <div className="youtube-kit-preview">
+        <section>
+          <h4>Title options</h4>
+          <div className="yt-titles">
+            {titles.map((title, index) => (
+              <button key={index} type="button" className="yt-title" onClick={() => copy(title, "Title")}>
+                <span>{title}</span>
+                <Copy size={13} />
+              </button>
+            ))}
+          </div>
+        </section>
+        <section>
+          <div className="yt-section-head">
+            <h4>Description</h4>
+            <button type="button" onClick={() => copy(description, "Description")}>
+              <Copy size={13} /> Copy
+            </button>
+          </div>
+          <pre className="yt-description">{description}</pre>
+        </section>
+        {chapters.length ? (
+          <section>
+            <div className="yt-section-head">
+              <h4>Chapters</h4>
+              <button type="button" onClick={() => copy(chapters.map((chapter) => `${chapter.time} ${chapter.label}`).join("\n"), "Chapters")}>
+                <Copy size={13} /> Copy
+              </button>
+            </div>
+            <div className="yt-chapters">
+              {chapters.map((chapter, index) => (
+                <div key={index}>
+                  <strong>{chapter.time}</strong>
+                  <span>{chapter.label}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+        {tags.length ? (
+          <section>
+            <h4>Tags</h4>
+            <div className="yt-tags">
+              {tags.map((tag, index) => (
+                <span key={index}>{tag}</span>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </div>
+    );
+  }
+
   if (Array.isArray(payload.tldr) || Array.isArray(payload.key_points)) {
     return (
       <div className="report-preview">
@@ -3708,15 +3980,17 @@ function sourceAcceptsFile(type: SourceType) {
 function sourceFileAccept(type: SourceType) {
   if (type === "pdf") return ".pdf,application/pdf";
   if (type === "docx") return ".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  if (type === "audio") return "audio/*,.mp3,.m4a,.wav,.aac,.ogg";
-  return ".md,.txt,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (type === "audio") return "audio/*,video/*,.mp3,.m4a,.wav,.aac,.ogg,.mp4,.mov";
+  if (type === "image") return "image/*,.png,.jpg,.jpeg,.webp,.gif,.heic,.heif,.bmp,.tiff";
+  return ".md,.txt,.pdf,.docx,.csv,image/*,audio/*,video/*,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 }
 
 function sourceTypeFromFile(file: File): SourceType {
   const name = file.name.toLowerCase();
   if (file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
   if (name.endsWith(".docx")) return "docx";
-  if (file.type.startsWith("audio/") || /\.(mp3|m4a|wav|aac|ogg)$/i.test(name)) return "audio";
+  if (file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|heic|heif|bmp|tiff?|avif|ico)$/i.test(name)) return "image";
+  if (file.type.startsWith("audio/") || file.type.startsWith("video/") || /\.(mp3|m4a|wav|aac|ogg|opus|mp4|mov|avi|mpeg|wma)$/i.test(name)) return "audio";
   if (name.endsWith(".txt")) return "text";
   return "markdown";
 }
@@ -3756,12 +4030,54 @@ function formatCount(value: number) {
   return String(value);
 }
 
+function relativeTime(value: string) {
+  if (!value) return "";
+  const then = new Date(value).getTime();
+  if (Number.isNaN(then)) return "";
+  const minutes = Math.round((Date.now() - then) / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.round(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.round(months / 12)}y ago`;
+}
+
 function artifactIcon(type: ArtifactType) {
   return artifactTypes.find((artifact) => artifact.type === type)?.icon || <Sparkles size={18} />;
 }
 
 function artifactTitle(type: ArtifactType) {
   return artifactTypes.find((artifact) => artifact.type === type)?.title || type;
+}
+
+function estimateArtifactDuration(artifact: Artifact) {
+  if (artifact.type !== "audio" && artifact.type !== "video") return "";
+  const payload = artifact.content_json || {};
+  const transcript = (payload.transcript || payload.storyboard) as Array<{ text?: string; narration?: string }> | undefined;
+  if (!Array.isArray(transcript)) return "";
+  const words = transcript.reduce(
+    (sum, line) => sum + String(line.text || line.narration || "").trim().split(/\s+/).filter(Boolean).length,
+    0,
+  );
+  if (!words) return "";
+  const seconds = Math.round((words / 150) * 60);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function artifactMetaLine(artifact: Artifact) {
+  const parts: string[] = [];
+  const duration = estimateArtifactDuration(artifact);
+  if (duration) parts.push(duration);
+  parts.push(artifactTitle(artifact.type));
+  const refs = artifact.source_refs_json?.length || 0;
+  parts.push(`${refs} ${refs === 1 ? "source" : "sources"}`);
+  const rel = relativeTime(artifact.created_at);
+  if (rel) parts.push(rel);
+  return parts.join(" · ");
 }
 
 function normalizeFlashcardProgress(progress: FlashcardProgressPayload | undefined, total: number): FlashcardProgress {

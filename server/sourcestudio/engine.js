@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -50,6 +51,8 @@ export async function createSourceStudioEngine(options = {}) {
     localGroundedAnswer: generateGroundedAnswer,
     estimateTokens,
   });
+  const embedder = createEmbedder({ env, fetchImpl, logger });
+  const pgStore = createPgStore({ env, logger });
 
   await mkdir(fileDir, { recursive: true });
   await mkdir(artifactDir, { recursive: true });
@@ -225,18 +228,43 @@ export async function createSourceStudioEngine(options = {}) {
       source.updated_at = now();
 
       removeSourceDerivedRows(sourceId);
+      if (pgStore.enabled) {
+        await pgStore.deleteBySource(sourceId).catch((error) =>
+          logger.warn("pgvector.delete.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) }),
+        );
+      }
       state.blocks.push(...document.blocks);
       const chunks = chunkDocument(notebookId, source, document.blocks);
       state.chunks.push(...chunks);
+      const chunkVectors = await embedder.embed(chunks.map((chunk) => chunk.normalized_text), "document");
       state.embeddings.push(
-        ...chunks.map((chunk) => ({
+        ...chunks.map((chunk, index) => ({
           id: id("embedding"),
           chunk_id: chunk.id,
-          provider: chooseEmbeddingProvider(),
-          vector: embedText(chunk.normalized_text),
+          provider: embedder.provider,
+          model: embedder.model,
+          vector: chunkVectors[index] || embedText(chunk.normalized_text),
           created_at: now(),
         })),
       );
+      if (pgStore.enabled) {
+        try {
+          await pgStore.upsertChunks(
+            chunks.map((chunk, index) => ({
+              chunk_id: chunk.id,
+              notebook_id: notebookId,
+              source_id: sourceId,
+              owner_user_id: context.ownerUserId || "",
+              content: chunk.normalized_text || chunk.text || "",
+              heading_path: (chunk.heading_path || []).join(" / "),
+              metadata: { source_title: source.title },
+              embedding: chunkVectors[index],
+            })),
+          );
+        } catch (error) {
+          logger.warn("pgvector.upsert.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) });
+        }
+      }
       const sourceKnowledge = buildSourceKnowledgeObjects(source, document.blocks, chunks);
       state.knowledgeObjects.push(...sourceKnowledge);
       rebuildNotebookKnowledge(notebookId);
@@ -296,6 +324,11 @@ export async function createSourceStudioEngine(options = {}) {
     assertSourceAccess(source, context);
     state.sources = state.sources.filter((item) => item.id !== sourceId);
     removeSourceDerivedRows(sourceId);
+    if (pgStore.enabled) {
+      await pgStore.deleteBySource(sourceId).catch((error) =>
+        logger.warn("pgvector.delete.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) }),
+      );
+    }
     rebuildNotebookKnowledge(source.notebook_id);
     await persist();
     logger.warn("source.delete.complete", {
@@ -324,7 +357,7 @@ export async function createSourceStudioEngine(options = {}) {
         question_chars: questionChars,
         answer_style: parsed.answer_style,
       });
-      const evidencePack = buildEvidencePack({
+      const evidencePack = await buildEvidencePack({
         notebook_id: notebook.id,
         question: parsed.question,
         source_mode: parsed.source_mode,
@@ -462,7 +495,7 @@ export async function createSourceStudioEngine(options = {}) {
         progress: job.progress,
       });
       const query = artifactQuery(parsed.type, parsed.options);
-      const evidencePack = buildEvidencePack({
+      const evidencePack = await buildEvidencePack({
         notebook_id: notebook.id,
         question: query,
         source_mode: parsed.options.source_mode || "active",
@@ -486,29 +519,34 @@ export async function createSourceStudioEngine(options = {}) {
         ...parsed.options,
         artifact_id: artifactId,
       };
-      const artifactResult = await buildArtifactPayload(parsed.type, notebook, evidencePack, artifactOptions);
-      const localPayload = artifactResult?.payload || artifactResult;
-      const artifactModelRuns = artifactResult?.model_runs || [];
-      const generation = await modelRouter.generateArtifactPayload({
-        type: parsed.type,
-        notebook,
-        evidencePack,
-        options: artifactOptions,
-        localPayload,
-        startRun: startModelRun,
-      });
-      const artifactPayload = generation.payload;
-      if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
-        artifactPayload.generation_provider = generation.active_run.provider;
-        artifactPayload.generation_model = generation.active_run.model;
-        artifactPayload.generation_fallback_reason = generation.fallback_reason || "";
+      let artifactPayload;
+      let modelRunIds = [];
+      if (parsed.type === "youtube-kit") {
+        artifactPayload = await buildYouTubeKit(notebook, evidencePack, artifactOptions);
+      } else if (parsed.type === "thumbnail") {
+        artifactPayload = await buildThumbnail(notebook, evidencePack, artifactOptions);
+      } else {
+        const artifactResult = await buildArtifactPayload(parsed.type, notebook, evidencePack, artifactOptions);
+        const localPayload = artifactResult?.payload || artifactResult;
+        const artifactModelRuns = artifactResult?.model_runs || [];
+        const generation = await modelRouter.generateArtifactPayload({
+          type: parsed.type,
+          notebook,
+          evidencePack,
+          options: artifactOptions,
+          localPayload,
+          startRun: startModelRun,
+        });
+        artifactPayload = generation.payload;
+        if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
+          artifactPayload.generation_provider = generation.active_run.provider;
+          artifactPayload.generation_model = generation.active_run.model;
+          artifactPayload.generation_fallback_reason = generation.fallback_reason || "";
+          artifactPayload.evidence_audit = buildArtifactEvidenceAudit(evidencePack, artifactPayload);
+        }
+        state.modelRuns.push(...generation.model_runs, ...artifactModelRuns);
+        modelRunIds = [...generation.model_runs.map((run) => run.id), ...artifactModelRuns.map((run) => run.id)];
       }
-      if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
-        artifactPayload.evidence_audit = buildArtifactEvidenceAudit(evidencePack, artifactPayload);
-      }
-      state.modelRuns.push(...generation.model_runs, ...artifactModelRuns);
-
-      const modelRunIds = [...generation.model_runs.map((run) => run.id), ...artifactModelRuns.map((run) => run.id)];
       if (parsed.type === "audio") {
         const audioRun = await renderAudioArtifact({
           artifactDir,
@@ -558,8 +596,8 @@ export async function createSourceStudioEngine(options = {}) {
         progress: job.progress,
         source_refs: artifact.source_refs_json.length,
         model_runs: modelRunIds,
-        provider: generation.active_run.provider,
-        fallback_reason: generation.fallback_reason || "",
+        provider: artifactPayload.generation_provider || "local",
+        fallback_reason: artifactPayload.generation_fallback_reason || "",
         duration_ms: Date.now() - startedAt,
       });
       return { job, artifact, evidence_pack: evidencePack };
@@ -1325,19 +1363,66 @@ export async function createSourceStudioEngine(options = {}) {
       });
     }
     if (source.type === "audio") {
-      const rawText = payload.body?.trim()
-        ? payload.body
-        : `# Audio source: ${source.title}\n\nAudio file uploaded. Paste or import a transcript to make this source fully searchable. Timestamped transcription is a production extension.`;
+      let rawText = payload.body?.trim() || "";
+      let parser = rawText ? "audio-user-transcript" : "audio-transcript-required";
+      let transcriptionStatus = rawText ? "provided" : "missing";
+      if (!rawText && payload.base64 && realProviderKey(env.DEEPGRAM_API_KEY)) {
+        try {
+          const transcript = await transcribeAudioWithDeepgram(Buffer.from(payload.base64, "base64"), {
+            apiKey: realProviderKey(env.DEEPGRAM_API_KEY),
+            model: env.DEEPGRAM_MODEL || "nova-3",
+            fetchImpl,
+          });
+          if (transcript) {
+            rawText = `# Audio transcript\n\n${transcript}`;
+            parser = "deepgram-nova-3";
+            transcriptionStatus = "transcribed";
+          }
+        } catch (error) {
+          logger.warn("audio.transcription.failed", { error: String(error?.message || error).slice(0, 200) });
+        }
+      }
+      if (!rawText) {
+        rawText = `# Audio source: ${source.title}\n\nAudio file uploaded. Configure DEEPGRAM_API_KEY to transcribe automatically, or paste a transcript to make this source searchable.`;
+      }
       return parseMarkdownLikeDocument(source, {
         rawText,
         cleanedText: normalizeWhitespace(rawText),
-        parser: payload.body?.trim() ? "audio-transcript" : "audio-transcript-required",
-        fallback: !payload.body?.trim(),
+        parser,
+        fallback: parser === "audio-transcript-required",
         metadata: {
           file_name: payload.file_name || "",
           mime_type: payload.mime_type || "",
-          transcription_status: payload.body?.trim() ? "provided" : "missing",
+          transcription_status: transcriptionStatus,
         },
+      });
+    }
+    if (source.type === "image") {
+      let rawText = payload.body?.trim() || "";
+      let parser = rawText ? "image-caption-provided" : "image-undescribed";
+      if (!rawText && payload.base64) {
+        try {
+          const description = await describeImage(payload.base64, payload.mime_type, {
+            apiKey: realProviderKey(env.OPENAI_API_KEY),
+            fetchImpl,
+          });
+          if (description) {
+            rawText = `# Image: ${source.title}\n\n${description}`;
+            parser = `vision-${process.env.OPENAI_VISION_MODEL || "gpt-5.5"}`;
+          }
+        } catch (error) {
+          logger.warn("image.vision.failed", { error: String(error?.message || error).slice(0, 160) });
+        }
+      }
+      if (!rawText) {
+        rawText = `# Image source: ${source.title}\n\nImage uploaded. Configure OPENAI_API_KEY for vision description, or paste a caption.`;
+      }
+      return parseMarkdownLikeDocument(source, {
+        rawText,
+        cleanedText: normalizeWhitespace(rawText),
+        parser,
+        fallback: parser === "image-undescribed",
+        metadata: { file_name: payload.file_name || "", mime_type: payload.mime_type || "" },
       });
     }
     if (source.type === "docx") {
@@ -1391,14 +1476,20 @@ export async function createSourceStudioEngine(options = {}) {
       });
     }
     if (source.type === "pdf") {
-      const rawText = payload.base64
-        ? parsePdfFallback(Buffer.from(payload.base64, "base64"))
-        : payload.body || "";
+      let rawText = payload.body || "";
+      let parser = "pdf-pasted-text";
+      let fallback = !payload.body;
+      if (payload.base64) {
+        const extracted = await extractPdfText(Buffer.from(payload.base64, "base64"));
+        rawText = extracted.text || rawText;
+        parser = extracted.parser;
+        fallback = extracted.parser === "pdf-string-fallback";
+      }
       return parseMarkdownLikeDocument(source, {
         rawText,
         cleanedText: normalizeWhitespace(rawText || payload.body || ""),
-        parser: "pdf-string-fallback",
-        fallback: true,
+        parser,
+        fallback,
       });
     }
     return parseMarkdownLikeDocument(source, {
@@ -1645,7 +1736,7 @@ export async function createSourceStudioEngine(options = {}) {
       tokenCount = estimateTokens(overlapBlocks.map((block) => block.text).join(" "));
     };
 
-    for (const block of blocks) {
+    for (const block of splitOversizedBlocks(blocks)) {
       if (block.type === "heading") currentHeading = block.heading_path;
       const nextTokens = estimateTokens(block.text);
       if (current.length && tokenCount + nextTokens > CHUNK_TOKEN_TARGET) pushChunk();
@@ -1831,7 +1922,7 @@ export async function createSourceStudioEngine(options = {}) {
     );
   }
 
-  function buildEvidencePack({ notebook_id, question, source_mode = "active", selected_source_ids = [], artifact_type = "" }) {
+  async function buildEvidencePack({ notebook_id, question, source_mode = "active", selected_source_ids = [], artifact_type = "" }) {
     const notebook = state.notebooks.find((item) => item.id === notebook_id);
     if (!notebook) throw statusError(404, "Notebook not found.");
     const intent = detectIntent(question, artifact_type);
@@ -1844,10 +1935,19 @@ export async function createSourceStudioEngine(options = {}) {
     const queryTokens = tokenize(question);
     const rewrites = rewriteQuery(question, notebook_id, queryTokens);
     const corpusStats = buildRetrievalCorpusStats(sourceIds);
+    const queryVector = (await embedder.embed([rewrites.join(" ") || question], "query"))[0] || [];
     const candidateLimit = Math.max(evidenceLimit * RETRIEVAL_CANDIDATE_MULTIPLIER, RETRIEVAL_MIN_CANDIDATES);
+    let pgSimMap = null;
+    if (pgStore.enabled) {
+      try {
+        pgSimMap = await pgStore.nearest(queryVector, sourceIds, Math.max(50, candidateLimit));
+      } catch (error) {
+        logger.warn("pgvector.nearest.failed", { error: String(error?.message || error).slice(0, 160) });
+      }
+    }
     let scored = state.chunks
       .filter((chunk) => sourceIds.includes(chunk.source_id))
-      .map((chunk) => scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats))
+      .map((chunk) => scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector, pgSimMap))
       .filter((result) => result.include)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateLimit);
@@ -1951,7 +2051,7 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
-  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats) {
+  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector = [], pgSimMap = null) {
     const chunkTokens = tokenize(chunk.normalized_text);
     const keywordScore = queryTokens.reduce((sum, token) => {
       const exact = chunkTokens.filter((chunkToken) => chunkToken === token).length;
@@ -1961,16 +2061,37 @@ export async function createSourceStudioEngine(options = {}) {
     const keywordNorm = keywordScore / Math.max(1, queryTokens.length);
     const bm25Score = bm25QueryScore(queryTokens, chunkTokens, corpusStats);
     const rewriteScore = rewrites.reduce((sum, query) => sum + overlapScore(tokenize(query), chunkTokens), 0);
-    const embedding = state.embeddings.find((item) => item.chunk_id === chunk.id)?.vector || embedText(chunk.text);
-    const vectorScore = cosineSimilarity(embedText(rewrites.join(" ")), embedding);
+    const stored = state.embeddings.find((item) => item.chunk_id === chunk.id);
+    const chunkVector = stored?.vector;
+    const semantic = embedder.isSemantic;
+    let vectorScore = 0;
+    const pgSim = pgSimMap?.get(chunk.id);
+    if (typeof pgSim === "number") {
+      vectorScore = pgSim;
+    } else if (queryVector?.length && chunkVector?.length === queryVector.length && (stored?.provider || "local") === embedder.provider) {
+      vectorScore = cosineSimilarity(queryVector, chunkVector);
+    }
     const entityScore = getEntityScore(chunk, queryTokens);
     const summaryIntent = ["summary", "compare", "artifact", "table", "audio", "video", "slides", "mindmap"].includes(intent);
-    const score = keywordNorm * 0.24 + bm25Score * 0.28 + rewriteScore * 0.14 + vectorScore * 0.18 + entityScore * 0.16;
-    const include = summaryIntent ? score > 0.01 || chunk.token_count > 20 : keywordScore > 0 || entityScore > 0.1 || score > 0.26;
-    let supportType = "vector";
+    // With real (semantic) embeddings the dense signal carries meaning, so it
+    // dominates; with the local hash it is mostly lexical, so keep it small.
+    const weights = semantic
+      ? { keyword: 0.20, bm25: 0.22, rewrite: 0.10, vector: 0.40, entity: 0.12 }
+      : { keyword: 0.24, bm25: 0.28, rewrite: 0.14, vector: 0.18, entity: 0.16 };
+    const score =
+      keywordNorm * weights.keyword +
+      bm25Score * weights.bm25 +
+      rewriteScore * weights.rewrite +
+      vectorScore * weights.vector +
+      entityScore * weights.entity;
+    const semanticHit = semantic && vectorScore > 0.35;
+    const include = summaryIntent
+      ? score > 0.01 || chunk.token_count > 20
+      : keywordScore > 0 || entityScore > 0.1 || score > 0.26 || semanticHit;
+    let supportType = semanticHit && keywordScore === 0 ? "semantic" : "vector";
     if (keywordScore > 0) supportType = bm25Score > 0.2 ? "lexical" : "keyword";
     if (entityScore > 0.1) supportType = "entity";
-    if (summaryIntent && keywordScore === 0) supportType = "summary_context";
+    if (summaryIntent && keywordScore === 0) supportType = semantic ? "semantic_context" : "summary_context";
     return {
       chunk,
       score,
@@ -2361,6 +2482,145 @@ export async function createSourceStudioEngine(options = {}) {
       })),
       citations,
     };
+  }
+
+  function extractJsonBlock(text) {
+    const trimmed = String(text || "").trim();
+    if (trimmed.startsWith("{")) return trimmed;
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    return match ? match[0] : "{}";
+  }
+
+  function buildLocalChapters(evidencePack) {
+    const chapters = [];
+    const seen = new Set();
+    for (const item of evidencePack.evidence_items || []) {
+      const match = /\[(\d+):(\d{2})\]/.exec(item.quote || "");
+      if (match && !seen.has(match[0])) {
+        seen.add(match[0]);
+        chapters.push({
+          time: `${match[1]}:${match[2]}`,
+          label: truncate(stripCitations((item.quote || "").replace(/\[\d+:\d+\]/g, "")), 60),
+        });
+      }
+    }
+    if (!chapters.some((chapter) => chapter.time === "0:00")) chapters.unshift({ time: "0:00", label: "Intro" });
+    return chapters.slice(0, 12);
+  }
+
+  async function buildYouTubeKit(notebook, evidencePack, options = {}) {
+    const activeIds = evidencePack.active_source_ids || [];
+    const activeSources = state.sources.filter(
+      (source) => source.notebook_id === notebook.id && (activeIds.includes(source.id) || source.active),
+    );
+    const transcript = activeSources.map((source) => source.cleaned_text || "").join("\n\n").slice(0, 120000);
+    if (!transcript.trim()) {
+      return { title: "YouTube title & description", titles: [], description: "", chapters: [], tags: [], warning: "No active source transcript available." };
+    }
+    const language = options.language || "the language of the transcript";
+    const prompt = [
+      "You are a top YouTube growth strategist. From the timestamped transcript below, produce a complete publish kit.",
+      `Write everything in ${language}. Return STRICT JSON only (no markdown fences) with this exact shape:`,
+      '{"titles": ["..."], "description": "...", "chapters": [{"time": "M:SS", "label": "..."}], "tags": ["..."]}',
+      "Rules:",
+      "- titles: exactly 5 click-worthy but accurate options, each <= 70 characters, varied angles.",
+      "- description: a strong 2-3 sentence hook, then a concise summary, then a short call-to-action, as 3-6 short paragraphs separated by blank lines.",
+      "- chapters: derive real timestamps from the [M:SS] markers in the transcript. The first chapter MUST be 0:00. Use 4-12 concise chapters.",
+      "- tags: 10 relevant lowercase search tags.",
+      "- Base everything ONLY on the transcript. Do not invent facts and do not add citation markers like [1].",
+      "",
+      "Transcript:",
+      transcript,
+    ].join("\n");
+    const result = await modelRouter.generateStructured({
+      role: "artifact_generation",
+      systemPrompt: "You write YouTube publish kits as strict JSON only. No prose outside JSON.",
+      prompt,
+      maxTokens: 1800,
+      startRun: startModelRun,
+    });
+    if (result.run) state.modelRuns.push(result.run);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(extractJsonBlock(result.text));
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) {
+      return {
+        title: "YouTube title & description",
+        titles: [truncate(notebook.title, 70)],
+        description: (evidencePack.evidence_items || []).slice(0, 3).map((item) => stripCitations((item.quote || "").replace(/\[\d+:\d+\]/g, ""))).join(" "),
+        chapters: buildLocalChapters(evidencePack),
+        tags: [],
+        generation_provider: result.provider || "local",
+        generation_model: result.model || "local-grounded-v1",
+        warning: result.error ? `LLM generation failed: ${result.error}` : "Configure an LLM provider for higher-quality titles.",
+      };
+    }
+    return {
+      title: "YouTube title & description",
+      titles: Array.isArray(parsed.titles) ? parsed.titles.slice(0, 5) : [],
+      description: String(parsed.description || ""),
+      chapters: Array.isArray(parsed.chapters) ? parsed.chapters.slice(0, 12) : buildLocalChapters(evidencePack),
+      tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 12) : [],
+      generation_provider: result.provider,
+      generation_model: result.model,
+    };
+  }
+
+  async function buildThumbnail(notebook, evidencePack, options = {}) {
+    const topic = stripCitations((evidencePack.evidence_items?.[0]?.quote || notebook.title || "").replace(/\[\d+:\d+\]/g, "")).trim();
+    const imagePrompt = String(options.prompt || "").trim()
+      || `Bold, high-contrast YouTube thumbnail about: ${truncate(topic, 180)}. Eye-catching and professional, vivid colors, a strong central subject, dramatic lighting, leave clear negative space for a few words of overlaid text. No watermarks, no gibberish text.`;
+    const references = Array.isArray(options.reference_images) ? options.reference_images.filter(Boolean).slice(0, 4) : [];
+    const result = await generateThumbnailImage(imagePrompt, references);
+    return {
+      title: "YouTube thumbnail",
+      image_prompt: imagePrompt,
+      image_data: result.image_data || "",
+      image_status: result.image_data ? "rendered" : (result.error || "Image generation unavailable. Configure OpenAI billing for gpt-image-1."),
+      reference_count: references.length,
+      generation_provider: "openai",
+      generation_model: env.OPENAI_IMAGE_MODEL || "gpt-image-2",
+    };
+  }
+
+  async function generateThumbnailImage(prompt, references = []) {
+    const key = realProviderKey(env.OPENAI_API_KEY);
+    if (!key) return { error: "OpenAI key not configured." };
+    const imageModel = env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+    try {
+      let response;
+      if (references.length) {
+        const form = new FormData();
+        form.append("model", imageModel);
+        form.append("prompt", prompt);
+        form.append("size", "1536x1024");
+        references.forEach((ref, index) => {
+          const base64 = String(ref).replace(/^data:[^,]+,/, "");
+          form.append("image[]", new Blob([Buffer.from(base64, "base64")], { type: "image/png" }), `ref-${index}.png`);
+        });
+        response = await fetchImpl("https://api.openai.com/v1/images/edits", {
+          method: "POST",
+          headers: { authorization: `Bearer ${key}` },
+          body: form,
+        });
+      } else {
+        response = await fetchImpl("https://api.openai.com/v1/images/generations", {
+          method: "POST",
+          headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: imageModel, prompt, size: "1536x1024", n: 1 }),
+        });
+      }
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) return { error: body?.error?.message?.slice(0, 180) || `Image API failed with ${response.status}.` };
+      const b64 = body.data?.[0]?.b64_json;
+      if (!b64) return { error: "Image API returned no image." };
+      return { image_data: `data:image/png;base64,${b64}` };
+    } catch (error) {
+      return { error: String(error?.message || error).slice(0, 180) };
+    }
   }
 
   function buildFlashcardCards(citations, keyPoints, plan, evidencePack) {
@@ -3149,6 +3409,24 @@ export async function createSourceStudioEngine(options = {}) {
     if (type === "infographic" && payload.svg_markup) {
       return payload.svg_markup;
     }
+    if (type === "youtube-kit") {
+      return [
+        "# Title options",
+        ...(payload.titles || []).map((title) => `- ${title}`),
+        "",
+        "# Description",
+        payload.description || "",
+        "",
+        "# Chapters",
+        ...(payload.chapters || []).map((chapter) => `${chapter.time}  ${chapter.label}`),
+        "",
+        "# Tags",
+        (payload.tags || []).join(", "),
+      ].join("\n");
+    }
+    if (type === "thumbnail") {
+      return `# YouTube thumbnail\n\nPrompt: ${payload.image_prompt || ""}\nStatus: ${payload.image_status || ""}`;
+    }
     return JSON.stringify(payload, null, 2);
   }
 
@@ -3493,6 +3771,19 @@ function cleanHtml(html) {
   ).trim();
 }
 
+async function extractPdfText(buffer) {
+  try {
+    const { extractText, getDocumentProxy } = await import("unpdf");
+    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { text } = await extractText(pdf, { mergePages: true });
+    const cleaned = normalizeWhitespace(Array.isArray(text) ? text.join("\n\n") : String(text || ""));
+    if (cleaned.length > 40) return { text: cleaned, parser: "pdf-unpdf" };
+  } catch {
+    // Fall through to the byte-scan fallback (e.g. scanned/encrypted PDFs).
+  }
+  return { text: parsePdfFallback(buffer), parser: "pdf-string-fallback" };
+}
+
 function parsePdfFallback(buffer) {
   const text = buffer
     .toString("latin1")
@@ -3549,20 +3840,153 @@ function googleDocExportUrl(url) {
   }
 }
 
+// Vision description + OCR for image sources (GPT-4o-mini vision).
+async function describeImage(base64, mimeType, { apiKey, fetchImpl = globalThis.fetch } = {}) {
+  if (!apiKey) return "";
+  const dataUrl = String(base64).startsWith("data:") ? base64 : `data:${mimeType || "image/png"};base64,${base64}`;
+  const response = await fetchImpl("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: process.env.OPENAI_VISION_MODEL || "gpt-5.5",
+      max_completion_tokens: 1500,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Describe this image in thorough detail for a research notebook. Transcribe ALL visible text verbatim. Note any charts, diagrams, numbers, data, people, branding, and context. Be comprehensive and factual.",
+            },
+            { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+          ],
+        },
+      ],
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body?.error?.message?.slice(0, 160) || `Vision API failed with ${response.status}.`);
+  return body.choices?.[0]?.message?.content?.trim() || "";
+}
+
+// Audio/video transcription via Deepgram (Nova-3, diarized). ffmpeg normalizes
+// any input (incl. extracting audio from video) to a clean 16kHz mono MP3 first.
+async function transcribeAudioWithDeepgram(buffer, { apiKey, model = "nova-3", fetchImpl = globalThis.fetch } = {}) {
+  if (!apiKey) return "";
+  const audio = await normalizeAudioForAsr(buffer).catch(() => buffer);
+  const params = new URLSearchParams({
+    model,
+    smart_format: "true",
+    punctuate: "true",
+    diarize: "true",
+    utterances: "true",
+    detect_language: "true",
+  });
+  const response = await fetchImpl(`https://api.deepgram.com/v1/listen?${params.toString()}`, {
+    method: "POST",
+    headers: { authorization: `Token ${apiKey}`, "content-type": "audio/mpeg" },
+    body: audio,
+  });
+  if (!response.ok) throw new Error(`Deepgram transcription failed with ${response.status}.`);
+  const body = await response.json();
+  const utterances = body.results?.utterances;
+  if (Array.isArray(utterances) && utterances.length) {
+    const lines = [];
+    let lastSpeaker = null;
+    for (const utterance of utterances) {
+      const speaker = `Speaker ${(utterance.speaker ?? 0) + 1}`;
+      if (speaker !== lastSpeaker) {
+        lines.push(`${speaker}: ${utterance.transcript}`);
+        lastSpeaker = speaker;
+      } else {
+        lines[lines.length - 1] += ` ${utterance.transcript}`;
+      }
+    }
+    return lines.join("\n").trim();
+  }
+  return body.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+}
+
+async function normalizeAudioForAsr(buffer) {
+  const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
+  const workDir = await mkdtemp(join(tmpdir(), "ssai-asr-"));
+  const inputPath = join(workDir, "input");
+  const outputPath = join(workDir, "audio.mp3");
+  try {
+    await writeFile(inputPath, buffer);
+    await execFile(
+      ffmpegPath,
+      ["-y", "-i", inputPath, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k", outputPath],
+      { timeout: 240000, maxBuffer: 1024 * 1024 * 16 },
+    );
+    return await readFile(outputPath);
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+const YOUTUBE_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
   const videoId = youtubeVideoId(url);
   if (!videoId) {
     return `# YouTube source\n\nThe supplied URL did not include a YouTube video ID. Paste the transcript to index this source.\n\nSource URL: ${url || "n/a"}`;
   }
-  for (const lang of ["en", "de", "en-US"]) {
+
+  // Primary: yt-dlp. It generates the proof-of-origin token YouTube now requires
+  // and reliably serves both manual and auto-generated captions in any language —
+  // the bare timedtext endpoints below return empty without that token.
+  if (fetchImpl === globalThis.fetch && process.env.SOURCESTUDIO_DISABLE_YTDLP !== "1") {
+    try {
+      const viaYtDlp = await fetchYouTubeTranscriptViaYtDlp(videoId);
+      if (viaYtDlp) return viaYtDlp;
+    } catch {
+      // yt-dlp may be missing or rate-limited; fall back to the direct fetch paths.
+    }
+  }
+
+  // Preferred path: read the watch page and use the real caption-track URLs.
+  // Unlike the bare timedtext endpoint, this works for auto-generated ("asr")
+  // captions and any available language, which is what most videos actually have.
+  try {
+    const tracks = await fetchYouTubeCaptionTracks(videoId, fetchImpl);
+    const track = pickBestCaptionTrack(tracks);
+    if (track?.baseUrl) {
+      const baseUrl = track.baseUrl.replace(/\\u0026/g, "&");
+      const trackUrl = /[?&]fmt=/.test(baseUrl) ? baseUrl : `${baseUrl}&fmt=json3`;
+      const response = await fetchImpl(trackUrl, {
+        headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+      });
+      if (response.ok) {
+        const transcript = parseYouTubeTimedText(await response.text());
+        if (transcript) {
+          const auto = track.kind === "asr" ? " (auto-generated)" : "";
+          const langName = track.name?.simpleText || track.name?.runs?.[0]?.text || "";
+          return [
+            `# YouTube transcript`,
+            "",
+            `Video ID: ${videoId}`,
+            `Language: ${track.languageCode || "unknown"}${auto}${langName ? ` — ${langName}` : ""}`,
+            "",
+            transcript,
+          ].join("\n");
+        }
+      }
+    }
+  } catch {
+    // Fall through to the legacy direct endpoint.
+  }
+
+  // Legacy fallback: direct timedtext for common languages (manual captions only).
+  for (const lang of ["en", "en-US", "de"]) {
     try {
       const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${encodeURIComponent(videoId)}&lang=${encodeURIComponent(lang)}&fmt=json3`;
       const response = await fetchImpl(transcriptUrl, {
-        headers: { "user-agent": "SourceStudioAI/1.0 transcript fetcher" },
+        headers: { "user-agent": YOUTUBE_UA },
       });
       if (!response.ok) continue;
-      const text = await response.text();
-      const transcript = parseYouTubeTimedText(text);
+      const transcript = parseYouTubeTimedText(await response.text());
       if (transcript) {
         return [`# YouTube transcript`, "", `Video ID: ${videoId}`, `Language: ${lang}`, "", transcript].join("\n");
       }
@@ -3570,7 +3994,146 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
       // Transcript fetching is opportunistic; users can still paste transcripts.
     }
   }
-  return `# YouTube source\n\nA public transcript was not available for video ${videoId}. Paste the transcript into the source body to make this source searchable.\n\nSource URL: ${url}`;
+
+  return `# YouTube source\n\nNo public or auto-generated captions were available for video ${videoId} (the uploader may have disabled captions). Paste the transcript into the source body, or configure speech-to-text (Deepgram or Whisper) to transcribe the audio automatically.\n\nSource URL: ${url}`;
+}
+
+async function fetchYouTubeTranscriptViaYtDlp(videoId) {
+  const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // Step 1: discover which caption languages actually exist on the video, so we
+  // request only a real track. Requesting non-existent langs makes yt-dlp pull
+  // translation tracks, which YouTube aggressively 429-rate-limits.
+  let chosenLang = "";
+  let chosenIsAuto = false;
+  try {
+    const { stdout } = await execFile(
+      ytDlpPath,
+      ["-J", "--skip-download", "--no-warnings", "--no-playlist", videoUrl],
+      { timeout: 60_000, maxBuffer: 1024 * 1024 * 64 },
+    );
+    const info = JSON.parse(stdout);
+    const origLang = String(info.language || "").toLowerCase();
+    const manual = Object.keys(info.subtitles || {});
+    const auto = Object.keys(info.automatic_captions || {});
+    const pickManual = (langs) => {
+      for (const pref of ["en", "de", "es", "fr"]) {
+        const hit = langs.find((code) => code.toLowerCase().startsWith(pref));
+        if (hit) return hit;
+      }
+      return langs[0] || "";
+    };
+    const pickAuto = (langs) => {
+      // automatic_captions lists ~150 machine TRANSLATIONS; only the video's own
+      // language is the real transcript. Requesting a translation makes YouTube
+      // 429. Prefer the original language so we never request a translated track.
+      if (origLang) {
+        const native =
+          langs.find((code) => code.toLowerCase() === `${origLang}-orig`) ||
+          langs.find((code) => code.toLowerCase() === origLang) ||
+          langs.find((code) => code.toLowerCase().startsWith(origLang));
+        if (native) return native;
+      }
+      return langs.find((code) => /-orig$/i.test(code)) || pickManual(langs);
+    };
+    if (manual.length) {
+      chosenLang = pickManual(manual);
+      chosenIsAuto = false;
+    } else if (auto.length) {
+      chosenLang = pickAuto(auto);
+      chosenIsAuto = true;
+    }
+  } catch {
+    // Metadata probe failed; fall back to a small fixed request set below.
+  }
+
+  const workDir = await mkdtemp(join(tmpdir(), "ssai-yt-"));
+  try {
+    const subFlags = chosenLang
+      ? [chosenIsAuto ? "--write-auto-subs" : "--write-subs", "--sub-langs", chosenLang]
+      : ["--write-auto-subs", "--write-subs", "--sub-langs", "en.*,de.*"];
+    await execFile(
+      ytDlpPath,
+      [
+        "--skip-download",
+        ...subFlags,
+        "--sub-format",
+        "json3",
+        "--no-warnings",
+        "--no-playlist",
+        "--ignore-errors",
+        "--no-abort-on-error",
+        "--retries",
+        "2",
+        "--socket-timeout",
+        "20",
+        "--paths",
+        workDir,
+        "-o",
+        "%(id)s",
+        videoUrl,
+      ],
+      { timeout: 90_000, maxBuffer: 1024 * 1024 * 8 },
+    ).catch(() => {
+      // --ignore-errors keeps successful tracks; read whatever was written below.
+    });
+    const files = (await readdir(workDir)).filter((name) => name.endsWith(".json3"));
+    if (!files.length) return "";
+    const chosen = pickSubtitleFile(files);
+    const transcript = parseYouTubeTimedTextWithStamps(await readFile(join(workDir, chosen), "utf8"));
+    if (!transcript) return "";
+    const lang = subtitleLangFromFile(chosen);
+    const auto = chosenIsAuto || /-orig\b/.test(lang) ? " (auto-generated)" : "";
+    return [`# YouTube transcript`, "", `Video ID: ${videoId}`, `Language: ${lang}${auto}`, "", transcript].join("\n");
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function subtitleLangFromFile(name) {
+  return (/\.([A-Za-z-]+(?:-orig)?)\.json3$/.exec(name)?.[1] || "unknown");
+}
+
+function pickSubtitleFile(files) {
+  const score = (name) => {
+    const lang = subtitleLangFromFile(name).toLowerCase();
+    let value = 0;
+    if (lang.startsWith("en")) value += 100;
+    else if (lang.startsWith("de")) value += 90;
+    if (!/-orig\b/.test(lang)) value += 5;
+    return value;
+  };
+  return [...files].sort((a, b) => score(b) - score(a))[0];
+}
+
+async function fetchYouTubeCaptionTracks(videoId, fetchImpl = globalThis.fetch) {
+  const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en`;
+  const response = await fetchImpl(watchUrl, {
+    headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+  });
+  if (!response.ok) return [];
+  const html = await response.text();
+  const match = html.match(/"captionTracks":(\[.*?\])\s*,\s*"(?:audioTracks|translationLanguages|defaultAudioTrackIndex)"/s)
+    || html.match(/"captionTracks":(\[.*?\])/s);
+  if (!match) return [];
+  try {
+    return JSON.parse(match[1].replace(/\\u0026/g, "&"));
+  } catch {
+    return [];
+  }
+}
+
+function pickBestCaptionTrack(tracks) {
+  if (!Array.isArray(tracks) || !tracks.length) return null;
+  const preferredLangs = ["en", "en-us", "en-gb", "de"];
+  const manual = tracks.filter((track) => track.kind !== "asr");
+  const pool = manual.length ? manual : tracks;
+  for (const lang of preferredLangs) {
+    const hit = pool.find((track) => String(track.languageCode || "").toLowerCase().startsWith(lang));
+    if (hit) return hit;
+  }
+  return pool[0];
 }
 
 function youtubeVideoId(url) {
@@ -3584,6 +4147,37 @@ function youtubeVideoId(url) {
     return "";
   }
   return "";
+}
+
+// Build a transcript with inline [M:SS] markers (roughly every windowSec) so
+// downstream features (YouTube chapters) have real timestamps to work from.
+function parseYouTubeTimedTextWithStamps(text, windowSec = 12) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return parseYouTubeTimedText(text);
+  }
+  const lines = [];
+  let buffer = [];
+  let windowStartMs = null;
+  const flush = () => {
+    if (!buffer.length || windowStartMs == null) return;
+    const t = Math.floor(windowStartMs / 1000);
+    lines.push(`[${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}] ${normalizeWhitespace(buffer.join(" "))}`);
+    buffer = [];
+    windowStartMs = null;
+  };
+  for (const event of parsed.events || []) {
+    const segText = (event.segs || []).map((seg) => seg.utf8 || "").join("");
+    if (!segText.trim()) continue;
+    const startMs = event.tStartMs || 0;
+    if (windowStartMs != null && startMs - windowStartMs >= windowSec * 1000) flush();
+    if (windowStartMs == null) windowStartMs = startMs;
+    buffer.push(segText);
+  }
+  flush();
+  return lines.join("\n") || parseYouTubeTimedText(text);
 }
 
 function parseYouTubeTimedText(text) {
@@ -3696,6 +4290,214 @@ function tokenize(input) {
 
 function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text || "").split(/\s+/).filter(Boolean).length * 1.25));
+}
+
+// Split any single block whose text exceeds the chunk target into smaller
+// sub-blocks (by line for transcripts, else by sentence) so long sources
+// (YouTube transcripts, big PDFs) produce many retrievable chunks instead of one.
+function splitOversizedBlocks(blocks) {
+  const out = [];
+  for (const block of blocks) {
+    if (block.type === "heading" || estimateTokens(block.text) <= CHUNK_TOKEN_TARGET) {
+      out.push(block);
+      continue;
+    }
+    const useNewlines = (block.text.match(/\n/g) || []).length >= 3;
+    const units = useNewlines ? block.text.split("\n") : block.text.split(/(?<=[.!?])\s+/);
+    const joiner = useNewlines ? "\n" : " ";
+    let buffer = [];
+    let bufferTokens = 0;
+    let offset = block.char_start || 0;
+    const flush = () => {
+      if (!buffer.length) return;
+      const text = buffer.join(joiner).trim();
+      if (text) {
+        out.push({ ...block, text, char_start: offset, char_end: offset + text.length });
+        offset += text.length;
+      }
+      buffer = [];
+      bufferTokens = 0;
+    };
+    for (const unit of units) {
+      const unitTokens = estimateTokens(unit);
+      if (buffer.length && bufferTokens + unitTokens > CHUNK_TOKEN_TARGET) flush();
+      buffer.push(unit);
+      bufferTokens += unitTokens;
+    }
+    flush();
+  }
+  return out;
+}
+
+function realProviderKey(value) {
+  const key = String(value || "").trim();
+  return key && !/^replace-with-/i.test(key) ? key : "";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Real semantic embeddings (Voyage → OpenAI → local hash fallback). Replaces the
+// SHA-256 hashed bag-of-words so retrieval understands meaning, not just keywords.
+// Override the provider with EMBEDDING_PROVIDER=voyage|openai|local.
+function createEmbedder({ env = process.env, fetchImpl = globalThis.fetch, logger } = {}) {
+  const voyageKey = realProviderKey(env.VOYAGE_API_KEY);
+  const openaiKey = realProviderKey(env.OPENAI_API_KEY);
+  const preferred = String(env.EMBEDDING_PROVIDER || "").trim().toLowerCase();
+  let provider = "local";
+  let model = "local-hash-v1";
+  if (preferred === "local") {
+    provider = "local";
+  } else if (preferred === "local-model" || preferred === "transformers") {
+    provider = "local-model";
+    model = env.LOCAL_EMBEDDING_MODEL || "Xenova/multilingual-e5-small";
+  } else if (preferred === "openai" && openaiKey) {
+    provider = "openai";
+    model = env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-large";
+  } else if (preferred === "voyage" && voyageKey) {
+    provider = "voyage";
+    model = env.VOYAGE_EMBEDDING_MODEL || "voyage-3-large";
+  } else if (voyageKey) {
+    provider = "voyage";
+    model = env.VOYAGE_EMBEDDING_MODEL || "voyage-3-large";
+  } else if (openaiKey) {
+    provider = "openai";
+    model = env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-large";
+  }
+
+  let localModelPipePromise = null;
+  function getLocalModelPipe() {
+    if (!localModelPipePromise) {
+      localModelPipePromise = import("@xenova/transformers").then(({ pipeline }) =>
+        pipeline("feature-extraction", model),
+      );
+    }
+    return localModelPipePromise;
+  }
+
+  // Multilingual sentence-transformer running locally via ONNX. Free, offline,
+  // no rate limits, cross-lingual. e5 models expect "query:"/"passage:" prefixes.
+  async function embedLocalModel(texts, inputType) {
+    const pipe = await getLocalModelPipe();
+    const prefix = inputType === "query" ? "query: " : "passage: ";
+    const output = await pipe(texts.map((text) => prefix + text), { pooling: "mean", normalize: true });
+    return output.tolist();
+  }
+
+  async function postWithRetry(url, headers, payload) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(payload) });
+      if (response.status === 429 || response.status >= 500) {
+        if (attempt === 4) throw new Error(`Embeddings rate-limited (${response.status}) after retries.`);
+        await sleep(1500 * (attempt + 1));
+        continue;
+      }
+      if (!response.ok) throw new Error(`Embeddings failed with ${response.status}.`);
+      return response.json();
+    }
+    throw new Error("Embeddings failed after retries.");
+  }
+
+  async function embedBatch(texts, inputType) {
+    if (provider === "local-model") return embedLocalModel(texts, inputType);
+    if (provider === "voyage") {
+      const body = await postWithRetry(
+        "https://api.voyageai.com/v1/embeddings",
+        { "content-type": "application/json", authorization: `Bearer ${voyageKey}` },
+        { input: texts, model, input_type: inputType === "query" ? "query" : "document" },
+      );
+      return (body.data || []).slice().sort((a, b) => a.index - b.index).map((item) => item.embedding);
+    }
+    if (provider === "openai") {
+      const body = await postWithRetry(
+        "https://api.openai.com/v1/embeddings",
+        { "content-type": "application/json", authorization: `Bearer ${openaiKey}` },
+        { input: texts, model },
+      );
+      return (body.data || []).slice().sort((a, b) => a.index - b.index).map((item) => item.embedding);
+    }
+    return texts.map(embedText);
+  }
+
+  async function embed(texts, inputType = "document") {
+    const list = (Array.isArray(texts) ? texts : [texts]).map((text) => String(text || "").slice(0, 24000) || " ");
+    if (!list.length) return [];
+    if (provider === "local") return list.map(embedText);
+    const out = [];
+    const BATCH = provider === "local-model" ? 16 : 64;
+    for (let start = 0; start < list.length; start += BATCH) {
+      const slice = list.slice(start, start + BATCH);
+      try {
+        const vectors = await embedBatch(slice, inputType);
+        if (vectors.length !== slice.length) throw new Error("Embedding count mismatch.");
+        out.push(...vectors);
+      } catch (error) {
+        logger?.warn?.("embedding.provider.failed", { provider, model, error: String(error?.message || error).slice(0, 200) });
+        out.push(...slice.map(embedText));
+      }
+    }
+    return out;
+  }
+
+  return { embed, provider, model, isSemantic: provider !== "local" };
+}
+
+// Optional Supabase/pgvector store for durable, scalable vector retrieval.
+// Active when SUPABASE_DB_URL is set; otherwise the in-memory cosine path is used.
+const PGVECTOR_DIM = 384;
+function createPgStore({ env = process.env, logger } = {}) {
+  const url = String(env.SUPABASE_DB_URL || "").trim();
+  if (!url) return { enabled: false };
+  let poolPromise = null;
+  async function getPool() {
+    if (!poolPromise) {
+      poolPromise = import("pg").then(({ default: pg }) => {
+        const pool = new pg.Pool({
+          connectionString: url,
+          max: 4,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 8000,
+        });
+        pool.on("error", (error) => logger?.warn?.("pg.pool.error", { error: String(error?.message || error).slice(0, 160) }));
+        return pool;
+      });
+    }
+    return poolPromise;
+  }
+  const toVector = (vec) => `[${vec.join(",")}]`;
+  async function upsertChunks(rows) {
+    const usable = rows.filter((row) => Array.isArray(row.embedding) && row.embedding.length === PGVECTOR_DIM);
+    if (!usable.length) return;
+    const pool = await getPool();
+    const client = await pool.connect();
+    try {
+      for (const row of usable) {
+        await client.query(
+          `insert into doc_chunks(chunk_id, notebook_id, source_id, owner_user_id, content, heading_path, metadata, embedding)
+           values($1, $2, $3, $4, $5, $6, $7, $8)
+           on conflict (chunk_id) do update set content = excluded.content, embedding = excluded.embedding, metadata = excluded.metadata`,
+          [row.chunk_id, row.notebook_id, row.source_id, row.owner_user_id || "", row.content || "", row.heading_path || "", row.metadata || {}, toVector(row.embedding)],
+        );
+      }
+    } finally {
+      client.release();
+    }
+  }
+  async function deleteBySource(sourceId) {
+    const pool = await getPool();
+    await pool.query("delete from doc_chunks where source_id = $1", [sourceId]);
+  }
+  async function nearest(queryVector, sourceIds, limit) {
+    if (!sourceIds.length || queryVector.length !== PGVECTOR_DIM) return new Map();
+    const pool = await getPool();
+    const result = await pool.query(
+      "select chunk_id, 1 - (embedding <=> $1) as sim from doc_chunks where source_id = any($2) order by embedding <=> $1 limit $3",
+      [toVector(queryVector), sourceIds, limit],
+    );
+    return new Map(result.rows.map((row) => [row.chunk_id, Number(row.sim)]));
+  }
+  return { enabled: true, upsertChunks, deleteBySource, nearest };
 }
 
 function embedText(text) {
@@ -4154,6 +4956,8 @@ function artifactLabel(type) {
       audio: "Audio Overview",
       video: "Video Overview",
       infographic: "Infographic",
+      "youtube-kit": "Title & Description",
+      thumbnail: "Thumbnail",
     }[type] || titleCase(type)
   );
 }

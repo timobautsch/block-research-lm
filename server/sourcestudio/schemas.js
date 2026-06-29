@@ -10,6 +10,7 @@ export const SourceTypeSchema = z.enum([
   "youtube",
   "audio",
   "google_doc",
+  "image",
 ]);
 
 export const SourceStatusSchema = z.enum(["pending", "parsing", "indexed", "failed"]);
@@ -24,6 +25,8 @@ export const ArtifactTypeSchema = z.enum([
   "audio",
   "video",
   "infographic",
+  "youtube-kit",
+  "thumbnail",
 ]);
 
 export const ModelRoleSchema = z.enum([

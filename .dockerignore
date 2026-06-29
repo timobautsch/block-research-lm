@@ -1,0 +1,11 @@
+node_modules
+.data
+.git
+dist
+.env
+.env.local
+.env.secrets
+.env.freelancer
+*.log
+scratchpad
+.DS_Store
