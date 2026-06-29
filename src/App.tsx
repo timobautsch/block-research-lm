@@ -1059,7 +1059,7 @@ export default function App() {
     setIsCreatingArtifact(type);
     setError("");
     try {
-      const response = await api<{ artifact: Artifact; job: ArtifactJob }>("/api/artifacts", {
+      const start = await api<{ job: ArtifactJob }>("/api/artifacts", {
         method: "POST",
         body: JSON.stringify({
           notebook_id: notebook.id,
@@ -1078,8 +1078,21 @@ export default function App() {
                 : {},
         }),
       });
+      // The artifact is generated in the background; poll the job until it finishes.
+      // Long outputs (audio/video, 60-120s) would otherwise exceed Firebase Hosting's
+      // ~60s rewrite-proxy timeout. Each poll is a fast request, so it stays well under.
+      let job = start.job;
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (job && (job.status === "queued" || job.status === "running") && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const poll = await api<{ job: ArtifactJob }>(`/api/jobs/${job.id}`);
+        job = poll.job;
+      }
+      if (!job || job.status !== "completed" || !job.result_artifact_id) {
+        throw new Error(job?.error || "Generation timed out. Please try again.");
+      }
       await refreshNotebook();
-      setSelectedArtifactId(response.artifact.id);
+      setSelectedArtifactId(job.result_artifact_id);
       setToast(`${artifactTitle(type)} generated from an Evidence Pack.`);
       refreshDebugSilently();
     } catch (artifactError) {

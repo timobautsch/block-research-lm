@@ -483,7 +483,8 @@ export async function createSourceStudioEngine(options = {}) {
       options: Object.keys(parsed.options || {}),
     });
 
-    try {
+    const runJob = async () => {
+     try {
       job.status = "running";
       job.progress = 35;
       job.updated_at = now();
@@ -601,7 +602,7 @@ export async function createSourceStudioEngine(options = {}) {
         duration_ms: Date.now() - startedAt,
       });
       return { job, artifact, evidence_pack: evidencePack };
-    } catch (error) {
+     } catch (error) {
       job.status = "failed";
       job.error = error.message;
       job.updated_at = now();
@@ -615,7 +616,19 @@ export async function createSourceStudioEngine(options = {}) {
         error,
       });
       throw error;
+     }
+    };
+
+    // Legacy/sync callers await the full artifact. The default path runs the job in
+    // the background and returns immediately, so long artifacts (audio/video, 60-120s)
+    // never hit Firebase Hosting's ~60s rewrite-proxy timeout — the client polls the job.
+    if (context.sync) {
+      return runJob();
     }
+    runJob().catch(() => {
+      // Failure is already recorded on the job (status/error) and logged above.
+    });
+    return { job, artifact: null, evidence_pack: null };
   }
 
   async function seedDemo({ resetFirst = false, ownerUserId = "", requestId = "" } = {}) {
@@ -1336,6 +1349,11 @@ export async function createSourceStudioEngine(options = {}) {
       const rawText = payload.body?.trim()
         ? payload.body
         : await fetchYouTubeTranscript(source.original_url, fetchImpl);
+      // Use the real video title when the user didn't name the source (avoids "youtube.com").
+      if (!payload.title?.trim() && !payload.body?.trim()) {
+        const ytTitle = await fetchYouTubeTitle(youtubeVideoId(source.original_url));
+        if (ytTitle) source.title = ytTitle;
+      }
       return parseMarkdownLikeDocument(source, {
         rawText,
         cleanedText: normalizeWhitespace(rawText),
@@ -3927,6 +3945,21 @@ async function normalizeAudioForAsr(buffer) {
 
 const YOUTUBE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+async function fetchYouTubeTitle(videoId) {
+  if (!videoId || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
+  try {
+    const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
+    const { stdout } = await execFile(
+      ytDlpPath,
+      ["--print", "%(title)s", "--skip-download", "--no-warnings", "--no-playlist", `https://www.youtube.com/watch?v=${videoId}`],
+      { timeout: 30_000 },
+    );
+    return String(stdout || "").split("\n")[0].trim().slice(0, 200);
+  } catch {
+    return "";
+  }
+}
 
 async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
   const videoId = youtubeVideoId(url);
