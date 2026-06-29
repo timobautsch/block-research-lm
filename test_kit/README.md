@@ -1,6 +1,6 @@
 # Multimodal Test Kit
 
-Sample sources to test every input modality of Nanas Block Research LM.
+Sample sources to test every input modality of Block Research LM.
 
 | File | Modality | Pipeline tested |
 |---|---|---|

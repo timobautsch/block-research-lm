@@ -33,7 +33,7 @@ const FLASHCARD_DIFFICULTIES = new Set(["easy", "medium", "hard", "mixed"]);
 const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "source-check", "compare"];
 const DEFAULT_CRAWL_MAX_PAGES = 80;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
-const PRODUCT_NAME = "Nanas Block Research LM";
+const PRODUCT_NAME = "Block Research LM";
 const execFile = promisify(execFileCallback);
 
 export async function createSourceStudioEngine(options = {}) {

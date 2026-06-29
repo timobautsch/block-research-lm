@@ -1,6 +1,6 @@
 # NotebookLM Parity and Differentiation Plan
 
-Dieses Dokument beschreibt den Ausbau von Nanas Block Research LM von einem lokalen, NotebookLM-inspirierten Vertical Slice zu einer produktionsnahen Research Workbench. Ziel ist nicht eine Pixelkopie von NotebookLM, sondern Ergebnisparität bei Quellenarbeit, Chat, Studio-Artefakten und Medienausgaben plus bessere Auditierbarkeit durch Evidence Packs und Citation Ledgers.
+Dieses Dokument beschreibt den Ausbau von Block Research LM von einem lokalen, NotebookLM-inspirierten Vertical Slice zu einer produktionsnahen Research Workbench. Ziel ist nicht eine Pixelkopie von NotebookLM, sondern Ergebnisparität bei Quellenarbeit, Chat, Studio-Artefakten und Medienausgaben plus bessere Auditierbarkeit durch Evidence Packs und Citation Ledgers.
 
 ## Zielbild
 

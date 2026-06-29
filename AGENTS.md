@@ -4,7 +4,7 @@ This repository is a standalone interview/demo project and follows a focused del
 
 ## Project Map
 
-- Product: Nanas Block Research LM, a local NotebookLM-inspired Block Research AI workbench with source-grounded chat, Evidence Packs, Citation Ledgers, and Studio artifact generation.
+- Product: Block Research LM, a local NotebookLM-inspired Block Research AI workbench with source-grounded chat, Evidence Packs, Citation Ledgers, and Studio artifact generation.
 - Frontend: `src/App.tsx` and `src/styles.css` contain the React/Vite workbench UI, including auth views, Sources, Chat, Studio artifacts, citations, and responsive layout.
 - API: `server/index.js` runs the Express server, auth endpoints, protected `/api` routes, Vite middleware in development, and static `dist` serving in production.
 - Domain engine: `server/sourcestudio/engine.js` owns notebooks, sources, source blocks, chunks, local embeddings, knowledge objects, retrieval runs, evidence packs, citation ledgers, artifact jobs, artifacts, and model runs.

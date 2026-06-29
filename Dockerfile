@@ -1,4 +1,4 @@
-# Nanas Block Research LM — Cloud Run container
+# Block Research LM — Cloud Run container
 # Node 24 (node:sqlite auth), ffmpeg + yt-dlp for media ingestion, local ONNX embedder.
 FROM node:24-slim
 

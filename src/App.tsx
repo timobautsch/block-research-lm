@@ -95,7 +95,7 @@ type MobilePanel = "sources" | "chat" | "studio";
 const AUTH_MODES = ["login", "signup", "reset-request", "reset-confirm"] as const;
 type AuthMode = (typeof AUTH_MODES)[number];
 type ApiInit = Parameters<typeof fetch>[1];
-const BRAND_NAME = "Nanas Block Research LM";
+const BRAND_NAME = "Block Research LM";
 const BRAND_EYEBROW = "Block Research AI";
 const BRAND_LOGO_PATH = "/brand/blockresearch-mark.svg";
 const ASSISTANT_NAME = "Block Research LM";
@@ -503,13 +503,13 @@ const artifactTypes: Array<{
   { type: "youtube-kit", title: "Title & Description", action: "YouTube", icon: <Youtube size={18} /> },
   { type: "thumbnail", title: "Thumbnail", action: "Image", icon: <Image size={18} /> },
   { type: "audio", title: "Audio Overview", action: "Script", icon: <AudioLines size={18} /> },
-  { type: "slide-deck", title: "Slide Deck", action: "Beta", icon: <Presentation size={18} /> },
+  { type: "slide-deck", title: "Slide Deck", action: "Slides", icon: <Presentation size={18} /> },
   { type: "video", title: "Video Overview", action: "Storyboard", icon: <Video size={18} /> },
   { type: "mindmap", title: "Mind Map", action: "Map", icon: <Map size={18} /> },
   { type: "report", title: "Reports", action: "Write", icon: <ClipboardList size={18} /> },
   { type: "flashcards", title: "Flashcards", action: "Cards", icon: <Layers3 size={18} /> },
   { type: "quiz", title: "Quiz", action: "Test", icon: <ListChecks size={18} /> },
-  { type: "infographic", title: "Infographic", action: "Beta", icon: <Sparkles size={18} /> },
+  { type: "infographic", title: "Infographic", action: "Visual", icon: <Sparkles size={18} /> },
   { type: "data-table", title: "Data Table", action: "Extract", icon: <Table2 size={18} /> },
 ];
 
@@ -1797,9 +1797,6 @@ export default function App() {
                 }}
                 disabled={Boolean(isCreatingArtifact)}
               >
-                {artifact.type === "slide-deck" || artifact.type === "infographic" ? (
-                  <span className="beta-badge">Beta</span>
-                ) : null}
                 <span className="studio-icon">{isCreatingArtifact === artifact.type ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
                 <span>
                   <strong>{artifact.title}</strong>
@@ -1919,26 +1916,49 @@ export default function App() {
               {sourceNeedsUrl(sourceForm.type) ? (
                 <label className="modal-field">
                   <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
-                  <input
-                    value={sourceForm.original_url}
-                    onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
-                    placeholder={sourceUrlPlaceholder(sourceForm.type)}
-                    inputMode="url"
-                  />
+                  <div className="input-with-go">
+                    <input
+                      value={sourceForm.original_url}
+                      onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          event.currentTarget.form?.requestSubmit();
+                        }
+                      }}
+                      placeholder={sourceUrlPlaceholder(sourceForm.type)}
+                      inputMode="url"
+                      autoFocus
+                    />
+                    <button className="go-arrow" type="submit" disabled={isAddingSource} aria-label="Add source">
+                      {isAddingSource ? <Loader2 className="spin" size={18} /> : <ArrowRight size={18} />}
+                    </button>
+                  </div>
                 </label>
               ) : null}
 
               {sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note" ? (
                 <label className="modal-field">
                   <span>{sourceBodyLabel(sourceForm.type)}</span>
-                  <textarea
-                    ref={sourceBodyRef}
-                    value={sourceForm.body}
-                    onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
-                    placeholder={sourceBodyPlaceholder(sourceForm.type)}
-                    aria-invalid={Boolean(sourceFormNotice)}
-                    rows={5}
-                  />
+                  <div className="input-with-go input-with-go--area">
+                    <textarea
+                      ref={sourceBodyRef}
+                      value={sourceForm.body}
+                      onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                          event.preventDefault();
+                          event.currentTarget.form?.requestSubmit();
+                        }
+                      }}
+                      placeholder={sourceBodyPlaceholder(sourceForm.type)}
+                      aria-invalid={Boolean(sourceFormNotice)}
+                      rows={5}
+                    />
+                    <button className="go-arrow" type="submit" disabled={isAddingSource} aria-label="Add source">
+                      {isAddingSource ? <Loader2 className="spin" size={18} /> : <ArrowRight size={18} />}
+                    </button>
+                  </div>
                 </label>
               ) : null}
 
@@ -1953,6 +1973,13 @@ export default function App() {
 
               {sourceFormNotice ? <p className="source-form-help">{sourceFormNotice}</p> : null}
               <div className="modal-actions">
+                <span style={{ marginRight: "auto", fontSize: "0.78rem", opacity: 0.55 }}>
+                  {sourceNeedsUrl(sourceForm.type)
+                    ? "Press Enter or click Add source"
+                    : sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note"
+                      ? "Press ⌘/Ctrl + Enter or click Add source"
+                      : "Click Add source to finish"}
+                </span>
                 <button className="secondary-button" type="button" onClick={() => setIsAddSourceOpen(false)}>Cancel</button>
                 <button className="primary-button" type="submit" disabled={isAddingSource}>
                   {isAddingSource ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}

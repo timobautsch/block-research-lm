@@ -5895,3 +5895,54 @@ textarea::placeholder {
 .add-source-form textarea { resize: vertical; line-height: 1.5; }
 .add-source-form input:focus, .add-source-form textarea:focus { border-color: rgba(15, 208, 112, 0.72); box-shadow: 0 0 0 3px rgba(15, 208, 112, 0.12); }
 .add-source-form .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* Add-source inline "next" arrow (NotebookLM-style round submit) */
+.input-with-go {
+  position: relative;
+  display: block;
+}
+.input-with-go > input,
+.input-with-go > textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding-right: 58px;
+}
+.input-with-go .go-arrow {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--green);
+  color: #05140b;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(15, 208, 112, 0.28);
+  transition: filter 0.12s ease, transform 0.12s ease, opacity 0.12s ease;
+}
+.input-with-go--area {
+  display: block;
+}
+.input-with-go--area .go-arrow {
+  top: auto;
+  bottom: 10px;
+  transform: none;
+}
+.input-with-go .go-arrow:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-50%) scale(1.04);
+}
+.input-with-go--area .go-arrow:hover:not(:disabled) {
+  transform: scale(1.04);
+}
+.input-with-go .go-arrow:disabled {
+  opacity: 0.55;
+  cursor: default;
+  box-shadow: none;
+}

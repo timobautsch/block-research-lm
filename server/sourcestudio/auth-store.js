@@ -3,7 +3,9 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
 
-export const SESSION_COOKIE_NAME = "ssai_session";
+// Must be "__session" so Firebase Hosting forwards it to the Cloud Run backend
+// (Firebase strips every other cookie name when proxying through its CDN).
+export const SESSION_COOKIE_NAME = "__session";
 
 const PASSWORD_KEY_LENGTH = 64;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
@@ -266,17 +268,21 @@ export function parseCookies(header = "") {
     }, {});
 }
 
+function cookieIsSecure(env) {
+  return env.AUTH_COOKIE_SECURE === "true" || env.NODE_ENV === "production";
+}
+
 export function serializeSessionCookie(token, env = process.env) {
   return serializeCookie(SESSION_COOKIE_NAME, token, {
     maxAge: Math.floor(SESSION_TTL_MS / 1000),
-    secure: env.AUTH_COOKIE_SECURE === "true",
+    secure: cookieIsSecure(env),
   });
 }
 
 export function serializeClearSessionCookie(env = process.env) {
   return serializeCookie(SESSION_COOKIE_NAME, "", {
     maxAge: 0,
-    secure: env.AUTH_COOKIE_SECURE === "true",
+    secure: cookieIsSecure(env),
   });
 }
 
