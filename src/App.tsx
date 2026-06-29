@@ -3786,28 +3786,40 @@ function InfographicPreview({ payload, panels }: { payload: Record<string, unkno
     typeof payload.render_status === "string" ? payload.render_status.replaceAll("_", " ") : "",
   ].filter(Boolean);
 
+  const panelList = (
+    <div className="infographic-preview">
+      {panels.slice(0, 8).map((panel, index) => (
+        <article key={`${panel.headline}-${index}`}>
+          <span>{String(panel.panel || index + 1).padStart(2, "0")}</span>
+          <strong>{panel.headline}</strong>
+          <p>{panel.copy}</p>
+          {panel.source_title ? <small>{panel.source_title}{panel.citation ? ` · ${panel.citation}` : ""}</small> : null}
+        </article>
+      ))}
+    </div>
+  );
+
   return (
     <div className="infographic-artifact">
       {svgSrc ? (
         <figure className="infographic-frame">
           <img src={svgSrc} alt={typeof payload.title === "string" ? payload.title : "Source-grounded infographic"} />
         </figure>
-      ) : null}
+      ) : (
+        // No rendered SVG (e.g. legacy artifact): fall back to the panel breakdown.
+        panelList
+      )}
       {meta.length ? (
         <div className="infographic-meta">
           {meta.map((item) => <span key={item}>{item}</span>)}
         </div>
       ) : null}
-      <div className="infographic-preview">
-        {panels.slice(0, 8).map((panel, index) => (
-          <article key={`${panel.headline}-${index}`}>
-            <span>{String(panel.panel || index + 1).padStart(2, "0")}</span>
-            <strong>{panel.headline}</strong>
-            <p>{panel.copy}</p>
-            {panel.source_title ? <small>{panel.source_title}{panel.citation ? ` · ${panel.citation}` : ""}</small> : null}
-          </article>
-        ))}
-      </div>
+      {svgSrc && panels.length ? (
+        <details className="infographic-panels">
+          <summary>Panel breakdown · {panels.length} source-grounded panels</summary>
+          {panelList}
+        </details>
+      ) : null}
     </div>
   );
 }

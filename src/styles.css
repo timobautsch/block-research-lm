@@ -2040,7 +2040,8 @@ select:focus-visible {
   place-items: center;
   width: 100%;
   margin: 0;
-  overflow: hidden;
+  padding: 10px;
+  overflow: auto;
   border: 1px solid rgba(236, 153, 188, 0.28);
   border-radius: var(--radius);
   background:
@@ -2052,8 +2053,45 @@ select:focus-visible {
   display: block;
   width: 100%;
   height: auto;
-  max-height: 430px;
+  max-height: 76vh;
   object-fit: contain;
+  border-radius: calc(var(--radius) - 6px);
+}
+
+.infographic-panels {
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 4px 12px;
+}
+
+.infographic-panels > summary {
+  cursor: pointer;
+  padding: 8px 2px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--text-muted, #aeb9b2);
+  list-style: none;
+}
+
+.infographic-panels > summary::-webkit-details-marker {
+  display: none;
+}
+
+.infographic-panels > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+}
+
+.infographic-panels[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.infographic-panels[open] > summary {
+  margin-bottom: 6px;
 }
 
 .infographic-meta {

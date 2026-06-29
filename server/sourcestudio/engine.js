@@ -569,6 +569,9 @@ export async function createSourceStudioEngine(options = {}) {
           startRun: startModelRun,
         });
         artifactPayload = generation.payload;
+        if (parsed.type === "infographic") {
+          artifactPayload = finalizeInfographicPayload(artifactPayload, localPayload);
+        }
         if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
           artifactPayload.generation_provider = generation.active_run.provider;
           artifactPayload.generation_model = generation.active_run.model;
@@ -5117,7 +5120,7 @@ function buildInfographicPayload({ notebook, evidencePack, citations, keyPoints,
     const sentence = stripCitations(point.text);
     return {
       panel: index + 1,
-      headline: infographicHeadline(sentence, index),
+      headline: infographicPanelHeadline(citation, sentence, index),
       copy: `${truncate(sentence, detailLevel === "compact" ? 118 : 154)} ${point.citation || citation.citation || ""}`.trim(),
       citation: point.citation || citation.citation || "",
       evidence_id: citation.evidence_id || "",
@@ -5164,8 +5167,43 @@ function buildInfographicPayload({ notebook, evidencePack, citations, keyPoints,
       notes: "SVG is generated deterministically from cited Evidence Pack passages.",
     },
   };
+  // Height grows with the panel count, so resolve the real canvas size from the layout.
+  const layout = infographicLayout(payload);
+  payload.dimensions = { width: layout.W, height: layout.H };
   payload.svg_markup = renderInfographicSvg(payload);
   return payload;
+}
+
+// The model router refines a infographic's title + panels but drops the deterministic
+// visual metadata and svg_markup. Re-merge the refined panels onto the local payload and
+// re-render the SVG so the designed infographic survives every provider path.
+function finalizeInfographicPayload(generated, local) {
+  const base = local && typeof local === "object" && Array.isArray(local.panels) ? local : generated;
+  if (!base || typeof base !== "object") return generated;
+  const merged = { ...base };
+  if (generated && typeof generated === "object") {
+    if (typeof generated.title === "string" && generated.title.trim()) merged.title = generated.title.trim();
+    if (Array.isArray(generated.panels) && generated.panels.length) {
+      merged.panels = generated.panels.map((g, index) => {
+        const localPanel = (base.panels && base.panels[index]) || {};
+        return {
+          ...localPanel,
+          panel: g.panel || localPanel.panel || index + 1,
+          headline: g.headline || localPanel.headline || "",
+          copy: g.copy || localPanel.copy || "",
+          citation: g.citation || localPanel.citation || "",
+          source_title: g.source_title || localPanel.source_title || "",
+          evidence_id: g.evidence_id || localPanel.evidence_id || "",
+          source_refs: g.source_refs || localPanel.source_refs || [],
+        };
+      });
+    }
+  }
+  const layout = infographicLayout(merged);
+  merged.dimensions = { width: layout.W, height: layout.H };
+  merged.render_status = "rendered_svg";
+  merged.svg_markup = renderInfographicSvg(merged);
+  return merged;
 }
 
 function normalizeChoice(value, allowed, fallback) {
@@ -5174,15 +5212,33 @@ function normalizeChoice(value, allowed, fallback) {
 }
 
 function infographicDimensions(orientation) {
-  if (orientation === "portrait") return { width: 900, height: 1200 };
-  if (orientation === "square") return { width: 1000, height: 1000 };
-  return { width: 1200, height: 900 };
+  // Width is fixed per orientation; the real height is computed from content by
+  // infographicLayout() (the canvas grows with the panel count). These heights are
+  // only nominal seeds and get overwritten in buildInfographicPayload().
+  if (orientation === "portrait") return { width: 1000, height: 1414 };
+  if (orientation === "square") return { width: 1080, height: 1080 };
+  return { width: 1280, height: 1000 };
 }
 
 function infographicHeadline(sentence, index) {
   const topic = titleCase(topicFromSentence(sentence));
   const prefixes = ["Core Signal", "Evidence", "Workflow", "Risk", "Decision", "Next Step", "Pattern", "Question"];
   return truncate(`${prefixes[index % prefixes.length]}: ${topic}`, 48);
+}
+
+// Prefer the cited passage's section heading (e.g. a markdown H2) as the panel headline —
+// it reads far better than a keyword-salad topic. Only use it when it actually relates to
+// the panel copy (retrieval chunks can straddle heading boundaries); otherwise fall back to
+// the synthesized headline so headline and copy never drift apart.
+function infographicPanelHeadline(citation, sentence, index) {
+  const heading = Array.isArray(citation?.heading_path)
+    ? citation.heading_path.filter(Boolean).at(-1)
+    : "";
+  if (heading && heading.trim().length >= 4) {
+    const related = overlapScore(tokenize(heading), tokenize(sentence)) >= 0.12;
+    if (related) return truncate(titleCase(heading.trim()), 46);
+  }
+  return infographicHeadline(sentence, index);
 }
 
 function infographicMetricLabel(citation, index) {
@@ -5196,98 +5252,293 @@ function infographicMetricValue(citation, index) {
   return `E${index + 1}`;
 }
 
-function renderInfographicSvg(payload) {
-  const width = Number(payload.dimensions?.width || 1200);
-  const height = Number(payload.dimensions?.height || 900);
-  const margin = Math.round(width * 0.045);
-  const headerHeight = payload.orientation === "portrait" ? 160 : 138;
-  const footerHeight = 104;
-  const gap = 22;
-  const columns = payload.orientation === "portrait" ? 1 : 2;
+// stripCitations + tidy spacing around punctuation (stripped citations leave " ." behind).
+function infographicCleanText(text) {
+  return stripCitations(text).replace(/\s+([.,;:!?])/g, "$1").replace(/\s{2,}/g, " ").trim();
+}
+
+// Inline icon library (24x24 viewport). Each value is the inner markup, placed inside a
+// <g transform="translate(x y) scale(s)" stroke=...> by iconMarkup().
+const INFOGRAPHIC_ICONS = {
+  shield: `<path d="M12 2.5 4.5 5.5v6c0 4.6 3.2 7.7 7.5 9.5 4.3-1.8 7.5-4.9 7.5-9.5v-6L12 2.5Z"/><path d="M8.7 12.2l2.3 2.3 4.3-4.6"/>`,
+  chartUp: `<path d="M4 19.5h16"/><path d="M4 19.5V5"/><path d="M6.5 15l3.5-4 3 2.5 4.5-6"/><path d="M17.5 7.5h-3M17.5 7.5v3"/>`,
+  calendar: `<rect x="4" y="5.5" width="16" height="14.5" rx="2.4"/><path d="M4 10h16M8 3.5v4M16 3.5v4"/><path d="M8.5 14.5l2 2 4-4.2"/>`,
+  dollar: `<circle cx="12" cy="12" r="9"/><path d="M12 7v10M14.7 9.2c-.5-1-1.6-1.5-2.9-1.5-1.6 0-2.7.8-2.7 2 0 1.3 1 1.8 2.8 2.2 1.9.4 2.9 1 2.9 2.3 0 1.3-1.2 2.1-2.9 2.1-1.4 0-2.6-.6-3-1.7"/>`,
+  layers: `<path d="M12 3.5 3.5 8 12 12.5 20.5 8 12 3.5Z"/><path d="M3.5 12 12 16.5 20.5 12"/><path d="M3.5 16 12 20.5 20.5 16"/>`,
+  target: `<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6"/>`,
+  bot: `<rect x="4.5" y="8" width="15" height="11" rx="3"/><path d="M12 8V4.5M12 4.5h-.01"/><circle cx="9" cy="13" r="1.3"/><circle cx="15" cy="13" r="1.3"/><path d="M9.5 16.3h5M2.8 12v3M21.2 12v3"/>`,
+  flow: `<circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.4 7.2 11 15.4M15.6 7.2 13 15.4M8.6 6h6.8"/>`,
+  lightbulb: `<path d="M9 17.5h6M9.7 20.5h4.6"/><path d="M12 3.2A6 6 0 0 0 8 14.3c.7.7 1 1.3 1 2.2h6c0-.9.3-1.5 1-2.2A6 6 0 0 0 12 3.2Z"/>`,
+  check: `<circle cx="12" cy="12" r="9"/><path d="M8 12.3l2.6 2.6L16 9.3"/>`,
+  gauge: `<path d="M4 16.5a8 8 0 1 1 16 0"/><path d="M12 16.5 16 10"/><circle cx="12" cy="16.5" r="1.4"/>`,
+  link: `<path d="M9.5 14.5 14.5 9.5"/><path d="M11 7.5l1.2-1.2a3.6 3.6 0 0 1 5.1 5.1L16 12.6"/><path d="M13 16.5l-1.2 1.2a3.6 3.6 0 0 1-5.1-5.1L8 11.3"/>`,
+  spark: `<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/>`,
+  doc: `<path d="M6 3.5h7l5 5V20a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z"/><path d="M13 3.5V8.5h5M8.5 13h7M8.5 16.5h7"/>`,
+  users: `<circle cx="9" cy="9" r="3"/><path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5"/><path d="M16 6.2a3 3 0 0 1 0 5.6M17 14.2c2.3.5 3.5 2.4 3.5 4.8"/>`,
+};
+const INFOGRAPHIC_ICON_KEYWORDS = [
+  [/\b(price|cost|\$|usd|fee|revenue|paid|plan|month|year)\b/i, "dollar"],
+  [/\b(risk|safety|protect|secure|guard|hedge|drawdown)\b/i, "shield"],
+  [/\b(growth|increase|return|performance|profit|yield|gain|scale|trend)\b/i, "chartUp"],
+  [/\b(since|history|year|decade|live|track record)\b/i, "calendar"],
+  [/\b(bot|automat|algorith|systematic|execution|engine)\b/i, "bot"],
+  [/\b(strategy|method|approach|framework|principle|model)\b/i, "target"],
+  [/\b(layer|stack|tier|ladder|product|infrastructure|system)\b/i, "layers"],
+  [/\b(workflow|pipeline|process|route|signal|flow|webhook)\b/i, "flow"],
+  [/\b(idea|insight|learn|course|understand|guide)\b/i, "lightbulb"],
+  [/\b(community|trader|user|team|member|people|discord)\b/i, "users"],
+  [/\b(connect|integrat|api|link|bridge)\b/i, "link"],
+  [/\b(volatility|adaptive|dynamic|real-time|monitor)\b/i, "gauge"],
+];
+function pickInfographicIcon(text, index) {
+  const hay = String(text || "");
+  for (const [re, key] of INFOGRAPHIC_ICON_KEYWORDS) if (re.test(hay)) return key;
+  const cycle = ["target", "layers", "chartUp", "spark", "flow", "doc", "lightbulb", "gauge"];
+  return cycle[index % cycle.length];
+}
+function infographicIconMarkup(key, x, y, size, color, strokeW = 1.8) {
+  const inner = INFOGRAPHIC_ICONS[key] || INFOGRAPHIC_ICONS.target;
+  const s = size / 24;
+  return `<g transform="translate(${x} ${y}) scale(${s})" fill="none" stroke="${color}" stroke-width="${strokeW}" stroke-linecap="round" stroke-linejoin="round">${inner}</g>`;
+}
+
+// Pull the most quotable numbers (money, %, years, durations) out of the cited copy to
+// power the hero KPI strip. Backfills with structural coverage stats so we always get 3.
+const INFOGRAPHIC_KPI_STOP = new Set("the a an of on in at to and or for all with that this its his her their is are was were be been has have had includes include uses use built from than over per via into out up down new now first only also each both".split(" "));
+const INFOGRAPHIC_NUM_RE = /(\$\s?[\d.,]+\s?(?:k|m|bn)?(?:\s?\/\s?(?:month|year|mo|yr))?|\b(?:19|20)\d{2}\b|\b\d+(?:\.\d+)?\s?%|\b\d+(?:\.\d+)?\s?(?:years?|yrs?|months?|weeks?|days?|hours?|x)\b|\b\d{3,}\b)/gi;
+function infographicKpiLabel(before, after, fallbackTopic) {
+  const pick = (arr) => arr.map((w) => w.toLowerCase()).filter((w) => w.length > 2 && !INFOGRAPHIC_KPI_STOP.has(w) && !/^https?/.test(w));
+  let words = pick(after).slice(0, 2);
+  if (words.length < 1) words = pick(before).slice(-2);
+  if (words.length < 1 && fallbackTopic) words = String(fallbackTopic).split(/\s+/).slice(0, 2);
+  return titleCase(words.join(" ")) || "From sources";
+}
+function extractInfographicMetrics(payload) {
+  const panels = payload.panels || [];
+  const entries = [
+    ...panels.map((p) => ({ text: `${p.headline}. ${p.copy}`, topic: infographicCleanText(p.headline || "") })),
+    ...(payload.evidence_appendix || []).map((e) => ({ text: e.quote || "", topic: infographicCleanText(e.source_title || "") })),
+  ];
+  const found = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    const clean = infographicCleanText(entry.text);
+    let m;
+    INFOGRAPHIC_NUM_RE.lastIndex = 0;
+    while ((m = INFOGRAPHIC_NUM_RE.exec(clean))) {
+      const value = m[0].replace(/\s+/g, " ").trim().replace(/\s?\/\s?/g, "/");
+      const key = value.toLowerCase().replace(/[,\s]/g, "");
+      if (seen.has(key)) continue;
+      const before = clean.slice(Math.max(0, m.index - 46), m.index).replace(/[^a-zA-Z%/$.\s]/g, " ").trim().split(/\s+/).filter(Boolean);
+      const after = clean.slice(m.index + m[0].length, m.index + m[0].length + 46).replace(/[^a-zA-Z%/$.\s]/g, " ").trim().split(/\s+/).filter(Boolean);
+      const label = infographicKpiLabel(before, after, entry.topic);
+      seen.add(key);
+      const isMoney = /\$/.test(value), isPct = /%/.test(value), isYear = /^(19|20)\d{2}$/.test(value);
+      const icon = isMoney ? "dollar" : isPct ? "gauge" : isYear ? "calendar" : pickInfographicIcon(`${label} ${value}`, found.length);
+      found.push({
+        value: truncate(value, 13),
+        label: truncate(label, 24),
+        icon,
+        score: (isMoney ? 10 : 0) + (isPct ? 8 : 0) + (isYear ? 6 : 0) + Math.min(4, value.length),
+      });
+      if (found.length >= 10) break;
+    }
+    if (found.length >= 10) break;
+  }
+  found.sort((a, b) => b.score - a.score);
+  const top = found.slice(0, 3);
+  const cov = payload.source_coverage || {};
+  const fillers = [
+    { value: String(cov.active_sources ?? 0), label: "Active sources", icon: "doc" },
+    { value: String(cov.evidence_items ?? (payload.evidence_appendix || []).length), label: "Evidence items", icon: "layers" },
+    { value: String(panels.length), label: "Source panels", icon: "target" },
+    { value: String(cov.cited_sources ?? 0), label: "Cited sources", icon: "check" },
+  ];
+  let fi = 0;
+  while (top.length < 3 && fi < fillers.length) {
+    const f = fillers[fi++];
+    if (!top.some((t) => t.value === f.value && t.label === f.label)) top.push(f);
+  }
+  return top.slice(0, 3);
+}
+
+// Full layout. Width is fixed per orientation; height GROWS with the panel count so every
+// panel gets a comfortable, fixed row height (no cramming, no overlaps).
+function infographicLayout(payload) {
+  const portrait = payload.orientation === "portrait";
+  const square = payload.orientation === "square";
+  const W = Number(payload.dimensions?.width) || (portrait ? 1000 : square ? 1080 : 1280);
+  const M = Math.round(W * 0.035);
+  const columns = portrait ? 1 : 2;
   const panels = payload.panels || [];
   const rows = Math.max(1, Math.ceil(panels.length / columns));
-  const panelWidth = Math.floor((width - margin * 2 - gap * (columns - 1)) / columns);
-  const panelHeight = Math.floor((height - margin * 2 - headerHeight - footerHeight - gap * (rows - 1)) / rows);
-  const colors = infographicPalette(payload.visual_style);
-  const headerLines = wrapSvgText(payload.title, payload.orientation === "portrait" ? 32 : 44, 2);
-  const subtitle = `${payload.summary} Source coverage: ${payload.source_coverage?.cited_sources || 0}/${payload.source_coverage?.active_sources || 0} active source(s).`;
+  const titleSize = portrait ? 30 : 34;
+  const titleLH = portrait ? 36 : 40;
+  const titleLines = wrapSvgText(payload.title, portrait ? 28 : 34, 2);
+  const headerH = 64 + titleLines.length * titleLH + 30;
+  const kpiH = portrait ? 122 : 116;
+  const footerH = 72;
+  const pGap = 16;
+  const panelH = portrait ? 150 : 172;
+  const gridTop = M + headerH + 12 + kpiH + 16;
+  const H = gridTop + rows * panelH + (rows - 1) * pGap + 14 + footerH + M;
+  return { W, H, M, portrait, columns, panels, rows, titleSize, titleLH, titleLines, headerH, kpiH, footerH, pGap, panelH, gridTop };
+}
 
-  const panelMarkup = panels.map((panel, index) => {
-    const col = index % columns;
-    const row = Math.floor(index / columns);
-    const x = margin + col * (panelWidth + gap);
-    const y = margin + headerHeight + row * (panelHeight + gap);
-    const accent = colors.accents[index % colors.accents.length];
-    const headlineLines = wrapSvgText(panel.headline, columns === 1 ? 42 : 32, 2);
-    const copyLines = wrapSvgText(panel.copy, columns === 1 ? 58 : 42, panelHeight < 150 ? 2 : 3);
-    const sourceLines = wrapSvgText(panel.source_title || panel.evidence_id || "Evidence Pack", columns === 1 ? 48 : 34, 1);
-    return [
-      `<g transform="translate(${x} ${y})">`,
-      `<rect width="${panelWidth}" height="${panelHeight}" rx="18" fill="${colors.panel}" stroke="${accent}" stroke-opacity="0.62"/>`,
-      `<rect x="0" y="0" width="${panelWidth}" height="8" rx="4" fill="${accent}"/>`,
-      `<text x="22" y="34" fill="${accent}" font-family="Inter, Arial, sans-serif" font-size="13" font-weight="800">${String(panel.panel).padStart(2, "0")}</text>`,
-      svgTextBlock(headlineLines, 22, 60, { fill: colors.text, size: 22, weight: 800, lineHeight: 26 }),
-      svgTextBlock(copyLines, 22, 114, { fill: colors.muted, size: 15, weight: 500, lineHeight: 20 }),
-      `<g transform="translate(22 ${panelHeight - 38})">`,
-      `<rect width="${panelWidth - 44}" height="24" rx="12" fill="${accent}" fill-opacity="0.12"/>`,
-      `<text x="12" y="16" fill="${colors.text}" font-family="Inter, Arial, sans-serif" font-size="11" font-weight="800">${escapeXml(panel.metric_label)}: ${escapeXml(panel.metric_value)}</text>`,
-      `<text x="${panelWidth - 62}" y="16" text-anchor="end" fill="${accent}" font-family="Inter, Arial, sans-serif" font-size="11" font-weight="900">${escapeXml(panel.citation || "")}</text>`,
-      `</g>`,
-      sourceLines.length ? `<text x="22" y="${panelHeight - 52}" fill="${colors.faint}" font-family="Inter, Arial, sans-serif" font-size="10" font-weight="700">${escapeXml(sourceLines[0])}</text>` : "",
-      `</g>`,
-    ].join("");
-  }).join("");
+function svgText(x, y, str, { fill, size, weight = 600, anchor = "start", spacing, family = "Inter, 'Helvetica Neue', Arial, sans-serif", opacity }) {
+  const attrs = [
+    `x="${x}"`, `y="${y}"`, `fill="${fill}"`, `font-family="${family}"`,
+    `font-size="${size}"`, `font-weight="${weight}"`, `text-anchor="${anchor}"`,
+    spacing ? `letter-spacing="${spacing}"` : "",
+    opacity != null ? `opacity="${opacity}"` : "",
+  ].filter(Boolean).join(" ");
+  return `<text ${attrs}>${escapeXml(str)}</text>`;
+}
 
-  const footerSources = (payload.evidence_appendix || [])
-    .slice(0, 4)
-    .map((item) => `${item.citation} ${item.source_title}`)
-    .join("   ");
+function svgTextBlock(lines, x, y, { fill, size, weight, lineHeight, anchor = "start", spacing }) {
+  return lines.map((line, index) => svgText(x, y + index * lineHeight, line, { fill, size, weight, anchor, spacing })).join("");
+}
 
-  return [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(payload.title)}">`,
-    `<rect width="${width}" height="${height}" fill="${colors.background}"/>`,
-    `<rect x="${margin}" y="${margin}" width="${width - margin * 2}" height="${height - margin * 2}" rx="28" fill="${colors.surface}" stroke="${colors.border}"/>`,
-    `<circle cx="${width - margin - 58}" cy="${margin + 52}" r="36" fill="${colors.green}" fill-opacity="0.18"/>`,
-    `<circle cx="${width - margin - 106}" cy="${margin + 86}" r="18" fill="${colors.purple}" fill-opacity="0.22"/>`,
-    `<text x="${margin + 26}" y="${margin + 36}" fill="${colors.green}" font-family="Inter, Arial, sans-serif" font-size="13" font-weight="900">SOURCE-GROUNDED INFOGRAPHIC</text>`,
-    svgTextBlock(headerLines, margin + 26, margin + 76, { fill: colors.text, size: payload.orientation === "portrait" ? 34 : 38, weight: 800, lineHeight: 42 }),
-    svgTextBlock(wrapSvgText(subtitle, payload.orientation === "portrait" ? 62 : 94, 2), margin + 26, margin + 126, { fill: colors.muted, size: 14, weight: 600, lineHeight: 19 }),
-    panelMarkup,
-    `<g transform="translate(${margin + 26} ${height - margin - 58})">`,
-    `<text x="0" y="0" fill="${colors.green}" font-family="Inter, Arial, sans-serif" font-size="12" font-weight="900">Evidence appendix</text>`,
-    svgTextBlock(wrapSvgText(footerSources || "No source references available.", payload.orientation === "portrait" ? 74 : 126, 2), 0, 24, { fill: colors.faint, size: 11, weight: 600, lineHeight: 15 }),
-    `<text x="${width - margin * 2 - 52}" y="24" text-anchor="end" fill="${colors.faint}" font-family="Inter, Arial, sans-serif" font-size="11" font-weight="700">${escapeXml(PRODUCT_NAME)}</text>`,
-    `</g>`,
-    `</svg>`,
-  ].join("");
+function renderInfographicSvg(payload) {
+  const L = infographicLayout(payload);
+  const { W, H, M, portrait, columns, panels, titleSize, titleLH, titleLines, headerH, kpiH, footerH, pGap, panelH, gridTop } = L;
+  const c = infographicPalette(payload.visual_style);
+  const innerW = W - M * 2;
+
+  const coverage = payload.source_coverage || {};
+  const subtitle = truncate(
+    `${panels.length} source-grounded panels · ${coverage.cited_sources || 0}/${coverage.active_sources || 0} sources cited · ${coverage.evidence_items || 0} evidence items`,
+    portrait ? 60 : 84,
+  );
+
+  const metrics = extractInfographicMetrics(payload);
+  const kpiGap = 16;
+  const kpiW = Math.floor((innerW - kpiGap * (metrics.length - 1)) / Math.max(1, metrics.length));
+  const panelW = Math.floor((innerW - pGap * (columns - 1)) / columns);
+
+  const parts = [];
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(payload.title)}">`);
+
+  // gradient defs
+  parts.push(`<defs>`);
+  parts.push(`<linearGradient id="ig-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${c.bg1}"/><stop offset="1" stop-color="${c.bg0}"/></linearGradient>`);
+  parts.push(`<linearGradient id="ig-hdr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${c.green}" stop-opacity="0.16"/><stop offset="0.6" stop-color="${c.accents[4]}" stop-opacity="0.05"/><stop offset="1" stop-color="${c.bg0}" stop-opacity="0"/></linearGradient>`);
+  c.accents.forEach((a, i) => {
+    parts.push(`<linearGradient id="ig-acc${i}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${a}" stop-opacity="0.22"/><stop offset="1" stop-color="${a}" stop-opacity="0.02"/></linearGradient>`);
+  });
+  parts.push(`</defs>`);
+
+  // backdrop + faint grid texture
+  parts.push(`<rect width="${W}" height="${H}" fill="url(#ig-bg)"/>`);
+  const gl = [];
+  for (let gx = M; gx < W - M; gx += 48) gl.push(`<line x1="${gx}" y1="${M}" x2="${gx}" y2="${H - M}" stroke="${c.text}" stroke-opacity="0.018"/>`);
+  for (let gy = M; gy < H - M; gy += 48) gl.push(`<line x1="${M}" y1="${gy}" x2="${W - M}" y2="${gy}" stroke="${c.text}" stroke-opacity="0.018"/>`);
+  parts.push(gl.join(""));
+
+  // ===== HEADER =====
+  const hx = M, hy = M;
+  parts.push(`<rect x="${hx}" y="${hy}" width="${innerW}" height="${headerH}" rx="22" fill="url(#ig-hdr)" stroke="${c.panelEdge}"/>`);
+  const mox = W - M - 64, moy = hy + 58;
+  parts.push(`<circle cx="${mox}" cy="${moy}" r="46" fill="none" stroke="${c.green}" stroke-opacity="0.25"/>`);
+  parts.push(`<circle cx="${mox}" cy="${moy}" r="30" fill="none" stroke="${c.accents[1]}" stroke-opacity="0.3"/>`);
+  parts.push(`<circle cx="${mox}" cy="${moy}" r="6" fill="${c.green}"/>`);
+  [[-46, 0], [33, -33], [33, 33], [0, 46]].forEach(([dx, dy], i) => {
+    const a = c.accents[i % c.accents.length];
+    parts.push(`<line x1="${mox}" y1="${moy}" x2="${mox + dx}" y2="${moy + dy}" stroke="${a}" stroke-opacity="0.3"/>`);
+    parts.push(`<circle cx="${mox + dx}" cy="${moy + dy}" r="4.5" fill="${a}"/>`);
+  });
+  parts.push(`<circle cx="${hx + 28}" cy="${hy + 32}" r="4" fill="${c.green}"/>`);
+  parts.push(svgText(hx + 40, hy + 36, "SOURCE-GROUNDED INFOGRAPHIC", { fill: c.green, size: 12.5, weight: 800, spacing: 2.4 }));
+  parts.push(svgTextBlock(titleLines, hx + 28, hy + 64 + titleSize - 6, { fill: c.text, size: titleSize, weight: 800, lineHeight: titleLH }));
+  parts.push(svgText(hx + 28, hy + headerH - 18, subtitle, { fill: c.muted, size: 13.5, weight: 600 }));
+
+  // ===== HERO KPI STRIP =====
+  const ky = M + headerH + 12;
+  metrics.forEach((mt, i) => {
+    const kx = M + i * (kpiW + kpiGap);
+    const a = c.accents[i % c.accents.length];
+    parts.push(`<g transform="translate(${kx} ${ky})">`);
+    parts.push(`<rect width="${kpiW}" height="${kpiH}" rx="18" fill="url(#ig-acc${i % c.accents.length})" stroke="${a}" stroke-opacity="0.45"/>`);
+    parts.push(`<rect width="5" height="${kpiH}" rx="2.5" fill="${a}"/>`);
+    parts.push(`<rect x="20" y="20" width="40" height="40" rx="11" fill="${a}" fill-opacity="0.16"/>`);
+    parts.push(infographicIconMarkup(mt.icon, 28, 28, 24, a, 1.9));
+    parts.push(svgText(20, kpiH - 38, truncate(mt.value, 14), { fill: c.text, size: 40, weight: 800 }));
+    parts.push(svgText(20, kpiH - 16, truncate(mt.label, 30).toUpperCase(), { fill: c.muted, size: 11.5, weight: 700, spacing: 0.8 }));
+    parts.push(`</g>`);
+  });
+
+  // ===== PANEL GRID =====
+  panels.forEach((p, i) => {
+    const col = i % columns, row = Math.floor(i / columns);
+    const x = M + col * (panelW + pGap);
+    const y = gridTop + row * (panelH + pGap);
+    const a = c.accents[i % c.accents.length];
+    const icon = pickInfographicIcon(`${p.headline} ${p.copy}`, i);
+    const headlineText = infographicCleanText(p.headline || "");
+    const copyText = infographicCleanText(p.copy || "");
+    const single = columns === 1;
+    const headSize = single ? 20 : 18, headLH = single ? 25 : 23;
+    const copySize = single ? 15 : 13.5, copyLH = single ? 21 : 19;
+    const headLines = wrapSvgText(headlineText, single ? 52 : 30, 2);
+    const padX = 24;
+    const headTop = 30;
+    const copyY = headTop + headLines.length * headLH + 10;
+    const dividerY = panelH - 30;
+    const footerY = panelH - 14;
+    const copyRoom = dividerY - 6 - copyY;
+    const maxCopyLines = Math.min(5, Math.floor(copyRoom / copyLH));
+    const copyLines = maxCopyLines >= 1 ? wrapSvgText(copyText, single ? 80 : 44, maxCopyLines) : [];
+    const source = truncate(p.source_title || p.evidence_id || "Evidence Pack", single ? 56 : 30);
+
+    parts.push(`<g transform="translate(${x} ${y})">`);
+    parts.push(`<rect width="${panelW}" height="${panelH}" rx="18" fill="${c.panel}" stroke="${c.panelEdge}"/>`);
+    parts.push(`<rect width="5" height="${panelH}" rx="2.5" fill="${a}"/>`);
+    parts.push(`<circle cx="42" cy="40" r="18" fill="${a}" fill-opacity="0.16" stroke="${a}" stroke-opacity="0.5"/>`);
+    parts.push(svgText(42, 45, String(p.panel || i + 1).padStart(2, "0"), { fill: a, size: 14, weight: 800, anchor: "middle" }));
+    parts.push(`<rect x="${panelW - 56}" y="22" width="36" height="36" rx="10" fill="${a}" fill-opacity="0.1"/>`);
+    parts.push(infographicIconMarkup(icon, panelW - 50, 28, 24, a, 1.8));
+    parts.push(svgTextBlock(headLines, 72, headTop + headSize - 4, { fill: c.text, size: headSize, weight: 800, lineHeight: headLH }));
+    parts.push(svgTextBlock(copyLines, padX, copyY + copySize, { fill: c.muted, size: copySize, weight: 500, lineHeight: copyLH }));
+    parts.push(`<line x1="${padX}" y1="${dividerY}" x2="${panelW - padX}" y2="${dividerY}" stroke="${c.panelEdge}"/>`);
+    parts.push(`<circle cx="${padX + 4}" cy="${footerY - 4}" r="3" fill="${a}"/>`);
+    parts.push(svgText(padX + 14, footerY, source, { fill: c.faint, size: 11.5, weight: 700 }));
+    if (p.citation) {
+      const cw = 16 + String(p.citation).length * 7.4;
+      parts.push(`<rect x="${panelW - cw - padX}" y="${footerY - 15}" width="${cw}" height="22" rx="11" fill="${a}" fill-opacity="0.16"/>`);
+      parts.push(svgText(panelW - padX - cw / 2, footerY, String(p.citation), { fill: a, size: 11.5, weight: 800, anchor: "middle" }));
+    }
+    parts.push(`</g>`);
+  });
+
+  // ===== FOOTER =====
+  const fy = H - M - footerH;
+  parts.push(`<rect x="${M}" y="${fy}" width="${innerW}" height="${footerH}" rx="16" fill="${c.panel}" fill-opacity="0.5" stroke="${c.panelEdge}"/>`);
+  parts.push(`<circle cx="${M + 24}" cy="${fy + 26}" r="4" fill="${c.green}"/>`);
+  parts.push(svgText(M + 36, fy + 30, "EVIDENCE APPENDIX", { fill: c.green, size: 11.5, weight: 800, spacing: 1.6 }));
+  const refs = (payload.evidence_appendix || []).slice(0, 4).map((e) => `${e.citation} ${truncate(e.source_title || "", 26)}`).join("    ");
+  parts.push(svgText(M + 36, fy + 52, truncate(refs || "No source references available.", portrait ? 70 : 104), { fill: c.faint, size: 12, weight: 600 }));
+  parts.push(svgText(W - M - 18, fy + 42, PRODUCT_NAME, { fill: c.muted, size: 12.5, weight: 800, anchor: "end" }));
+
+  parts.push(`</svg>`);
+  return parts.join("");
 }
 
 function infographicPalette(style) {
   const base = {
-    background: "#080a09",
-    surface: "#151916",
-    panel: "#1d231f",
-    border: "#2b332e",
-    text: "#f4f7f2",
-    muted: "#c4cec8",
-    faint: "#8d9a92",
-    green: "#0fd070",
-    purple: "#aa9fff",
-    accents: ["#0fd070", "#d8e67e", "#74ccf4", "#ec99bc", "#aa9fff", "#92d0c3", "#e7aa83", "#a8bced"],
+    bg0: "#080b0a", bg1: "#0d100e",
+    panel: "#161b18", panelEdge: "#243029",
+    text: "#f3f7f2", muted: "#aeb9b2", faint: "#7f8c84",
+    green: "#13d075",
+    accents: ["#13d075", "#7bd3f0", "#c9e36b", "#f0a2c0", "#b6a4ff", "#7fd4c2", "#f0b483", "#9db9f0"],
   };
   if (style === "executive-brief") {
-    return { ...base, surface: "#171a1b", panel: "#202425", accents: ["#d8e67e", "#74ccf4", "#0fd070", "#ec99bc", "#92d0c3", "#aa9fff"] };
+    return { ...base, accents: ["#c9e36b", "#7bd3f0", "#13d075", "#f0a2c0", "#7fd4c2", "#b6a4ff"] };
   }
   if (style === "study-map") {
-    return { ...base, surface: "#15171f", panel: "#1e2130", accents: ["#aa9fff", "#74ccf4", "#0fd070", "#e7aa83", "#ec99bc", "#d8e67e"] };
+    return { ...base, bg0: "#08090f", bg1: "#0d0f17", panel: "#161827", panelEdge: "#262a3d",
+      accents: ["#b6a4ff", "#7bd3f0", "#13d075", "#f0b483", "#f0a2c0", "#c9e36b"] };
   }
   return base;
-}
-
-function svgTextBlock(lines, x, y, { fill, size, weight, lineHeight }) {
-  return lines.map((line, index) =>
-    `<text x="${x}" y="${y + index * lineHeight}" fill="${fill}" font-family="Inter, Arial, sans-serif" font-size="${size}" font-weight="${weight}">${escapeXml(line)}</text>`,
-  ).join("");
 }
 
 function wrapSvgText(text, maxChars, maxLines) {
