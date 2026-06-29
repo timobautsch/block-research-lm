@@ -14,6 +14,7 @@ import {
   serializeSessionCookie,
 } from "./sourcestudio/auth-store.js";
 import { createDebugLogger } from "./sourcestudio/logger.js";
+import { createDurableStore } from "./sourcestudio/durable-store.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -25,7 +26,17 @@ loadEnvironment();
 
 const logger = createDebugLogger();
 const engine = await createSourceStudioEngine({ root, logger });
-const authStore = createAuthStore({ root, env: process.env });
+const durable = createDurableStore({ env: process.env, logger });
+const authSnapshot = durable.enabled ? await durable.get("auth_snapshot") : null;
+const authStore = createAuthStore({
+  root,
+  env: process.env,
+  // Persist auth in Supabase so logins survive Cloud Run restarts/redeploys.
+  snapshot: authSnapshot,
+  onChange: () => {
+    void durable.set("auth_snapshot", authStore.snapshot());
+  },
+});
 const app = express();
 
 app.use(express.json({ limit: "18mb" }));

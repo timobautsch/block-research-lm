@@ -60,6 +60,11 @@ export function createAuthStore(options = {}) {
     CREATE INDEX IF NOT EXISTS idx_password_resets_token_hash ON password_resets(token_hash);
   `);
 
+  // Restore users/sessions from the durable snapshot (Supabase) so logins survive
+  // Cloud Run restarts/redeploys; onChange persists a fresh snapshot after writes.
+  const onChange = typeof options.onChange === "function" ? options.onChange : () => {};
+  if (options.snapshot) restoreSnapshot(options.snapshot);
+
   function createUser(input = {}) {
     const email = normalizeEmail(input.email);
     const name = normalizeName(input.name, email);
@@ -233,16 +238,61 @@ export function createAuthStore(options = {}) {
     };
   }
 
-  return {
-    createUser,
-    loginUser,
-    createSession,
-    getSession,
-    revokeSession,
-    requestPasswordReset,
-    resetPassword,
-    status,
+  const mutating = (fn) => (...args) => {
+    const result = fn(...args);
+    try {
+      onChange();
+    } catch {
+      // snapshot persistence is best-effort; the live sqlite copy still works.
+    }
+    return result;
   };
+
+  return {
+    createUser: mutating(createUser),
+    loginUser: mutating(loginUser),
+    createSession: mutating(createSession),
+    getSession,
+    revokeSession: mutating(revokeSession),
+    requestPasswordReset: mutating(requestPasswordReset),
+    resetPassword: mutating(resetPassword),
+    status,
+    snapshot,
+  };
+
+  function snapshot() {
+    return {
+      users: db.prepare("SELECT * FROM users").all(),
+      sessions: db.prepare("SELECT * FROM sessions WHERE revoked_at IS NULL AND expires_at > ?").all(now()),
+      password_resets: db.prepare("SELECT * FROM password_resets WHERE used_at IS NULL AND expires_at > ?").all(now()),
+    };
+  }
+
+  function restoreSnapshot(data) {
+    if (!data || typeof data !== "object") return;
+    try {
+      const insertUser = db.prepare(
+        "INSERT OR REPLACE INTO users (id, email, name, password_hash, password_salt, created_at, updated_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (const u of data.users || []) {
+        insertUser.run(u.id, u.email, u.name, u.password_hash, u.password_salt, u.created_at, u.updated_at, u.last_login_at ?? null);
+      }
+      const insertSession = db.prepare(
+        "INSERT OR REPLACE INTO sessions (id, user_id, token_hash, user_agent, ip_hash, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (const s of data.sessions || []) {
+        insertSession.run(s.id, s.user_id, s.token_hash, s.user_agent || "", s.ip_hash || "", s.created_at, s.expires_at, s.revoked_at ?? null);
+      }
+      const insertReset = db.prepare(
+        "INSERT OR REPLACE INTO password_resets (id, user_id, token_hash, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, ?)",
+      );
+      for (const r of data.password_resets || []) {
+        insertReset.run(r.id, r.user_id, r.token_hash, r.created_at, r.expires_at, r.used_at ?? null);
+      }
+    } catch {
+      // best-effort restore
+    }
+  }
 
   function findUserByEmail(email) {
     return db.prepare("SELECT * FROM users WHERE email = ? LIMIT 1").get(email) || null;

@@ -14,6 +14,7 @@ import {
   FlashcardReviewSchema,
 } from "./schemas.js";
 import { createModelRouter } from "./model-router.js";
+import { createDurableStore } from "./durable-store.js";
 import { noopLogger } from "./logger.js";
 
 const VECTOR_SIZE = 96;
@@ -53,20 +54,35 @@ export async function createSourceStudioEngine(options = {}) {
   });
   const embedder = createEmbedder({ env, fetchImpl, logger });
   const pgStore = createPgStore({ env, logger });
+  const durable = createDurableStore({ env, logger });
 
   await mkdir(fileDir, { recursive: true });
   await mkdir(artifactDir, { recursive: true });
 
-  let state = await loadState(stateFile);
+  let state = await loadInitialState();
   let audioOverviewPromptSpec = null;
   logger.info("engine.ready", {
     storage_dir: storageLabel(root, storageDir),
+    durable: durable.enabled,
     counts: stateCounts(),
   });
+
+  // Load the durable snapshot (Supabase) first so notebooks/sources survive
+  // Cloud Run restarts and redeploys; fall back to the local disk copy.
+  async function loadInitialState() {
+    if (durable.enabled) {
+      const stored = await durable.get("engine_state");
+      if (stored && typeof stored === "object") {
+        return { ...createEmptyState(), ...stored };
+      }
+    }
+    return loadState(stateFile);
+  }
 
   async function persist() {
     await mkdir(dirname(stateFile), { recursive: true });
     await writeFile(stateFile, JSON.stringify(state, null, 2));
+    if (durable.enabled) await durable.set("engine_state", state);
   }
 
   function now() {
