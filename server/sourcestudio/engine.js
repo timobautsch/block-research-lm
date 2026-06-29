@@ -297,6 +297,7 @@ export async function createSourceStudioEngine(options = {}) {
         knowledge_objects: sourceKnowledge.length,
         duration_ms: Date.now() - startedAt,
       });
+      await maybeAutoNameNotebook(notebookId, context);
       return decorateSource(sourceId, { includeBlocks: true });
     } catch (error) {
       source.status = "failed";
@@ -330,6 +331,92 @@ export async function createSourceStudioEngine(options = {}) {
       // Failure is already recorded on the source (status + metadata error).
     });
     return decorateSource(sourceId, { includeBlocks: false });
+  }
+
+  async function renameNotebook(notebookId, input = {}, context = {}) {
+    const notebook = assertNotebookAccess(notebookId, context);
+    const title = String(input.title || "").trim();
+    if (!title) throw statusError(400, "Notebook title is required.");
+    if (title.length > 160) throw statusError(400, "Notebook title is too long.");
+    notebook.title = title;
+    notebook.title_source = "manual";
+    notebook.updated_at = now();
+    await persist();
+    logger.info("notebook.rename", { request_id: context.requestId, notebook_id: notebookId, title });
+    return decorateNotebook(notebookId);
+  }
+
+  // After a source finishes indexing, ask the model for a notebook name that captures
+  // the overarching topic of its sources — but never override a user's manual title.
+  async function maybeAutoNameNotebook(notebookId, context = {}) {
+    const notebook = state.notebooks.find((item) => item.id === notebookId);
+    if (!notebook || notebook.auto_naming) return;
+    if (notebook.title_source === "manual") return;
+    if (!isDefaultNotebookTitle(notebook.title)) return;
+    const sources = state.sources.filter(
+      (source) => source.notebook_id === notebookId && source.status === "indexed",
+    );
+    if (!sources.length) return;
+
+    notebook.auto_naming = true;
+    try {
+      const suggestion = await suggestNotebookTitle(sources);
+      const fresh = state.notebooks.find((item) => item.id === notebookId);
+      // Re-check: the user may have manually renamed it while the model was thinking.
+      if (fresh && suggestion && fresh.title_source !== "manual" && isDefaultNotebookTitle(fresh.title)) {
+        fresh.title = suggestion;
+        fresh.title_source = "auto";
+        fresh.updated_at = now();
+        await persist();
+        logger.info("notebook.autoname.complete", {
+          request_id: context.requestId,
+          notebook_id: notebookId,
+          title: suggestion,
+        });
+      }
+    } catch (error) {
+      logger.warn("notebook.autoname.failed", {
+        notebook_id: notebookId,
+        error: String(error?.message || error).slice(0, 160),
+      });
+    } finally {
+      const fresh = state.notebooks.find((item) => item.id === notebookId);
+      if (fresh) fresh.auto_naming = false;
+    }
+  }
+
+  async function suggestNotebookTitle(sources) {
+    const corpus = sources
+      .slice(0, 5)
+      .map((source) => {
+        const body = String(source.cleaned_text || source.raw_text || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 1200);
+        return `Source title: ${source.title}\n${body}`;
+      })
+      .join("\n\n---\n\n");
+
+    const prompt = [
+      "Name a research notebook based on the sources below.",
+      "Capture the overarching topic shared across the sources — specific, not generic.",
+      "Return ONLY the title text: 2-6 words, Title Case, no quotes, no markdown, no file extensions, no trailing punctuation.",
+      "",
+      "SOURCES:",
+      corpus,
+      "",
+      "Notebook title:",
+    ].join("\n");
+
+    const result = await modelRouter.generateStructured({
+      role: "artifact_generation",
+      systemPrompt: "You generate short, specific notebook titles. Output only the title text, nothing else.",
+      prompt,
+      maxTokens: 24,
+      startRun: startModelRun,
+    });
+    if (result?.run) state.modelRuns.push(result.run);
+    return cleanNotebookTitle(result?.text) || fallbackNotebookTitle(sources);
   }
 
   async function setSourceActive(sourceId, input = {}, context = {}) {
@@ -915,6 +1002,7 @@ export async function createSourceStudioEngine(options = {}) {
     createNotebook,
     listNotebooks,
     getNotebook,
+    renameNotebook,
     ingestSource,
     setSourceActive,
     deleteSource,
@@ -1771,14 +1859,18 @@ export async function createSourceStudioEngine(options = {}) {
     let current = [];
     let tokenCount = 0;
     let currentHeading = [];
+    // How many leading blocks in `current` are overlap carried over from the previous chunk.
+    // Used to guard flushes so we never emit an overlap-only (duplicate) chunk.
+    let carriedOverlap = 0;
     const pushChunk = () => {
       const text = current.map((block) => block.text).join("\n\n").trim();
       if (!text) {
         current = [];
         tokenCount = 0;
+        carriedOverlap = 0;
         return;
       }
-      const blockIds = current.map((block) => block.block_id);
+      const blockIds = [...new Set(current.map((block) => block.block_id))];
       const first = current[0];
       const last = current[current.length - 1];
       chunks.push({
@@ -1803,31 +1895,46 @@ export async function createSourceStudioEngine(options = {}) {
         },
         created_at: now(),
       });
-      const overlapBlocks = current.slice(-2);
-      current = overlapBlocks;
-      tokenCount = estimateTokens(overlapBlocks.map((block) => block.text).join(" "));
+      // Carry only a small trailing tail (<= CHUNK_TOKEN_OVERLAP tokens) into the next chunk
+      // for context continuity. A block at/over the target is never carried (that is what
+      // previously made the chunker repeat the same opening and skip the document body).
+      const overlap = [];
+      let overlapTokens = 0;
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        const blockTokens = estimateTokens(current[i].text);
+        if (blockTokens > CHUNK_TOKEN_OVERLAP || overlapTokens + blockTokens > CHUNK_TOKEN_OVERLAP) break;
+        overlap.unshift(current[i]);
+        overlapTokens += blockTokens;
+      }
+      current = overlap;
+      tokenCount = overlapTokens;
+      carriedOverlap = overlap.length;
     };
 
     for (const block of splitOversizedBlocks(blocks)) {
-      if (block.type === "heading") currentHeading = block.heading_path;
-      const nextTokens = estimateTokens(block.text);
-      if (current.length && tokenCount + nextTokens > CHUNK_TOKEN_TARGET) pushChunk();
-      current.push(block);
-      tokenCount += nextTokens;
-      if (block.type === "heading" && current.length > 1) pushChunk();
-    }
-    if (current.length) {
-      const before = chunks.length;
-      pushChunk();
-      if (chunks.length > before && chunks.at(-1)?.block_ids.length <= 2 && chunks.length > 1) {
-        const last = chunks.pop();
-        const previous = chunks.at(-1);
-        previous.text = `${previous.text}\n\n${last.text}`;
-        previous.normalized_text = normalizeForSearch(previous.text);
-        previous.block_ids = [...new Set([...previous.block_ids, ...last.block_ids])];
-        previous.token_count = estimateTokens(previous.text);
-        previous.char_end = last.char_end;
+      if (block.type === "heading") {
+        if (current.length > carriedOverlap) pushChunk(); // close the open section first
+        currentHeading = block.heading_path;
       }
+      const blockTokens = estimateTokens(block.text);
+      // Flush before adding when this block would overflow the target, but only once we
+      // hold real (non-overlap) content. The `current.length > carriedOverlap` guard
+      // guarantees forward progress, full coverage, and no overlap-only duplicate chunks.
+      if (current.length > carriedOverlap && tokenCount + blockTokens > CHUNK_TOKEN_TARGET) pushChunk();
+      current.push(block);
+      tokenCount += blockTokens;
+    }
+    if (current.length > carriedOverlap) pushChunk();
+
+    // Fold a tiny trailing remnant back into its predecessor.
+    if (chunks.length > 1 && chunks.at(-1).block_ids.length <= 1 && estimateTokens(chunks.at(-1).text) < CHUNK_TOKEN_OVERLAP) {
+      const last = chunks.pop();
+      const previous = chunks.at(-1);
+      previous.text = `${previous.text}\n\n${last.text}`;
+      previous.normalized_text = normalizeForSearch(previous.text);
+      previous.block_ids = [...new Set([...previous.block_ids, ...last.block_ids])];
+      previous.token_count = estimateTokens(previous.text);
+      previous.char_end = last.char_end;
     }
     return chunks;
   }
@@ -2046,7 +2153,10 @@ export async function createSourceStudioEngine(options = {}) {
         source_title: source.title,
         block_ids: result.chunk.block_ids,
         chunk_id: result.chunk.id,
-        quote: truncate(result.chunk.text, 620),
+        // Show the full retrieved chunk (capped) — truncating to a few hundred chars used
+        // to hide evidence that sat past the chunk opening (e.g. a pricing table mid-chunk),
+        // which made the model abstain even though the chunk contained the answer.
+        quote: truncate(result.chunk.text, 2600),
         heading_path: result.chunk.heading_path || [],
         page_number: result.chunk.page_start || firstBlock?.page_number || null,
         timestamp_start: result.chunk.timestamp_start || null,
@@ -4431,17 +4541,39 @@ function splitOversizedBlocks(blocks) {
     let buffer = [];
     let bufferTokens = 0;
     let offset = block.char_start || 0;
+    const emit = (raw) => {
+      const text = String(raw || "").trim();
+      if (!text) return;
+      out.push({ ...block, text, char_start: offset, char_end: offset + text.length });
+      offset += text.length;
+    };
     const flush = () => {
       if (!buffer.length) return;
-      const text = buffer.join(joiner).trim();
-      if (text) {
-        out.push({ ...block, text, char_start: offset, char_end: offset + text.length });
-        offset += text.length;
-      }
+      emit(buffer.join(joiner));
       buffer = [];
       bufferTokens = 0;
     };
     for (const unit of units) {
+      // A single unit can itself exceed the target when there are no sentence breaks —
+      // e.g. a flattened pricing/milestone table. Hard-split it by words so every
+      // sub-block stays retrievable instead of becoming one oversized (or dropped) chunk.
+      if (estimateTokens(unit) > CHUNK_TOKEN_TARGET) {
+        flush();
+        let wordBuffer = [];
+        let wordTokens = 0;
+        for (const word of unit.split(/\s+/).filter(Boolean)) {
+          const wt = estimateTokens(word);
+          if (wordBuffer.length && wordTokens + wt > CHUNK_TOKEN_TARGET) {
+            emit(wordBuffer.join(" "));
+            wordBuffer = [];
+            wordTokens = 0;
+          }
+          wordBuffer.push(word);
+          wordTokens += wt;
+        }
+        if (wordBuffer.length) emit(wordBuffer.join(" "));
+        continue;
+      }
       const unitTokens = estimateTokens(unit);
       if (buffer.length && bufferTokens + unitTokens > CHUNK_TOKEN_TARGET) flush();
       buffer.push(unit);
@@ -5742,4 +5874,45 @@ function statusError(status, message) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+function isDefaultNotebookTitle(title) {
+  const value = String(title || "").trim();
+  return (
+    value === "" ||
+    value === "Untitled notebook" ||
+    value === "SourceStudio Demo Notebook" ||
+    value === PRODUCT_NAME
+  );
+}
+
+// Normalize a model's raw title output: take the first non-empty line, strip wrapping
+// quotes/markdown/trailing punctuation, and reject sentence-length blobs (refusals etc.).
+function cleanNotebookTitle(raw) {
+  if (!raw) return "";
+  let title = String(raw)
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean) || "";
+  title = title
+    .replace(/^["'`*#\s]+/, "")
+    .replace(/["'`*\s]+$/, "")
+    .replace(/[.;:,]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!title) return "";
+  if (title.split(" ").length > 10) return "";
+  if (title.length > 80) title = title.slice(0, 80).trim();
+  return title;
+}
+
+function fallbackNotebookTitle(sources) {
+  const first = sources[0];
+  if (!first) return "";
+  const base = String(first.title || "")
+    .replace(/\.[a-z0-9]{1,5}$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return base ? truncate(base, 60) : "";
 }
