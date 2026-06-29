@@ -107,6 +107,16 @@ app.post("/api/auth/password-reset/confirm", asyncHandler(async (req, res) => {
 
 app.use("/api", requireAuth);
 
+app.post("/api/auth/password", asyncHandler(async (req, res) => {
+  const user = authStore.changePassword({
+    userId: req.user.id,
+    currentPassword: req.body?.current_password,
+    newPassword: req.body?.new_password,
+    keepSessionToken: sessionToken(req),
+  });
+  res.json({ ok: true, user });
+}));
+
 app.get("/api/debug/status", routeHandler((req) => ({
   debug: engine.debugSnapshot(userContext(req)),
   events: logger.events(req.query.limit || 180),

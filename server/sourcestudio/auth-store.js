@@ -229,6 +229,36 @@ export function createAuthStore(options = {}) {
     return publicUser(findUserById(reset.user_id));
   }
 
+  function changePassword(input = {}) {
+    const user = findUserById(String(input.userId || ""));
+    if (!user) throw authError(401, "You must be signed in to change your password.");
+    if (!verifyPassword(String(input.currentPassword || ""), user.password_salt, user.password_hash)) {
+      throw authError(400, "Current password is incorrect.");
+    }
+    const nextPassword = validatePassword(input.newPassword);
+    if (verifyPassword(nextPassword, user.password_salt, user.password_hash)) {
+      throw authError(400, "New password must be different from the current password.");
+    }
+
+    const credentials = hashPassword(nextPassword);
+    const timestamp = now();
+    db.prepare("UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?").run(
+      credentials.hash,
+      credentials.salt,
+      timestamp,
+      user.id,
+    );
+    // Revoke every other session so an old password can't keep a stolen session alive; keep the caller's session.
+    const keepTokenHash = input.keepSessionToken ? hashToken(input.keepSessionToken) : "";
+    db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND token_hash != ?").run(
+      timestamp,
+      user.id,
+      keepTokenHash,
+    );
+
+    return publicUser(findUserById(user.id));
+  }
+
   function status() {
     return {
       provider: "node-sqlite",
@@ -256,6 +286,7 @@ export function createAuthStore(options = {}) {
     revokeSession: mutating(revokeSession),
     requestPasswordReset: mutating(requestPasswordReset),
     resetPassword: mutating(resetPassword),
+    changePassword: mutating(changePassword),
     status,
     snapshot,
   };

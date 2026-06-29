@@ -33,6 +33,7 @@ import {
   NotebookPen,
   PanelLeft,
   PlayCircle,
+  PauseCircle,
   Plus,
   Presentation,
   RefreshCw,
@@ -644,6 +645,8 @@ export default function App() {
   const [audioOptions, setAudioOptions] = useState<AudioOverviewOptions>(defaultAudioOverviewOptions);
   const [flashcardOptions, setFlashcardOptions] = useState<FlashcardOptions>(defaultFlashcardOptions);
   const [isArtifactDetailOpen, setIsArtifactDetailOpen] = useState(false);
+  const [playingArtifactId, setPlayingArtifactId] = useState("");
+  const inlineAudioRef = useRef<HTMLAudioElement>(null);
   const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
   const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail">("");
@@ -1143,6 +1146,23 @@ export default function App() {
         return next;
       });
     }
+  }
+
+  function toggleArtifactAudio(artifact: Artifact) {
+    const el = inlineAudioRef.current;
+    if (!el) return;
+    if (playingArtifactId === artifact.id) {
+      el.pause();
+      setPlayingArtifactId("");
+      return;
+    }
+    el.src = `/api/artifacts/${artifact.id}/media`;
+    el.play()
+      .then(() => setPlayingArtifactId(artifact.id))
+      .catch(() => {
+        setPlayingArtifactId("");
+        setError("Audio isn't ready to play yet. Open the output to check its status.");
+      });
   }
 
   function focusCitation(citation: Citation) {
@@ -1876,9 +1896,10 @@ export default function App() {
               </div>
               <div className="artifact-list">
                 {notebook.artifacts.map((artifact) => (
-                  <button
+                  <div
                     key={artifact.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     className="artifact-row"
                     data-active={artifact.id === selectedArtifact?.id}
                     data-kind={artifact.type}
@@ -1886,19 +1907,39 @@ export default function App() {
                       setSelectedArtifactId(artifact.id);
                       setIsArtifactDetailOpen(true);
                     }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedArtifactId(artifact.id);
+                        setIsArtifactDetailOpen(true);
+                      }
+                    }}
                   >
                     <span className="artifact-icon" data-kind={artifact.type}>{artifactIcon(artifact.type)}</span>
-                    <span>
+                    <span className="artifact-row-text">
                       <strong>{artifact.title}</strong>
                       <small>{artifactMetaLine(artifact)}</small>
                     </span>
                     <span className="artifact-row-actions">
-                      {artifact.type === "audio" || artifact.type === "video" ? <PlayCircle size={16} /> : null}
+                      {artifact.type === "audio" ? (
+                        <button
+                          type="button"
+                          className="artifact-play"
+                          aria-label={playingArtifactId === artifact.id ? "Pause audio" : "Play audio"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleArtifactAudio(artifact);
+                          }}
+                        >
+                          {playingArtifactId === artifact.id ? <PauseCircle size={20} /> : <PlayCircle size={20} />}
+                        </button>
+                      ) : null}
                       <MoreVertical size={16} />
                     </span>
-                  </button>
+                  </div>
                 ))}
               </div>
+              <audio ref={inlineAudioRef} onEnded={() => setPlayingArtifactId("")} hidden />
             </>
           ) : null}
 
