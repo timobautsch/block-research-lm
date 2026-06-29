@@ -209,7 +209,8 @@ export async function createSourceStudioEngine(options = {}) {
       active: parsed.active,
     });
 
-    try {
+    const runIngest = async () => {
+     try {
       source.status = "parsing";
       source.updated_at = now();
       if (parsed.base64) {
@@ -299,7 +300,20 @@ export async function createSourceStudioEngine(options = {}) {
         error,
       });
       throw error;
+     }
+    };
+
+    if (context.sync) {
+      return runIngest();
     }
+    // Parse in the background so long parses (YouTube audio transcription, large
+    // media) never hold the request past Firebase Hosting's ~60s proxy timeout.
+    source.status = "parsing";
+    await persist();
+    runIngest().catch(() => {
+      // Failure is already recorded on the source (status + metadata error).
+    });
+    return decorateSource(sourceId, { includeBlocks: false });
   }
 
   async function setSourceActive(sourceId, input = {}, context = {}) {

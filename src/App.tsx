@@ -96,7 +96,7 @@ type MobilePanel = "sources" | "chat" | "studio";
 const AUTH_MODES = ["login", "signup", "reset-request", "reset-confirm"] as const;
 type AuthMode = (typeof AUTH_MODES)[number];
 type ApiInit = Parameters<typeof fetch>[1];
-const BRAND_NAME = "Block Research LM";
+const BRAND_NAME = "blockresearch.ai LM";
 const BRAND_EYEBROW = "Block Research AI";
 const BRAND_LOGO_PATH = "/brand/blockresearch-mark.svg";
 const ASSISTANT_NAME = "Block Research LM";
@@ -901,6 +901,28 @@ export default function App() {
     return response.notebook;
   }
 
+  async function pollSourceUntilReady(sourceId: string, notebookId: string) {
+    const deadline = Date.now() + 8 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      let fresh: Notebook;
+      try {
+        fresh = await loadNotebook(notebookId);
+      } catch {
+        break;
+      }
+      setNotebook((current) => (current?.id === notebookId ? fresh : current));
+      const source = fresh.sources.find((item) => item.id === sourceId);
+      if (!source || source.status === "indexed" || source.status === "failed") {
+        if (source?.status === "failed") {
+          setError("That source could not be indexed. Try again, or paste the text/transcript directly.");
+        }
+        refreshDebugSilently();
+        break;
+      }
+    }
+  }
+
   async function loadSourceBlocks(sourceId: string) {
     try {
       const response = await api<{ blocks: SourceBlock[] }>(`/api/sources/${sourceId}/blocks`);
@@ -972,8 +994,11 @@ export default function App() {
       setSourceForm(emptySourceForm);
       setIsAddSourceOpen(false);
       await refreshNotebook();
-      setToast("Source added. Parsing and indexing into your notebook.");
+      setToast("Source added — transcribing and indexing…");
       refreshDebugSilently();
+      // Parsing runs in the background (e.g. YouTube audio transcription); poll the
+      // source until it finishes so the card updates from "Indexing…" to word count.
+      void pollSourceUntilReady(response.source.id, notebook.id);
     } catch (sourceError) {
       // Surface the failure inside the modal (the global banner sits behind it).
       setSourceFormNotice(

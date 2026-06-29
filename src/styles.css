@@ -616,12 +616,10 @@ select:focus-visible {
   width: 42px;
   height: 42px;
   overflow: hidden;
-  border: 1px solid rgba(15, 208, 112, 0.5);
-  border-radius: 999px;
-  background: rgba(15, 208, 112, 0.1);
-  box-shadow:
-    0 0 0 4px rgba(15, 208, 112, 0.07),
-    0 18px 36px rgba(0, 0, 0, 0.34);
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
   flex: 0 0 auto;
 }
 
