@@ -5286,16 +5286,15 @@ textarea::placeholder {
 .menu-scrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: 15;
   border: 0;
   background: transparent;
   cursor: default;
 }
 
 .menu {
-  position: absolute;
-  top: calc(100% + 8px);
-  z-index: 41;
+  position: fixed;
+  z-index: 16;
   display: grid;
   gap: 2px;
   min-width: 232px;

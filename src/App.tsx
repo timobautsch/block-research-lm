@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
+import { createPortal } from "react-dom";
+import type { ChangeEvent, CSSProperties, DragEvent, FormEvent, ReactNode } from "react";
 import {
   ArrowRight,
   AudioLines,
@@ -2322,12 +2323,45 @@ function Menu({
   align: "start" | "end";
   onClose: () => void;
 }) {
+  // Render to document.body so the dropdown escapes the .topbar stacking context
+  // (otherwise its z-index is capped inside the topbar and paints behind .workspace/Studio).
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const [rect, setRect] = useState<{ top: number; left: number; right: number } | null>(null);
+  useEffect(() => {
+    const trigger = anchorRef.current?.previousElementSibling as HTMLElement | null;
+    if (!trigger) return;
+    const update = () => {
+      const r = trigger.getBoundingClientRect();
+      setRect({ top: r.bottom, left: r.left, right: r.right });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, []);
+  const menuStyle: CSSProperties = rect
+    ? {
+        top: rect.top + 8,
+        ...(align === "end"
+          ? { right: Math.max(8, window.innerWidth - rect.right) }
+          : { left: rect.left }),
+      }
+    : { visibility: "hidden" };
   return (
     <>
-      <button className="menu-scrim" type="button" aria-label="Close menu" onClick={onClose} />
-      <div className={`menu menu-${align}`} role="menu">
-        {children}
-      </div>
+      <span ref={anchorRef} aria-hidden style={{ display: "none" }} />
+      {createPortal(
+        <>
+          <button className="menu-scrim" type="button" aria-label="Close menu" onClick={onClose} />
+          <div className={`menu menu-${align}`} role="menu" style={menuStyle}>
+            {children}
+          </div>
+        </>,
+        document.body,
+      )}
     </>
   );
 }

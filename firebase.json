@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "blockresearch-lm",
     "public": "firebase_public",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
     "rewrites": [
