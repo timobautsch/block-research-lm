@@ -1,0 +1,4 @@
+metric,value,note
+subscribers,1000000,milestone
+strategies,42,active
+latency_ms,2800,signalpipe
