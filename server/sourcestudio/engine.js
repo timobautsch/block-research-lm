@@ -2616,8 +2616,12 @@ export async function createSourceStudioEngine(options = {}) {
         form.append("prompt", prompt);
         form.append("size", "1536x1024");
         references.forEach((ref, index) => {
+          // Use the reference's real mime/extension — sending a JPEG/WebP labelled
+          // "image/png" makes the images/edits endpoint reject it ("Invalid image file").
+          const mime = (/^data:([^;,]+)/.exec(String(ref))?.[1] || "image/png").toLowerCase();
+          const ext = /jpe?g/.test(mime) ? "jpg" : mime.includes("webp") ? "webp" : "png";
           const base64 = String(ref).replace(/^data:[^,]+,/, "");
-          form.append("image[]", new Blob([Buffer.from(base64, "base64")], { type: "image/png" }), `ref-${index}.png`);
+          form.append("image[]", new Blob([Buffer.from(base64, "base64")], { type: mime }), `ref-${index}.${ext}`);
         });
         response = await fetchImpl("https://api.openai.com/v1/images/edits", {
           method: "POST",

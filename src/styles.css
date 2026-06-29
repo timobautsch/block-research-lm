@@ -5945,3 +5945,91 @@ textarea::placeholder {
   cursor: default;
   box-shadow: none;
 }
+
+/* ===== Themed form controls across ALL modals (customize / thumbnail / audio) ===== */
+.modal-backdrop,
+.modal { color-scheme: dark; }
+
+.customize-modal .modal-field,
+.thumbnail-config .modal-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+}
+.customize-modal .modal-field > span,
+.thumbnail-config .modal-field > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.thumbnail-config {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+}
+
+/* selects, textareas and (non-file) inputs inside customize modals */
+.customize-modal select,
+.customize-modal textarea,
+.customize-modal input:not([type="file"]),
+.audio-config select,
+.audio-config textarea,
+.flashcard-config select,
+.flashcard-config input:not([type="file"]) {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  color: var(--text);
+  background: var(--panel-3, #14181580);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 13px;
+  line-height: 1.4;
+  outline: 0;
+  color-scheme: dark;
+}
+.customize-modal select,
+.audio-config select,
+.flashcard-config select {
+  height: auto;
+  min-height: 40px;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 34px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: right 17px center, right 12px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+.customize-modal textarea,
+.audio-config textarea {
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.5;
+}
+.customize-modal select:focus,
+.customize-modal textarea:focus,
+.customize-modal input:focus,
+.audio-config select:focus,
+.audio-config textarea:focus,
+.flashcard-config select:focus {
+  border-color: rgba(15, 208, 112, 0.72);
+  box-shadow: 0 0 0 3px rgba(15, 208, 112, 0.12);
+}
+
+/* Hide native file inputs inside dropzone labels — the styled label is the affordance */
+.upload-dropzone,
+.thumb-dropzone { position: relative; cursor: pointer; }
+.upload-dropzone input[type="file"],
+.thumb-dropzone input[type="file"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}

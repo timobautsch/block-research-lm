@@ -656,7 +656,7 @@ export default function App() {
   const [isBooting, setIsBooting] = useState(true);
   const [isAddingSource, setIsAddingSource] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
-  const [isCreatingArtifact, setIsCreatingArtifact] = useState<ArtifactType | "">("");
+  const [creatingTypes, setCreatingTypes] = useState<Set<ArtifactType>>(() => new Set());
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [sourceFormNotice, setSourceFormNotice] = useState("");
@@ -761,13 +761,14 @@ export default function App() {
       setNotebooks(list.notebooks);
       setNotebook(await loadNotebook(list.notebooks[0].id));
     } else {
-      const seeded = await api<{ notebook: Notebook }>("/api/seed", {
+      // Start with an empty notebook (NotebookLM-style) — no pre-seeded demo sources.
+      const created = await api<{ notebook: Notebook }>("/api/notebooks", {
         method: "POST",
-        body: JSON.stringify({ reset: false }),
+        body: JSON.stringify({ title: "Untitled notebook" }),
       });
-      setNotebooks([seeded.notebook]);
-      setNotebook(seeded.notebook);
-      setToast("Seed notebook created.");
+      const fresh = await loadNotebook(created.notebook.id);
+      setNotebooks([fresh]);
+      setNotebook(fresh);
     }
   }
 
@@ -942,6 +943,12 @@ export default function App() {
       sourceBodyRef.current?.focus();
       return;
     }
+    // Be flexible about URLs: accept "blockresearch.ai" without a scheme by
+    // defaulting to https:// (also covers youtu.be/... and www. links).
+    let originalUrl = sourceForm.original_url.trim();
+    if (sourceNeedsUrl(sourceForm.type) && originalUrl && !/^[a-z][a-z0-9+.-]*:\/\//i.test(originalUrl)) {
+      originalUrl = `https://${originalUrl.replace(/^\/+/, "")}`;
+    }
     setIsAddingSource(true);
     setError("");
     setSourceFormNotice("");
@@ -952,7 +959,7 @@ export default function App() {
           type: sourceForm.type,
           title: sourceForm.title.trim() || undefined,
           body: sourceForm.body.trim(),
-          original_url: sourceForm.original_url.trim(),
+          original_url: originalUrl,
           file_name: sourceForm.file_name,
           mime_type: sourceForm.mime_type,
           base64: sourceForm.base64,
@@ -968,7 +975,10 @@ export default function App() {
       setToast("Source added. Parsing and indexing into your notebook.");
       refreshDebugSilently();
     } catch (sourceError) {
-      setError(messageFromError(sourceError));
+      // Surface the failure inside the modal (the global banner sits behind it).
+      setSourceFormNotice(
+        messageFromError(sourceError) || "Could not add this source. Check the link or file and try again.",
+      );
     } finally {
       setIsAddingSource(false);
     }
@@ -1056,7 +1066,9 @@ export default function App() {
 
   async function createArtifact(type: ArtifactType) {
     if (!notebook) return;
-    setIsCreatingArtifact(type);
+    if (creatingTypes.has(type)) return;
+    setCreatingTypes((current) => new Set(current).add(type));
+    setToast(`Generating ${artifactTitle(type)}…`);
     setError("");
     try {
       const start = await api<{ job: ArtifactJob }>("/api/artifacts", {
@@ -1098,7 +1110,11 @@ export default function App() {
     } catch (artifactError) {
       setError(messageFromError(artifactError));
     } finally {
-      setIsCreatingArtifact("");
+      setCreatingTypes((current) => {
+        const next = new Set(current);
+        next.delete(type);
+        return next;
+      });
     }
   }
 
@@ -1199,7 +1215,7 @@ export default function App() {
   const activeCount = notebook?.active_source_count || 0;
   const activeProviderLabel = providerLabel(providerStatus);
   const runningDebugJobs = debugStatus?.debug.running_jobs.length || notebook?.jobs.filter((job) => ["queued", "running"].includes(job.status)).length || 0;
-  const isWorking = isBooting || isAddingSource || isAsking || Boolean(isCreatingArtifact) || runningDebugJobs > 0;
+  const isWorking = isBooting || isAddingSource || isAsking || creatingTypes.size > 0 || runningDebugJobs > 0;
 
   if (showLanding) {
     return (
@@ -1542,7 +1558,7 @@ export default function App() {
                 <select
                   value={audioOptions.format}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, format: event.target.value as AudioFormat }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {audioFormatOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1554,7 +1570,7 @@ export default function App() {
                 <select
                   value={audioOptions.length}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, length: event.target.value as AudioLength }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {audioLengthOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1568,7 +1584,7 @@ export default function App() {
                 <select
                   value={audioOptions.language}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, language: event.target.value }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {audioLanguageOptions.map((language) => (
                     <option key={language} value={language}>{language}</option>
@@ -1581,7 +1597,7 @@ export default function App() {
               <textarea
                 value={audioOptions.prompt}
                 onChange={(event) => setAudioOptions((current) => ({ ...current, prompt: event.target.value }))}
-                disabled={Boolean(isCreatingArtifact)}
+                disabled={creatingTypes.size > 0}
                 placeholder="Topic, audience, or angle"
                 rows={2}
               />
@@ -1615,7 +1631,7 @@ export default function App() {
                 <input
                   value={flashcardOptions.topic}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, topic: event.target.value }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                   placeholder="Focus"
                 />
               </label>
@@ -1624,7 +1640,7 @@ export default function App() {
                 <select
                   value={flashcardOptions.difficulty}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, difficulty: event.target.value as FlashcardDifficulty }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {flashcardDifficultyOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1639,7 +1655,7 @@ export default function App() {
                     const preset = flashcardCountOptions.find((option) => option.value === event.target.value) || flashcardCountOptions[1];
                     setFlashcardOptions((current) => ({ ...current, countPreset: preset.value, count: preset.count }));
                   }}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {flashcardCountOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1651,7 +1667,7 @@ export default function App() {
                 <select
                   value={flashcardOptions.language}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, language: event.target.value }))}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {audioLanguageOptions.map((language) => (
                     <option key={language} value={language}>{language}</option>
@@ -1664,7 +1680,7 @@ export default function App() {
               <input
                 value={flashcardOptions.audience}
                 onChange={(event) => setFlashcardOptions((current) => ({ ...current, audience: event.target.value }))}
-                disabled={Boolean(isCreatingArtifact)}
+                disabled={creatingTypes.size > 0}
                 placeholder="general"
               />
             </label>
@@ -1676,7 +1692,7 @@ export default function App() {
                     key={option.value}
                     type="button"
                     data-selected={selected}
-                    disabled={Boolean(isCreatingArtifact)}
+                    disabled={creatingTypes.size > 0}
                     onClick={() =>
                       setFlashcardOptions((current) => {
                         const next = selected
@@ -1707,7 +1723,7 @@ export default function App() {
                           : current.selectedSourceIds,
                     }));
                   }}
-                  disabled={Boolean(isCreatingArtifact)}
+                  disabled={creatingTypes.size > 0}
                 >
                   {sourceModeOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1723,7 +1739,7 @@ export default function App() {
                         key={source.id}
                         type="button"
                         data-selected={selected}
-                        disabled={Boolean(isCreatingArtifact)}
+                        disabled={creatingTypes.size > 0}
                         onClick={() =>
                           setFlashcardOptions((current) => ({
                             ...current,
@@ -1771,7 +1787,7 @@ export default function App() {
             <label className="upload-dropzone thumb-dropzone">
               <UploadCloud size={22} />
               <strong>{thumbnailRefs.length ? `${thumbnailRefs.length} reference image(s) attached` : "Add reference images (optional)"}</strong>
-              <p>Face, logo, product — gpt-image-1 blends them into the thumbnail.</p>
+              <p>Face, logo, product — gpt-image-2 blends them into the thumbnail.</p>
               <input type="file" accept="image/*" multiple onChange={(event) => void handleThumbnailRefs(event)} />
             </label>
             {thumbnailRefs.length ? (
@@ -1811,9 +1827,9 @@ export default function App() {
                     void createArtifact(artifact.type);
                   }
                 }}
-                disabled={Boolean(isCreatingArtifact)}
+                disabled={creatingTypes.has(artifact.type)}
               >
-                <span className="studio-icon">{isCreatingArtifact === artifact.type ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
+                <span className="studio-icon">{creatingTypes.has(artifact.type) ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
                 <span>
                   <strong>{artifact.title}</strong>
                 </span>
@@ -1988,8 +2004,8 @@ export default function App() {
                 </span>
                 <button className="secondary-button" type="button" onClick={() => setIsAddSourceOpen(false)}>Cancel</button>
                 <button className="primary-button" type="submit" disabled={isAddingSource}>
-                  {isAddingSource ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-                  Add source
+                  {isAddingSource ? <Loader2 className="spin" size={16} /> : <ArrowRight size={16} />}
+                  {isAddingSource ? "Adding…" : "Add & analyze"}
                 </button>
               </div>
             </form>
