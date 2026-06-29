@@ -1346,22 +1346,43 @@ export async function createSourceStudioEngine(options = {}) {
 
   async function parseSource(source, payload, context = {}) {
     if (source.type === "youtube") {
-      const rawText = payload.body?.trim()
+      const videoId = youtubeVideoId(source.original_url);
+      let rawText = payload.body?.trim()
         ? payload.body
         : await fetchYouTubeTranscript(source.original_url, fetchImpl);
+      let parser = payload.body?.trim() ? "youtube-user-transcript" : "youtube-transcript-fetcher";
+      // No captions available? Transcribe the audio track with Deepgram so the
+      // video is still fully transcribed instead of left as a short placeholder.
+      if (
+        !payload.body?.trim() &&
+        /no public or auto-generated captions|did not include a youtube video id|transcript was not available|no captions/i.test(rawText) &&
+        realProviderKey(env.DEEPGRAM_API_KEY)
+      ) {
+        logger.info("youtube.audio_transcribe.start", { request_id: context.requestId, video_id: videoId });
+        const audioText = await fetchYouTubeAudioTranscript(videoId, {
+          apiKey: realProviderKey(env.DEEPGRAM_API_KEY),
+          model: env.DEEPGRAM_MODEL || "nova-3",
+          fetchImpl,
+        });
+        if (audioText && audioText.split(/\s+/).length > 30) {
+          rawText = `# YouTube transcript (audio)\n\n${audioText}`;
+          parser = "youtube-deepgram-asr";
+          logger.info("youtube.audio_transcribe.complete", { request_id: context.requestId, video_id: videoId, words: audioText.split(/\s+/).length });
+        }
+      }
       // Use the real video title when the user didn't name the source (avoids "youtube.com").
       if (!payload.title?.trim() && !payload.body?.trim()) {
-        const ytTitle = await fetchYouTubeTitle(youtubeVideoId(source.original_url));
+        const ytTitle = await fetchYouTubeTitle(videoId);
         if (ytTitle) source.title = ytTitle;
       }
       return parseMarkdownLikeDocument(source, {
         rawText,
         cleanedText: normalizeWhitespace(rawText),
-        parser: payload.body?.trim() ? "youtube-user-transcript" : "youtube-transcript-fetcher",
-        fallback: !payload.body?.trim() && /transcript was not available/i.test(rawText),
+        parser,
+        fallback: !payload.body?.trim() && /transcript was not available|no public or auto-generated captions/i.test(rawText),
         metadata: {
           original_url: source.original_url,
-          video_id: youtubeVideoId(source.original_url),
+          video_id: videoId,
         },
       });
     }
@@ -3962,6 +3983,38 @@ async function fetchYouTubeTitle(videoId) {
     return String(stdout || "").split("\n")[0].trim().slice(0, 200);
   } catch {
     return "";
+  }
+}
+
+// When a video has no captions, download its audio track (yt-dlp) and transcribe
+// it with Deepgram, so a YouTube source is still fully transcribed rather than a
+// placeholder. ffmpeg (inside transcribeAudioWithDeepgram) normalizes the audio.
+async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch } = {}) {
+  if (!videoId || !apiKey || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
+  const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
+  let dir;
+  try {
+    dir = await mkdtemp(join(tmpdir(), "yt-audio-"));
+    await execFile(
+      ytDlpPath,
+      [
+        "-f", "bestaudio/best",
+        "-x", "--audio-format", "mp3", "--audio-quality", "5",
+        "--no-warnings", "--no-playlist",
+        "-o", join(dir, "audio.%(ext)s"),
+        `https://www.youtube.com/watch?v=${videoId}`,
+      ],
+      { timeout: 300_000, maxBuffer: 1024 * 1024 * 64 },
+    );
+    const files = await readdir(dir);
+    const audioFile = files.find((name) => /\.mp3$/i.test(name)) || files[0];
+    if (!audioFile) return "";
+    const buffer = await readFile(join(dir, audioFile));
+    return (await transcribeAudioWithDeepgram(buffer, { apiKey, model, fetchImpl })) || "";
+  } catch {
+    return "";
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

@@ -328,6 +328,29 @@ h1.title{
 .mt-a{margin-top:auto}
 .spread{justify-content:space-between}
 
+/* ============ BUILD JOURNEY (git timeline) ============ */
+.journey{display:flex; gap:clamp(12px,1.6vw,26px); width:100%; align-items:flex-start; justify-content:center}
+.daycol{flex:1; min-width:0; max-width:340px; display:flex; flex-direction:column; gap:12px}
+.dayhd{position:relative; padding:12px 15px; border-radius:14px; border:1px solid color-mix(in srgb,var(--ac) 42%,transparent); background:linear-gradient(160deg,color-mix(in srgb,var(--ac) 15%,transparent),transparent)}
+.dayhd .dn{font-size:clamp(16px,2.1vh,21px); font-weight:900; color:var(--ink); letter-spacing:-.01em; display:flex; align-items:baseline; gap:9px}
+.dayhd .dn .dd{font-size:13px; font-weight:700; color:var(--ac); font-family:'JetBrains Mono',monospace; letter-spacing:0}
+.dayhd .dc{font-size:12.5px; color:var(--ink-dim); margin-top:2px; font-weight:600}
+.dayhd .dbar{margin-top:9px; height:6px; border-radius:3px; background:rgba(255,255,255,.08); overflow:hidden}
+.dayhd .dbar i{display:block; height:100%; border-radius:3px; background:var(--ac); box-shadow:0 0 10px var(--ac)}
+.cmts{display:flex; flex-direction:column; gap:8px; position:relative; padding-left:4px}
+.cmt{position:relative; padding:9px 12px 9px 24px; border-radius:11px; border:1px solid var(--line); background:var(--glass)}
+.cmt::before{content:""; position:absolute; left:6px; top:14px; width:11px;height:11px;border-radius:50%; background:var(--ac); box-shadow:0 0 10px var(--ac); border:2px solid var(--bg1); z-index:2}
+.cmt::after{content:""; position:absolute; left:11px; top:24px; bottom:-9px; width:2px; background:linear-gradient(180deg,color-mix(in srgb,var(--ac) 55%,transparent),color-mix(in srgb,var(--ac) 20%,transparent))}
+.cmt:last-child::after{display:none}
+.cmt.big{border-color:color-mix(in srgb,var(--ac) 55%,transparent); background:linear-gradient(150deg,color-mix(in srgb,var(--ac) 13%,transparent),var(--glass))}
+.cmt.big::before{width:14px;height:14px;left:5px;top:13px}
+.cmt-top{display:flex; align-items:center; gap:8px; margin-bottom:3px}
+.cmt-t{font-size:11.5px; font-family:'JetBrains Mono',monospace; color:var(--ink-dim); font-weight:600}
+.cmt-h{font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--ac); margin-left:auto}
+.cmt-s{font-size:13.5px; font-weight:600; color:var(--ink); line-height:1.32; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden}
+.cmt-l{display:flex; gap:10px; margin-top:5px; font-size:11px; font-family:'JetBrains Mono',monospace; font-weight:600}
+.cmt-l .ins{color:var(--green)} .cmt-l .del{color:var(--rose)}
+
 @media (prefers-reduced-motion: reduce){
   *{animation:none !important}
   [data-anim]{opacity:1 !important; transform:none !important}
@@ -724,7 +747,20 @@ h1.title{
     <div class="speaker">Deployment: the whole thing ships as a <b>Node 24 container on Google Cloud Run</b>, fronted by <b>Firebase Hosting</b> at the edge. One gotcha — Firebase strips cookies that aren't named <b>__session</b>, so our auth uses exactly that. ffmpeg and yt-dlp are baked into the image. And thanks to those local fallbacks, the same codebase runs end-to-end <b>even with zero API keys</b> — just local models instead of the cloud providers.</div>
   </section>
 
-  <!-- ============ 14 · CLOSING ============ -->
+  <!-- ============ 14 · BUILD JOURNEY (git timeline, auto-generated) ============ -->
+  <section class="slide">
+    <div class="head">
+      <div class="kicker" data-anim style="--i:0">The build journey · behind the scenes</div>
+      <h2 class="headline" data-anim style="--i:1">How we built it — <span class="grad">commit by commit</span></h2>
+      <div class="bullets" id="journeyStat" data-anim style="--i:2"></div>
+    </div>
+    <div class="body" style="margin-top:16px">
+      <div class="journey" id="journey"></div>
+    </div>
+    <div class="speaker">Quick behind-the-scenes — this is the <b>actual git history</b> of the build, every commit grouped by day. <b>Day one</b> was the foundation: the initial Notebook-style workspace, CI, and our brand identity. <b>Day two</b> was the big one — we hardened the entire research pipeline in a single commit that touched 46 files. <b>Day three</b> is where it went multimodal and shipped: real RAG, vision, image generation, the rebrand to Block Research LM, the Cloud Run + Firebase deploy, and a run of UX and ingest fixes. You can literally watch how we iterated our way to the result.</div>
+  </section>
+
+  <!-- ============ 15 · CLOSING ============ -->
   <section class="slide center">
     <svg class="netbg" viewBox="0 0 1200 675" preserveAspectRatio="xMidYMid slice" fill="none" style="opacity:.4">
       <ellipse cx="600" cy="337" rx="420" ry="200" stroke="rgba(120,140,255,.25)"/>
@@ -758,6 +794,52 @@ h1.title{
   <div class="hud"><span class="dots" id="dots"></span><span class="count"><span class="mono" id="cur">1</span> / <span id="tot">14</span></span></div>
   <div id="notesbar"></div>
 </div>
+
+<script>
+/* COMMITS_START — auto-generated by scripts/gen-commit-timeline.mjs; do not edit by hand */
+const COMMITS = [{"h":"85ad3c8","day":"2026-06-26","time":"19:52","s":"Initial NotebookLM-style research workspace","ins":9267,"del":0},{"h":"f3240ad","day":"2026-06-26","time":"19:53","s":"Use Node 24 GitHub Actions","ins":2,"del":4},{"h":"8e5a99e","day":"2026-06-26","time":"21:19","s":"Apply blockresearch visual identity","ins":851,"del":83},{"h":"4681209","day":"2026-06-26","time":"21:27","s":"Polish blockresearch research workspace UI","ins":590,"del":17},{"h":"b7fe1c7","day":"2026-06-28","time":"17:03","s":"Harden sourcestudio research pipeline","ins":16066,"del":4809},{"h":"a319c99","day":"2026-06-28","time":"17:04","s":"Wire answer mode controls","ins":29,"del":2},{"h":"4ed8010","day":"2026-06-29","time":"15:04","s":"Multimodal NotebookLM: real RAG, creator kit, vision, Cloud Run deploy","ins":3261,"del":252},{"h":"6917292","day":"2026-06-29","time":"15:09","s":"Add image source type, gpt-5.5 vision, gpt-image-2, Firebase Hosting + multimodal test kit","ins":48,"del":0},{"h":"a67e285","day":"2026-06-29","time":"16:33","s":"Fix Firebase auth cookie, rebrand to Block Research LM, NotebookLM add-source arrow","ins":116,"del":32},{"h":"1c1cd61","day":"2026-06-29","time":"17:06","s":"Move to dedicated project, portal menu fix, __session cookie, NotebookLM arrow","ins":909,"del":10},{"h":"0be71cf","day":"2026-06-29","time":"18:43","s":"Add-source modal: single reliable CTA + spacing; cold-start hardening","ins":93,"del":103},{"h":"519e33f","day":"2026-06-29","time":"18:53","s":"Fix website ingest 500: single-page by default + crawl cap + 500 logging","ins":7,"del":2},{"h":"efeb2b8","day":"2026-06-29","time":"19:36","s":"Async artifact generation + real YouTube titles","ins":51,"del":5},{"h":"aabd13c","day":"2026-06-29","time":"21:50","s":"Fix Studio global-lock, modal theming, thumbnail refs, flexible URLs","ins":137,"del":29}];
+/* COMMITS_END */
+(function(){
+  const host = document.getElementById('journey');
+  if(!host || typeof COMMITS === 'undefined' || !COMMITS.length) return;
+  const PHCOL = ['var(--indigo)','var(--violet)','var(--cyan)','var(--teal)','var(--amber)','var(--supa)','var(--claude)','var(--eleven)','var(--rose)','var(--openai)'];
+  const days = [], map = new Map();
+  COMMITS.forEach(c => { if(!map.has(c.day)){ const o={day:c.day, items:[]}; map.set(c.day,o); days.push(o); } map.get(c.day).items.push(c); });
+  const totalIns = COMMITS.reduce((a,c)=>a+(c.ins||0),0);
+  const totalDel = COMMITS.reduce((a,c)=>a+(c.del||0),0);
+  const bigThreshold = Math.max(2000, ...COMMITS.map(c=>(c.ins||0)+(c.del||0))) * 0.6;
+  const maxDayLines = Math.max(1, ...days.map(d=>d.items.reduce((a,c)=>a+(c.ins||0)+(c.del||0),0)));
+  const fmt = n => n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+'k' : String(n);
+  const esc = s => String(s).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+  const fmtDate = d => { const p=d.split('-'); return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][(+p[1])-1]+' '+(+p[2]); };
+
+  const stat = document.getElementById('journeyStat');
+  if(stat) stat.innerHTML =
+    `<span class="b"><span class="dot"></span>${COMMITS.length} commits</span>`+
+    `<span class="b"><span class="dot"></span>${days.length} day${days.length>1?'s':''}</span>`+
+    `<span class="b"><span class="dot"></span>+${fmt(totalIns)} / −${fmt(totalDel)} lines</span>`;
+
+  host.innerHTML = days.map((d,di) => {
+    const col = PHCOL[di % PHCOL.length];
+    const dayLines = d.items.reduce((a,c)=>a+(c.ins||0)+(c.del||0),0);
+    const w = Math.round(dayLines / maxDayLines * 100);
+    const cards = d.items.map(c => {
+      const big = ((c.ins||0)+(c.del||0)) >= bigThreshold;
+      return `<div class="cmt${big?' big':''}">
+        <div class="cmt-top"><span class="cmt-t">${esc(c.time||'')}</span><span class="cmt-h">${esc(c.h)}</span></div>
+        <div class="cmt-s">${esc(c.s)}</div>
+        <div class="cmt-l"><span class="ins">+${fmt(c.ins||0)}</span><span class="del">−${fmt(c.del||0)}</span></div>
+      </div>`;
+    }).join('');
+    return `<div class="daycol" data-anim style="--i:${di+3}; --ac:${col}">
+      <div class="dayhd"><div class="dn">Day ${di+1}<span class="dd">${fmtDate(d.day)}</span></div>
+        <div class="dc">${d.items.length} commit${d.items.length>1?'s':''} · ${fmt(dayLines)} lines</div>
+        <div class="dbar"><i style="width:${w}%"></i></div></div>
+      <div class="cmts">${cards}</div>
+    </div>`;
+  }).join('');
+})();
+</script>
 
 <script>
 (function(){
