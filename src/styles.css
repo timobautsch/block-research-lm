@@ -2563,6 +2563,66 @@ select:focus-visible {
   width: min(1040px, calc(100vw - 32px));
 }
 
+.settings-modal {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.settings-panel {
+  display: grid;
+  gap: 18px;
+  padding: 16px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-section-label {
+  margin: 0;
+  color: #8a968f;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.settings-account {
+  display: grid;
+  gap: 3px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.settings-account strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.settings-account span {
+  color: #9aa6a0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.settings-form {
+  gap: 12px;
+  padding: 0;
+}
+
+.settings-form-error {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 105, 105, 0.4);
+  border-radius: var(--radius);
+  background: rgba(255, 105, 105, 0.1);
+  color: #ff9b9b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .artifact-modal .artifact-preview {
   max-height: min(720px, calc(100vh - 130px));
   margin: 0;
@@ -6262,3 +6322,43 @@ textarea::placeholder {
   background: rgba(15, 208, 112, 0.22);
   transform: scale(1.06);
 }
+
+/* Notebook overview (initial "I understood your sources" message) + thinking line */
+.canvas-overview {
+  width: 100%;
+  max-width: 760px;
+  display: grid;
+  gap: 10px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(15, 208, 112, 0.06), rgba(255, 255, 255, 0.02));
+  text-align: left;
+}
+.canvas-overview-top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.canvas-overview-top .avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: rgba(15, 208, 112, 0.14);
+  color: var(--green);
+}
+.canvas-overview-top strong { font-size: 14px; }
+.canvas-overview-meta { margin-left: auto; font-size: 12px; color: var(--muted); }
+.canvas-overview-text { font-size: 14px; line-height: 1.6; color: var(--text); }
+.canvas-suggestions-label {
+  display: block;
+  width: 100%;
+  margin-bottom: 2px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.thinking-line { color: var(--muted); transition: opacity 0.2s ease; }

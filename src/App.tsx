@@ -648,6 +648,7 @@ export default function App() {
   const [playingArtifactId, setPlayingArtifactId] = useState("");
   const inlineAudioRef = useRef<HTMLAudioElement>(null);
   const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
   const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail">("");
   const [thumbnailPrompt, setThumbnailPrompt] = useState("");
@@ -1411,11 +1412,10 @@ export default function App() {
                   <span>{authUser.email}</span>
                 </div>
                 <div className="menu-divider" />
-                <div className="menu-status">
-                  <span><ShieldCheck size={13} /> Source-only mode</span>
-                  <span><Database size={13} /> {activeProviderLabel}</span>
-                </div>
-                <div className="menu-divider" />
+                <button type="button" className="menu-item" onClick={() => { setOpenMenu(""); setIsSettingsOpen(true); }}>
+                  <Settings size={15} />
+                  <span>Settings</span>
+                </button>
                 <button type="button" className="menu-item" onClick={() => { setOpenMenu(""); void handleLogout(); }}>
                   <LogOut size={15} />
                   <span>Sign out</span>
@@ -1545,6 +1545,7 @@ export default function App() {
             {!notebook?.messages.length ? (
               <ResearchCanvas
                 activeCount={activeCount}
+                summary={notebook?.summary || ""}
                 suggestions={notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions}
                 onAsk={(prompt) => void askQuestion(prompt)}
               />
@@ -1553,7 +1554,7 @@ export default function App() {
                 <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
               ))
             )}
-            {isAsking ? <ThinkingBubble /> : null}
+            {isAsking ? <ThinkingBubble topic={notebook?.title || ""} /> : null}
           </div>
 
           <form className="chat-input" onSubmit={(event) => {
@@ -2121,6 +2122,23 @@ export default function App() {
         </div>
       ) : null}
 
+      {isSettingsOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsSettingsOpen(false)}>
+          <section className="modal settings-modal" role="dialog" aria-modal="true" aria-label="Account settings" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Account</p>
+                <h2>Settings</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsSettingsOpen(false)} aria-label="Close settings">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <SettingsPanel authUser={authUser} onToast={setToast} />
+          </section>
+        </div>
+      ) : null}
+
       {isDebugOpen ? (
         <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsDebugOpen(false)}>
           <section className="modal debug-modal" role="dialog" aria-modal="true" aria-label="Debug activity" onClick={(event) => event.stopPropagation()}>
@@ -2143,6 +2161,103 @@ export default function App() {
           </section>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function SettingsPanel({ authUser, onToast }: { authUser: AuthUser | null; onToast: (message: string) => void }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [formError, setFormError] = useState("");
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFormError("");
+    if (newPassword.length < 8) {
+      setFormError("New password must be at least 8 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setFormError("New password and confirmation do not match.");
+      return;
+    }
+    if (newPassword === currentPassword) {
+      setFormError("New password must be different from the current password.");
+      return;
+    }
+    setIsSaving(true);
+    try {
+      await api<{ ok: boolean }>("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+      });
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      onToast("Password updated.");
+    } catch (error) {
+      setFormError(messageFromError(error));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <div className="settings-panel">
+      <section className="settings-section">
+        <p className="settings-section-label">Signed in as</p>
+        <div className="settings-account">
+          <strong>{authUser?.name || "Your account"}</strong>
+          <span>{authUser?.email || ""}</span>
+        </div>
+      </section>
+
+      <form className="modal-form settings-form" onSubmit={handleSubmit}>
+        <p className="settings-section-label">Change password</p>
+        <label>
+          Current password
+          <input
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={(event) => setCurrentPassword(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          New password
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+            minLength={8}
+            required
+          />
+        </label>
+        <label>
+          Confirm new password
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            minLength={8}
+            required
+          />
+        </label>
+        {formError ? <p className="settings-form-error">{formError}</p> : null}
+        <button
+          type="submit"
+          className="primary-button"
+          disabled={isSaving || !currentPassword || !newPassword || !confirmPassword}
+        >
+          {isSaving ? <Loader2 className="spin" size={15} /> : null}
+          {isSaving ? "Updating…" : "Update password"}
+        </button>
+      </form>
     </div>
   );
 }
@@ -2711,26 +2826,43 @@ function SourceDetail({
 
 function ResearchCanvas({
   activeCount,
+  summary,
   suggestions,
   onAsk,
 }: {
   activeCount: number;
+  summary: string;
   suggestions: string[];
   onAsk: (prompt: string) => void;
 }) {
+  const hasOverview = Boolean(activeCount && summary.trim());
   return (
-    <section className="research-canvas" aria-label="Start a conversation">
-      <span className="canvas-mark">
-        <Sparkles size={22} />
-      </span>
-      <h3>{activeCount ? "Ask anything about your sources" : "Add a source to get started"}</h3>
-      <p>
-        {activeCount
-          ? `${ASSISTANT_NAME} answers only from your ${activeCount} active source${activeCount === 1 ? "" : "s"} — with a citation for every claim.`
-          : "Upload a document, paste text, add a note, or link a website. Every answer stays grounded in what you add."}
-      </p>
+    <section className="research-canvas" aria-label="Notebook overview">
+      {hasOverview ? (
+        <article className="canvas-overview">
+          <div className="canvas-overview-top">
+            <span className="avatar"><Bot size={17} /></span>
+            <strong>{ASSISTANT_NAME}</strong>
+            <span className="canvas-overview-meta">{activeCount} source{activeCount === 1 ? "" : "s"} loaded</span>
+          </div>
+          <p className="canvas-overview-text">{summary}</p>
+        </article>
+      ) : (
+        <>
+          <span className="canvas-mark">
+            <Sparkles size={22} />
+          </span>
+          <h3>{activeCount ? "Ask anything about your sources" : "Add a source to get started"}</h3>
+          <p>
+            {activeCount
+              ? `${ASSISTANT_NAME} answers only from your ${activeCount} active source${activeCount === 1 ? "" : "s"} — with a citation for every claim.`
+              : "Upload a document, paste text, add a note, or link a website. Every answer stays grounded in what you add."}
+          </p>
+        </>
+      )}
       {activeCount && suggestions.length ? (
         <div className="canvas-suggestions">
+          {hasOverview ? <span className="canvas-suggestions-label">Try asking</span> : null}
           {suggestions.slice(0, 4).map((prompt) => (
             <button key={prompt} type="button" onClick={() => onAsk(prompt)}>
               <MessageSquareText size={15} />
@@ -2854,7 +2986,25 @@ function renderMessageContent(
   return blocks;
 }
 
-function ThinkingBubble() {
+function ThinkingBubble({ topic = "" }: { topic?: string }) {
+  const phrases = useMemo(() => {
+    const t = topic.trim().replace(/\s+/g, " ").split(" ").slice(0, 5).join(" ");
+    return [
+      "Skimming your sources for the good parts…",
+      t ? `Connecting the dots on ${t}…` : "Connecting the dots…",
+      "Pulling the exact quotes that back this up…",
+      "Cross-checking every claim against the sources…",
+      t ? `Thinking it through on ${t}…` : "Thinking it through…",
+      "Lining up the citations…",
+      "Making sure I only say what's actually in there…",
+    ];
+  }, [topic]);
+  const [index, setIndex] = useState(0);
+  useEffect(() => {
+    setIndex(0);
+    const id = setInterval(() => setIndex((current) => (current + 1) % phrases.length), 1900);
+    return () => clearInterval(id);
+  }, [phrases]);
   return (
     <article className="chat-bubble">
       <span className="avatar">
@@ -2863,9 +3013,9 @@ function ThinkingBubble() {
       <div className="bubble-body">
         <div className="bubble-topline">
           <strong>{ASSISTANT_NAME}</strong>
-          <span>Retrieving evidence</span>
+          <span>Thinking</span>
         </div>
-        <p>Building Evidence Pack, verifying citations, and preparing source-only answer...</p>
+        <p className="thinking-line">{phrases[index]}</p>
       </div>
     </article>
   );
