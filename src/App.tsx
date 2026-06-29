@@ -957,6 +957,8 @@ export default function App() {
           mime_type: sourceForm.mime_type,
           base64: sourceForm.base64,
           active: true,
+          // Ingest the single linked page (NotebookLM-style), not a full-site crawl.
+          crawl: false,
         }),
       });
       setActiveSourceId(response.source.id);

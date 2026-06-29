@@ -31,7 +31,7 @@ const FLASHCARD_COUNT_PRESETS = {
 };
 const FLASHCARD_DIFFICULTIES = new Set(["easy", "medium", "hard", "mixed"]);
 const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "source-check", "compare"];
-const DEFAULT_CRAWL_MAX_PAGES = 80;
+const DEFAULT_CRAWL_MAX_PAGES = 12;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
 const PRODUCT_NAME = "Block Research LM";
 const execFile = promisify(execFileCallback);
@@ -1502,7 +1502,7 @@ export async function createSourceStudioEngine(options = {}) {
 
   async function crawlWebsiteSource(startUrl, options = {}) {
     const maxPages = Math.min(
-      200,
+      40,
       Math.max(1, Number(options.maxPages || env.SOURCESTUDIO_CRAWL_MAX_PAGES || DEFAULT_CRAWL_MAX_PAGES)),
     );
     const start = normalizeCrawlUrl(startUrl, startUrl);

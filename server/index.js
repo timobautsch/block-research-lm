@@ -234,6 +234,9 @@ app.use((error, req, res, next) => {
     path: req.path,
     status: safeStatus,
     error: safeStatus === 500 ? "SourceStudio request failed." : error.message,
+    // Always record the real cause server-side (never sent to the client) so 500s are diagnosable.
+    detail: String(error?.message || error).slice(0, 300),
+    stack: String(error?.stack || "").split("\n").slice(1, 4).join(" | "),
   });
   res.status(safeStatus).json({
     error: safeStatus === 500 ? "SourceStudio request failed." : error.message,
