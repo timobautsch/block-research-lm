@@ -34,6 +34,7 @@ import {
   PanelLeft,
   PlayCircle,
   PauseCircle,
+  Pencil,
   Plus,
   Presentation,
   RefreshCw,
@@ -655,6 +656,9 @@ export default function App() {
   const [thumbnailRefs, setThumbnailRefs] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [openMenu, setOpenMenu] = useState<"" | "settings" | "account" | "notebooks">("");
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const renameEscapeRef = useRef(false);
   const [isDebugOpen, setIsDebugOpen] = useState(false);
   const [debugStatus, setDebugStatus] = useState<DebugStatusResponse | null>(null);
   const [isBooting, setIsBooting] = useState(true);
@@ -665,6 +669,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [sourceFormNotice, setSourceFormNotice] = useState("");
   const didBootRef = useRef(false);
+  const overviewFiredRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const sourceBodyRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -699,6 +704,24 @@ export default function App() {
     // boot intentionally runs once to initialize persisted notebook state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // NotebookLM-style opening: the first time a notebook has indexed sources but no
+  // chat yet, auto-generate a grounded overview so the assistant shows it understood
+  // what was loaded. Fires once per notebook; the synthetic prompt is hidden in the UI.
+  useEffect(() => {
+    const id = notebook?.id;
+    if (!id || isBooting || isAsking) return;
+    if ((notebook?.messages.length || 0) > 0) {
+      overviewFiredRef.current.add(id);
+      return;
+    }
+    const hasIndexed = (notebook?.sources || []).some((source) => source.active && source.status === "indexed");
+    if (hasIndexed && !overviewFiredRef.current.has(id)) {
+      overviewFiredRef.current.add(id);
+      void askQuestion(OVERVIEW_PROMPT);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notebook?.id, notebook?.messages.length, notebook?.sources, isBooting]);
 
   useEffect(() => {
     if (notebook?.sources.length && !activeSourceId) {
@@ -783,6 +806,26 @@ export default function App() {
     } catch {
       // notebook list is non-critical chrome; ignore refresh failures.
     }
+  }
+
+  function exitRename(save: boolean) {
+    const next = titleDraft.trim();
+    setIsRenaming(false);
+    if (!save || !notebook || !next || next === notebook.title) return;
+    void (async () => {
+      setError("");
+      try {
+        const response = await api<{ notebook: Notebook }>(`/api/notebooks/${notebook.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ title: next }),
+        });
+        setNotebook((current) => (current?.id === response.notebook.id ? response.notebook : current));
+        await refreshNotebookList();
+        setToast("Notebook renamed.");
+      } catch (renameError) {
+        setError(messageFromError(renameError));
+      }
+    })();
   }
 
   async function createNotebook() {
@@ -920,6 +963,19 @@ export default function App() {
       if (!source || source.status === "indexed" || source.status === "failed") {
         if (source?.status === "failed") {
           setError("That source could not be indexed. Try again, or paste the text/transcript directly.");
+        }
+        if (source?.status === "indexed") {
+          // The server auto-names the notebook just after indexing finishes; poll a few
+          // more times so the AI-suggested title appears without a manual refresh.
+          for (let attempt = 0; attempt < 5 && isDefaultNotebookTitle(fresh.title); attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            try {
+              fresh = await loadNotebook(notebookId);
+            } catch {
+              break;
+            }
+            setNotebook((current) => (current?.id === notebookId ? fresh : current));
+          }
         }
         refreshDebugSilently();
         break;
@@ -1306,10 +1362,48 @@ export default function App() {
             <img src={BRAND_LOGO_PATH} alt="" />
           </button>
           <div className="notebook-title-cluster">
-            <h1 className="notebook-title" title={notebook?.title || "Untitled notebook"}>
-              {notebook?.title || "Untitled notebook"}
-            </h1>
-            {notebooks.length > 1 ? (
+            {isRenaming ? (
+              <input
+                className="notebook-title-input"
+                value={titleDraft}
+                autoFocus
+                maxLength={160}
+                aria-label="Notebook title"
+                onChange={(event) => setTitleDraft(event.target.value)}
+                onBlur={() => {
+                  const save = !renameEscapeRef.current;
+                  renameEscapeRef.current = false;
+                  exitRename(save);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    renameEscapeRef.current = true;
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+            ) : (
+              <>
+                <h1 className="notebook-title" title={notebook?.title || "Untitled notebook"}>
+                  {notebook?.title || "Untitled notebook"}
+                </h1>
+                <button
+                  className="title-switch"
+                  type="button"
+                  onClick={() => { setTitleDraft(notebook?.title || ""); setIsRenaming(true); }}
+                  aria-label="Rename notebook"
+                  title="Rename notebook"
+                  disabled={!notebook}
+                >
+                  <Pencil size={14} />
+                </button>
+              </>
+            )}
+            {!isRenaming && notebooks.length > 1 ? (
               <div className="menu-anchor">
                 <button
                   className="title-switch"
@@ -1542,7 +1636,7 @@ export default function App() {
           </div>
 
           <div className="messages" ref={messagesRef} role="log" aria-live="polite">
-            {!notebook?.messages.length ? (
+            {!notebook?.messages.length && !isAsking ? (
               <ResearchCanvas
                 activeCount={activeCount}
                 summary={notebook?.summary || ""}
@@ -1550,9 +1644,11 @@ export default function App() {
                 onAsk={(prompt) => void askQuestion(prompt)}
               />
             ) : (
-              notebook.messages.map((message) => (
-                <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
-              ))
+              (notebook?.messages ?? [])
+                .filter((message) => !(message.role === "user" && message.content.trim() === OVERVIEW_PROMPT))
+                .map((message) => (
+                  <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
+                ))
             )}
             {isAsking ? <ThinkingBubble topic={notebook?.title || ""} /> : null}
           </div>
@@ -4309,6 +4405,11 @@ const defaultQuestions = [
   "Create an executive brief from all active sources.",
 ];
 
+// Synthetic prompt used to auto-generate the opening overview. Hidden in the UI so
+// only the assistant's overview shows (NotebookLM-style).
+const OVERVIEW_PROMPT =
+  "Give me a quick, friendly overview of what these sources cover — and a couple of things worth digging into.";
+
 function sourceIcon(type: SourceType) {
   if (type === "url") return <Globe size={16} />;
   if (type === "youtube") return <Video size={16} />;
@@ -4508,6 +4609,11 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
 
 function messageFromError(error: unknown) {
   return error instanceof Error ? error.message : "Request failed.";
+}
+
+function isDefaultNotebookTitle(title?: string) {
+  const value = (title || "").trim();
+  return value === "" || value === "Untitled notebook" || value === "SourceStudio Demo Notebook";
 }
 
 async function fileToBase64(file: File) {

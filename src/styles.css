@@ -5529,6 +5529,28 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
+.notebook-title-input {
+  min-width: 0;
+  max-width: 420px;
+  width: min(60vw, 420px);
+  margin: 0;
+  padding: 2px 8px;
+  border: 1px solid rgba(15, 208, 112, 0.5);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-family: "EB Garamond", Georgia, serif;
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.notebook-title-input:focus {
+  outline: none;
+  border-color: var(--green);
+  background: rgba(15, 208, 112, 0.06);
+}
+
 .title-switch {
   display: grid;
   place-items: center;
@@ -5539,6 +5561,11 @@ textarea::placeholder {
   background: transparent;
   color: var(--muted);
   flex: 0 0 auto;
+}
+
+.title-switch:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .title-switch:hover {
