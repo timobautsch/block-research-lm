@@ -1129,8 +1129,10 @@ export default function App() {
         throw new Error(job?.error || "Generation timed out. Please try again.");
       }
       await refreshNotebook();
-      setSelectedArtifactId(job.result_artifact_id);
-      setToast(`${artifactTitle(type)} generated from an Evidence Pack.`);
+      // Don't hijack the view: only auto-open the result if nothing else is open,
+      // so concurrent generations finishing don't yank you between results.
+      setSelectedArtifactId((current) => current || job.result_artifact_id);
+      setToast(`${artifactTitle(type)} ready.`);
       refreshDebugSilently();
     } catch (artifactError) {
       setError(messageFromError(artifactError));
@@ -1407,7 +1409,7 @@ export default function App() {
       {error ? (
         <div className="toast error">
           <XCircle size={16} />
-          {error}
+          <span className="toast-text">{error}</span>
           <button type="button" onClick={() => setError("")} aria-label="Dismiss error">
             <XCircle size={14} />
           </button>
@@ -1417,7 +1419,7 @@ export default function App() {
       {toast ? (
         <div className="toast">
           <CheckCircle2 size={16} />
-          {toast}
+          <span className="toast-text">{toast}</span>
           <button type="button" onClick={() => setToast("")} aria-label="Dismiss notification">
             <XCircle size={14} />
           </button>
@@ -1583,7 +1585,7 @@ export default function App() {
                 <select
                   value={audioOptions.format}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, format: event.target.value as AudioFormat }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {audioFormatOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1595,7 +1597,7 @@ export default function App() {
                 <select
                   value={audioOptions.length}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, length: event.target.value as AudioLength }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {audioLengthOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1609,7 +1611,7 @@ export default function App() {
                 <select
                   value={audioOptions.language}
                   onChange={(event) => setAudioOptions((current) => ({ ...current, language: event.target.value }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {audioLanguageOptions.map((language) => (
                     <option key={language} value={language}>{language}</option>
@@ -1622,7 +1624,7 @@ export default function App() {
               <textarea
                 value={audioOptions.prompt}
                 onChange={(event) => setAudioOptions((current) => ({ ...current, prompt: event.target.value }))}
-                disabled={creatingTypes.size > 0}
+                disabled={false}
                 placeholder="Topic, audience, or angle"
                 rows={2}
               />
@@ -1656,7 +1658,7 @@ export default function App() {
                 <input
                   value={flashcardOptions.topic}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, topic: event.target.value }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                   placeholder="Focus"
                 />
               </label>
@@ -1665,7 +1667,7 @@ export default function App() {
                 <select
                   value={flashcardOptions.difficulty}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, difficulty: event.target.value as FlashcardDifficulty }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {flashcardDifficultyOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1680,7 +1682,7 @@ export default function App() {
                     const preset = flashcardCountOptions.find((option) => option.value === event.target.value) || flashcardCountOptions[1];
                     setFlashcardOptions((current) => ({ ...current, countPreset: preset.value, count: preset.count }));
                   }}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {flashcardCountOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1692,7 +1694,7 @@ export default function App() {
                 <select
                   value={flashcardOptions.language}
                   onChange={(event) => setFlashcardOptions((current) => ({ ...current, language: event.target.value }))}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {audioLanguageOptions.map((language) => (
                     <option key={language} value={language}>{language}</option>
@@ -1705,7 +1707,7 @@ export default function App() {
               <input
                 value={flashcardOptions.audience}
                 onChange={(event) => setFlashcardOptions((current) => ({ ...current, audience: event.target.value }))}
-                disabled={creatingTypes.size > 0}
+                disabled={false}
                 placeholder="general"
               />
             </label>
@@ -1717,7 +1719,7 @@ export default function App() {
                     key={option.value}
                     type="button"
                     data-selected={selected}
-                    disabled={creatingTypes.size > 0}
+                    disabled={false}
                     onClick={() =>
                       setFlashcardOptions((current) => {
                         const next = selected
@@ -1748,7 +1750,7 @@ export default function App() {
                           : current.selectedSourceIds,
                     }));
                   }}
-                  disabled={creatingTypes.size > 0}
+                  disabled={false}
                 >
                   {sourceModeOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -1764,7 +1766,7 @@ export default function App() {
                         key={source.id}
                         type="button"
                         data-selected={selected}
-                        disabled={creatingTypes.size > 0}
+                        disabled={false}
                         onClick={() =>
                           setFlashcardOptions((current) => ({
                             ...current,
@@ -3089,9 +3091,15 @@ function ArtifactPreview({
               <Download size={15} />
             </button>
           ) : null}
-          <button className="icon-button subtle" type="button" onClick={() => downloadText(`${downloadSlug(artifact.title)}.json`, JSON.stringify(payload, null, 2))} aria-label="Download artifact JSON">
-            <Download size={15} />
-          </button>
+          {artifact.type === "thumbnail" && payload?.image_data ? (
+            <a className="icon-button subtle" href={String(payload.image_data)} download={`${downloadSlug(artifact.title)}.png`} aria-label="Download thumbnail image">
+              <Download size={15} />
+            </a>
+          ) : artifact.type !== "thumbnail" ? (
+            <button className="icon-button subtle" type="button" onClick={() => downloadText(`${downloadSlug(artifact.title)}.json`, JSON.stringify(payload, null, 2))} aria-label="Download artifact JSON">
+              <Download size={15} />
+            </button>
+          ) : null}
         </div>
       </div>
       <ArtifactPayload

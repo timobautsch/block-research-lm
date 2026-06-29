@@ -2914,15 +2914,33 @@ select:focus-visible {
   right: 18px;
   bottom: 18px;
   z-index: 30;
-  max-width: min(420px, calc(100vw - 36px));
-  padding: 11px 13px;
+  max-width: min(440px, calc(100vw - 36px));
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 14px;
   border: 1px solid rgba(15, 208, 112, 0.34);
-  border-radius: var(--radius);
+  border-radius: 12px;
   background: #102017;
   color: #e8fff0;
   box-shadow: var(--shadow);
   font-size: 13px;
-  font-weight: 800;
+  font-weight: 600;
+}
+
+.toast > svg:first-child {
+  flex: 0 0 auto;
+  color: var(--green);
+}
+
+.toast.error > svg:first-child {
+  color: #ff8478;
+}
+
+.toast-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.4;
 }
 
 .mobile-tabs {

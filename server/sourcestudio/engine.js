@@ -2873,11 +2873,11 @@ export async function createSourceStudioEngine(options = {}) {
 
   function audioTurnTarget(mode, length) {
     const base = {
-      brief: 5,
-      deep_dive: 9,
-      critique: 9,
-      debate: 10,
-    }[mode] || 9;
+      brief: 6,
+      deep_dive: 13,
+      critique: 13,
+      debate: 14,
+    }[mode] || 13;
     const adjustment = length === "short" ? -2 : length === "long" ? 3 : 0;
     return Math.max(4, Math.min(14, base + adjustment));
   }
@@ -3261,7 +3261,7 @@ export async function createSourceStudioEngine(options = {}) {
       return null;
     }
 
-    const dialogue = transcript.slice(0, 14).map((turn) => ({
+    const dialogue = transcript.slice(0, 22).map((turn) => ({
       text: spokenAudioText(turn.text),
       voice_id: turn.host === "Host B" ? hostBVoiceId : hostAVoiceId,
     }));
