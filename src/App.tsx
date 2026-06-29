@@ -3080,6 +3080,7 @@ function ArtifactPreview({
   const svgMarkup = typeof payload.svg_markup === "string" ? payload.svg_markup : "";
   return (
     <div className="artifact-preview">
+      {artifact.type !== "quiz" ? (
       <div className="artifact-preview-top">
         <div>
           <p>{artifact.type}</p>
@@ -3102,6 +3103,7 @@ function ArtifactPreview({
           ) : null}
         </div>
       </div>
+      ) : null}
       <ArtifactPayload
         artifact={artifact}
         payload={payload}
@@ -3110,7 +3112,12 @@ function ArtifactPreview({
         onToast={onToast}
         onError={onError}
       />
-      <ArtifactEvidenceAuditView audit={payload.evidence_audit as ArtifactEvidenceAudit | undefined} />
+      {payload.evidence_audit ? (
+        <details className="artifact-audit-disclosure">
+          <summary>Evidence audit</summary>
+          <ArtifactEvidenceAuditView audit={payload.evidence_audit as ArtifactEvidenceAudit | undefined} />
+        </details>
+      ) : null}
     </div>
   );
 }
@@ -3810,10 +3817,14 @@ function QuizSession({ payload, questions }: { payload: Record<string, unknown>;
   const preparedQuestions = questions.filter((question) => question.question && (question.options || []).length >= 2);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<number, number>>({});
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [reviewMode, setReviewMode] = useState(false);
 
   useEffect(() => {
     setCurrentIndex(0);
     setAnswers({});
+    setReviewMode(false);
+    setIsExpanded(false);
   }, [quizKey]);
 
   if (!preparedQuestions.length) {
@@ -3848,95 +3859,133 @@ function QuizSession({ payload, questions }: { payload: Record<string, unknown>;
   function resetQuiz() {
     setAnswers({});
     setCurrentIndex(0);
+    setReviewMode(false);
   }
 
+  const showResults = isComplete && !reviewMode;
+  const isLastQuestion = currentIndex === preparedQuestions.length - 1;
+
   return (
-    <div className="quiz-session">
-      <div className="quiz-summary">
-        <span>
-          <strong>{answeredCount}/{preparedQuestions.length}</strong>
-          answered
-        </span>
-        <span>
-          <strong>{scorePercent}%</strong>
-          score
-        </span>
-        <span>
-          <strong>{Math.round(passingScore * 100)}%</strong>
-          pass
-        </span>
+    <div className="quiz-session" data-expanded={isExpanded}>
+      <div className="quiz-strip">
+        <div className="quiz-strip-head">
+          <span className="quiz-qno">Question {currentIndex + 1} of {preparedQuestions.length}</span>
+          <span className="quiz-diff">{current.difficulty || "medium"}</span>
+        </div>
+        <div className="quiz-strip-stats">
+          <span><strong>{answeredCount}</strong> answered</span>
+          <span><strong>{scorePercent}%</strong> score</span>
+          <span>pass {Math.round(passingScore * 100)}%</span>
+          <button
+            type="button"
+            className="icon-button subtle"
+            onClick={() => setIsExpanded((value) => !value)}
+            aria-label={isExpanded ? "Collapse quiz" : "Expand quiz"}
+            title={isExpanded ? "Collapse" : "Full screen"}
+          >
+            {isExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          </button>
+        </div>
       </div>
 
       <div className="quiz-progress" aria-label="Quiz progress">
         <span style={{ width: `${progressPercent}%` }} />
       </div>
 
-      <article className="quiz-card">
-        <div className="quiz-card-top">
-          <span>Question {currentIndex + 1} · {current.difficulty || "medium"}</span>
-          {current.learning_goal ? <small>{current.learning_goal}</small> : null}
-          <strong>{current.question}</strong>
-        </div>
-
-        <div className="quiz-options">
-          {(current.options || []).map((option, optionIndex) => {
-            const state = quizOptionState(selected, correctIndex, optionIndex);
-            return (
-              <button
-                key={`${option}-${optionIndex}`}
-                type="button"
-                data-state={state}
-                onClick={() => chooseAnswer(optionIndex)}
-                disabled={selected !== undefined}
-              >
-                <span>{String.fromCharCode(65 + optionIndex)}</span>
-                <strong>{option}</strong>
-                {state === "correct" ? <CheckCircle2 size={16} /> : null}
-                {state === "wrong" ? <XCircle size={16} /> : null}
-              </button>
-            );
-          })}
-        </div>
-
-        {selected !== undefined ? (
-          <div className="quiz-explanation" data-correct={selected === correctIndex}>
-            <strong>{selected === correctIndex ? "Correct" : "Review the evidence"}</strong>
-            <p>{current.explanation}</p>
-            {current.evidence_quote ? <small>{current.evidence_quote}</small> : null}
-            {current.tags?.length ? (
-              <div className="quiz-tags">
-                {current.tags.slice(0, 5).map((tag) => <span key={tag}>{tag}</span>)}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-      </article>
-
-      <div className="quiz-actions">
-        <button type="button" onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))} disabled={currentIndex === 0}>
-          Previous
-        </button>
-        <button
-          type="button"
-          onClick={() => setCurrentIndex((index) => Math.min(preparedQuestions.length - 1, index + 1))}
-          disabled={currentIndex === preparedQuestions.length - 1}
-        >
-          Next
-        </button>
-        <button type="button" onClick={resetQuiz}>
-          <RefreshCw size={14} />
-          Reset
-        </button>
-      </div>
-
-      {isComplete ? (
-        <div className="quiz-result" data-passed={passed}>
+      {showResults ? (
+        <div className="quiz-result-panel" data-passed={passed}>
+          <span className="quiz-score-big">{scorePercent}%</span>
           <strong>{passed ? "Passed" : "Needs review"}</strong>
           <p>{correctCount} of {preparedQuestions.length} answers matched the cited evidence.</p>
         </div>
-      ) : null}
+      ) : (
+        <article className="quiz-card">
+          <div className="quiz-card-top">
+            {current.learning_goal ? <small>{current.learning_goal}</small> : null}
+            <strong>{stripCitationMarkers(current.question)}</strong>
+          </div>
+
+          <div className="quiz-options">
+            {(current.options || []).map((option, optionIndex) => {
+              const state = quizOptionState(selected, correctIndex, optionIndex);
+              return (
+                <button
+                  key={`${option}-${optionIndex}`}
+                  type="button"
+                  data-state={state}
+                  onClick={() => chooseAnswer(optionIndex)}
+                  disabled={selected !== undefined}
+                >
+                  <span>{String.fromCharCode(65 + optionIndex)}</span>
+                  <strong>{stripCitationMarkers(option)}</strong>
+                  {state === "correct" ? <CheckCircle2 size={16} /> : null}
+                  {state === "wrong" ? <XCircle size={16} /> : null}
+                </button>
+              );
+            })}
+          </div>
+
+          {selected !== undefined ? (
+            <div className="quiz-explanation" data-correct={selected === correctIndex}>
+              <strong>{selected === correctIndex ? "Correct" : "Review the evidence"}</strong>
+              <p>{stripCitationMarkers(current.explanation)}</p>
+              {current.evidence_quote ? <small>{current.evidence_quote}</small> : null}
+              {current.tags?.length ? (
+                <div className="quiz-tags">
+                  {current.tags.slice(0, 5).map((tag) => <span key={tag}>{tag}</span>)}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </article>
+      )}
+
+      <div className="quiz-actions" data-mode={showResults ? "results" : "quiz"}>
+        {showResults ? (
+          <>
+            <button type="button" onClick={() => { setReviewMode(true); setCurrentIndex(0); }}>
+              Review answers
+            </button>
+            <button type="button" onClick={resetQuiz}>
+              <RefreshCw size={14} />
+              Retry
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))} disabled={currentIndex === 0}>
+              Previous
+            </button>
+            {isComplete && isLastQuestion ? (
+              <button type="button" onClick={() => setReviewMode(false)}>
+                See results
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setCurrentIndex((index) => Math.min(preparedQuestions.length - 1, index + 1))}
+                disabled={isLastQuestion}
+              >
+                Next
+              </button>
+            )}
+            <button type="button" onClick={resetQuiz}>
+              <RefreshCw size={14} />
+              Reset
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
+}
+
+function stripCitationMarkers(text: unknown): string {
+  if (typeof text !== "string") return text == null ? "" : String(text);
+  return text
+    .replace(/\s*\[\s*\d+(?:\s*[,–-]\s*\d+)*\s*\]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function normalizedCorrectIndex(question: QuizPayload) {

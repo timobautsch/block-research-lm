@@ -126,7 +126,10 @@ export function createModelRouter({
     try {
       const rawOutput = await callProvider(selected.provider, selected.model, prompt, {
         systemPrompt: audioScriptSystemPrompt(),
-        maxTokens: 2400,
+        // A 13-22 turn conversational script with voice directions needs room; too low
+        // truncates the JSON, which fails to parse and silently falls back to the
+        // formal local template (the "two readers" symptom).
+        maxTokens: 8000,
       });
       const payload = normalizeAudioScript(JSON.parse(extractJson(rawOutput)));
       finishRun(providerRun, "completed", JSON.stringify(payload));
