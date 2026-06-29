@@ -5706,10 +5706,10 @@ textarea::placeholder {
 .modal-header .panel-eyebrow { display: none; }
 
 .modal-intro {
-  margin: -2px 18px 4px;
+  margin: 16px 20px 18px;
   color: var(--muted);
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .source-modal { width: min(560px, calc(100vw - 32px)); }
@@ -5866,7 +5866,7 @@ textarea::placeholder {
 
 /* ---- Add sources modal (NotebookLM-style dropzone + type chips) ---- */
 .add-source-modal { width: min(600px, calc(100vw - 32px)); }
-.add-source-form { display: grid; gap: 14px; padding: 4px 18px 18px; }
+.add-source-form { display: grid; gap: 16px; padding: 2px 20px 20px; }
 .add-source-dropzone {
   position: relative;
   display: grid; justify-items: center; gap: 5px; padding: 26px 20px;

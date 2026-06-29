@@ -1917,49 +1917,39 @@ export default function App() {
               {sourceNeedsUrl(sourceForm.type) ? (
                 <label className="modal-field">
                   <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
-                  <div className="input-with-go">
-                    <input
-                      value={sourceForm.original_url}
-                      onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          event.currentTarget.form?.requestSubmit();
-                        }
-                      }}
-                      placeholder={sourceUrlPlaceholder(sourceForm.type)}
-                      inputMode="url"
-                      autoFocus
-                    />
-                    <button className="go-arrow" type="submit" disabled={isAddingSource} aria-label="Add source">
-                      {isAddingSource ? <Loader2 className="spin" size={18} /> : <ArrowRight size={18} />}
-                    </button>
-                  </div>
+                  <input
+                    value={sourceForm.original_url}
+                    onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        event.currentTarget.form?.requestSubmit();
+                      }
+                    }}
+                    placeholder={sourceUrlPlaceholder(sourceForm.type)}
+                    inputMode="url"
+                    autoFocus
+                  />
                 </label>
               ) : null}
 
               {sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note" ? (
                 <label className="modal-field">
                   <span>{sourceBodyLabel(sourceForm.type)}</span>
-                  <div className="input-with-go input-with-go--area">
-                    <textarea
-                      ref={sourceBodyRef}
-                      value={sourceForm.body}
-                      onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                          event.preventDefault();
-                          event.currentTarget.form?.requestSubmit();
-                        }
-                      }}
-                      placeholder={sourceBodyPlaceholder(sourceForm.type)}
-                      aria-invalid={Boolean(sourceFormNotice)}
-                      rows={5}
-                    />
-                    <button className="go-arrow" type="submit" disabled={isAddingSource} aria-label="Add source">
-                      {isAddingSource ? <Loader2 className="spin" size={18} /> : <ArrowRight size={18} />}
-                    </button>
-                  </div>
+                  <textarea
+                    ref={sourceBodyRef}
+                    value={sourceForm.body}
+                    onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                        event.preventDefault();
+                        event.currentTarget.form?.requestSubmit();
+                      }
+                    }}
+                    placeholder={sourceBodyPlaceholder(sourceForm.type)}
+                    aria-invalid={Boolean(sourceFormNotice)}
+                    rows={5}
+                  />
                 </label>
               ) : null}
 
