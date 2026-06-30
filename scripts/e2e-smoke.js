@@ -71,6 +71,32 @@ async function ensureAuth() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function waitForArtifact(response) {
+  if (response.artifact) return { artifact: response.artifact, job: response.job };
+  const jobId = response.job?.id;
+  if (!jobId) {
+    throw new Error(`Expected artifact or job id: ${JSON.stringify(response)}`);
+  }
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await sleep(100);
+    const { job } = await request(`/api/jobs/${jobId}`);
+    if (job.status === "failed") {
+      throw new Error(`Artifact job ${job.id} failed: ${job.error || "unknown error"}`);
+    }
+    if (job.status === "completed" && job.result_artifact_id) {
+      const { artifact } = await request(`/api/artifacts/${job.result_artifact_id}`);
+      return { artifact, job };
+    }
+  }
+  throw new Error(`Artifact job ${jobId} did not complete in time.`);
+}
+
 await ensureAuth();
 
 const notebookResponse = await request("/api/notebooks", {
@@ -100,7 +126,7 @@ if (!chat.message?.citations?.length) {
   throw new Error("Expected chat citations.");
 }
 
-const artifact = await request("/api/artifacts", {
+const quizResponse = await request("/api/artifacts", {
   method: "POST",
   body: JSON.stringify({
     notebook_id: notebook.id,
@@ -108,12 +134,13 @@ const artifact = await request("/api/artifacts", {
     options: {},
   }),
 });
+const quiz = await waitForArtifact(quizResponse);
 
-if (!artifact.artifact?.content_json?.questions?.length) {
+if (!quiz.artifact?.content_json?.questions?.length) {
   throw new Error("Expected quiz questions.");
 }
 
-const flashcards = await request("/api/artifacts", {
+const flashcardsResponse = await request("/api/artifacts", {
   method: "POST",
   body: JSON.stringify({
     notebook_id: notebook.id,
@@ -126,6 +153,7 @@ const flashcards = await request("/api/artifacts", {
     },
   }),
 });
+const flashcards = await waitForArtifact(flashcardsResponse);
 
 if (!flashcards.artifact?.content_json?.deck_id || !flashcards.artifact?.content_json?.cards?.length) {
   throw new Error("Expected flashcard deck and cards.");
@@ -164,8 +192,8 @@ console.log(
     {
       notebook_id: notebook.id,
       citation_count: chat.message.citations.length,
-      artifact_type: artifact.artifact.type,
-      job_status: artifact.job.status,
+      artifact_type: quiz.artifact.type,
+      job_status: quiz.job.status,
       flashcard_cards: adaptiveDeck.deck.cards.length,
       flashcard_missed: adaptiveDeck.deck.progress.missed,
     },

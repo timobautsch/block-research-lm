@@ -7,4 +7,3 @@ Rules:
 - Answers must be directly source-backed.
 - Do not ask about facts not present in sources.
 - Return valid JSON.
-

@@ -7,4 +7,3 @@ Rules:
 - Include scene titles, narration, captions, visual suggestions, and source refs.
 - Return valid JSON.
 - Do not imply MP4 rendering unless the renderer actually produced a file.
-

@@ -13,6 +13,7 @@
     "seed": "node scripts/seed.js",
     "test": "node --test tests/*.test.js",
     "audit:buttons": "node scripts/button-audit.js",
+    "presentation:timeline": "node scripts/gen-commit-timeline.mjs",
     "verify": "npm run audit:buttons && npm run build && npm run lint && npm test && node --check server/index.js",
     "smoke:api": "node scripts/smoke-api.js",
     "smoke:e2e": "node scripts/e2e-smoke.js"

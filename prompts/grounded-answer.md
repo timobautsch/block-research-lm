@@ -8,4 +8,3 @@ Rules:
 - If evidence is insufficient, abstain.
 - Do not create fake citations.
 - Keep answers concise, useful, and auditable.
-

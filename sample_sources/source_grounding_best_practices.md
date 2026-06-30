@@ -25,4 +25,3 @@ Studio artifacts should use the same Evidence Pack pattern as chat. Reports, sli
 ## Abstention
 
 Abstention is a feature, not a failure. A grounded system that refuses unsupported answers earns more trust than a general chatbot that invents plausible but unverifiable details.
-

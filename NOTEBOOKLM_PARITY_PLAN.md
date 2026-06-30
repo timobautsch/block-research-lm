@@ -292,4 +292,3 @@ Die App soll besonders dort besser werden, wo professionelle Research Workflows 
 8. PPTX/PDF/PNG Renderer.
 9. Audio/Video Rendering Jobs.
 10. Sharing, Tenancy, Usage und Evaluation.
-

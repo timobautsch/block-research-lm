@@ -7,4 +7,3 @@ Rules:
 - Each slide must include title, bullets, speaker notes, citations, visual suggestion, and layout type.
 - Avoid generic stock phrasing.
 - Return valid JSON.
-

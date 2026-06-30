@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const SourceTypeSchema = z.enum([
+const SourceTypeSchema = z.enum([
   "markdown",
   "text",
   "pdf",
@@ -13,9 +13,7 @@ export const SourceTypeSchema = z.enum([
   "image",
 ]);
 
-export const SourceStatusSchema = z.enum(["pending", "parsing", "indexed", "failed"]);
-
-export const ArtifactTypeSchema = z.enum([
+const ArtifactTypeSchema = z.enum([
   "report",
   "mindmap",
   "flashcards",
@@ -27,20 +25,6 @@ export const ArtifactTypeSchema = z.enum([
   "infographic",
   "youtube-kit",
   "thumbnail",
-]);
-
-export const ModelRoleSchema = z.enum([
-  "grounded_answer",
-  "reasoning",
-  "long_context",
-  "summarization",
-  "extraction",
-  "reranking",
-  "citation_verification",
-  "artifact_generation",
-  "slide_generation",
-  "audio_script",
-  "table_extraction",
 ]);
 
 export const CreateNotebookSchema = z.object({
@@ -95,20 +79,4 @@ export const FlashcardReviewSchema = z.object({
 
 export const ActiveSourceSchema = z.object({
   active: z.boolean(),
-});
-
-export const ProviderStatusSchema = z.object({
-  anthropic: z.boolean(),
-  openai: z.boolean(),
-  google: z.boolean(),
-  elevenlabs: z.boolean(),
-  database: z.boolean(),
-  redis: z.boolean(),
-  storage: z.string(),
-  storage_dir: z.string(),
-  available_reasoning_providers: z.array(z.string()),
-  active_grounded_answer_provider: z.string(),
-  grounded_answer_model: z.string(),
-  external_grounded_answer_enabled: z.boolean(),
-  roles: z.record(z.string(), z.any()),
 });

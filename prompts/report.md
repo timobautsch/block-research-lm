@@ -7,4 +7,3 @@ Rules:
 - Include title, TL;DR, key points, detailed sections, evidence/citations, open questions, risks, and bibliography.
 - Preserve source ids and block ids.
 - Return valid JSON.
-

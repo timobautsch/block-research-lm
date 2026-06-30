@@ -7,4 +7,3 @@ Rules:
 - Topic, entity, claim, and question nodes must carry source refs.
 - Edges should explain relationships.
 - Return valid JSON with `nodes`, `edges`, and `citations`.
-

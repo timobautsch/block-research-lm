@@ -7,4 +7,3 @@ Rules:
 - Return structured JSON objects with citation refs.
 - Include topics, entities, connections, contradictions, suggested questions, and suggested artifacts.
 - Mark uncertainty explicitly.
-

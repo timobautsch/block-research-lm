@@ -23,4 +23,3 @@ The biggest risks are unclear ownership, hallucinated responses, hidden data exp
 ## SME Priority List
 
 For most SMEs, the first three automations should be customer support summarization, sales proposal drafting from approved templates, and internal knowledge retrieval with citations. These use cases are visible, valuable, and controllable.
-

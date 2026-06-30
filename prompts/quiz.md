@@ -7,4 +7,3 @@ Rules:
 - Explanation must cite source evidence.
 - Do not include unsupported distractors that could be true outside sources.
 - Return valid JSON.
-

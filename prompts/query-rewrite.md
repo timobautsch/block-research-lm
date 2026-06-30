@@ -8,4 +8,3 @@ Rules:
 - Include relevant entities, synonyms, section names, and artifact intent.
 - Do not answer the question.
 - Return JSON with `original_query`, `rewritten_queries`, `intent`, and `filters`.
-

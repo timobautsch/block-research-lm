@@ -23,4 +23,3 @@ The output of retrieval is an Evidence Pack, not a random list of chunks. The Ev
 ## Citation Verification
 
 After a draft answer is generated, a citation verifier should split it into claims. Each claim is checked against the cited evidence. Unsupported claims are removed or softened. Partially supported claims are narrowed. The final answer should expose how many claims were checked and how many were supported.
-

@@ -8,4 +8,3 @@ Rules:
 - Label support as `supported`, `partially_supported`, `unsupported`, or `not_checkable`.
 - Remove or soften unsupported claims.
 - Return a Citation Ledger JSON object.
-
