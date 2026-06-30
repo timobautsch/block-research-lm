@@ -3116,16 +3116,6 @@ function ChatBubble({
           {message.mode === "abstained" ? <span>Abstained</span> : null}
         </div>
         <div className="answer-text">{renderMessageContent(message.content, message.citations || [], onCitationClick)}</div>
-        {message.citations?.length ? (
-          <div className="citation-list">
-            {message.citations.map((citation) => (
-              <button key={citation.evidence_id} type="button" className="citation-card" onClick={() => onCitationClick(citation)}>
-                <strong>[{citation.index}] {citation.source_title || citation.sourceTitle}</strong>
-                <p>{truncate(citation.quote, 150)}</p>
-              </button>
-            ))}
-          </div>
-        ) : null}
       </div>
     </article>
   );
@@ -3570,7 +3560,6 @@ function ArtifactPayload({
             </a>
           ) : null}
         </div>
-        {payload.image_prompt ? <p className="thumb-prompt">{String(payload.image_prompt)}</p> : null}
       </div>
     );
   }
