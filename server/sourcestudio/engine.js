@@ -4171,13 +4171,21 @@ async function normalizeAudioForAsr(buffer) {
 const YOUTUBE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+// Optional egress proxy for yt-dlp. YouTube blocks caption/audio downloads from
+// datacenter IPs (Cloud Run), so route yt-dlp through a (residential) proxy when
+// YTDLP_PROXY is set. No-op locally / when unset.
+function ytDlpNetworkArgs() {
+  const proxy = String(process.env.YTDLP_PROXY || "").trim();
+  return proxy ? ["--proxy", proxy] : [];
+}
+
 async function fetchYouTubeTitle(videoId) {
   if (!videoId || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
   try {
     const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
     const { stdout } = await execFile(
       ytDlpPath,
-      ["--print", "%(title)s", "--skip-download", "--no-warnings", "--no-playlist", `https://www.youtube.com/watch?v=${videoId}`],
+      [...ytDlpNetworkArgs(), "--print", "%(title)s", "--skip-download", "--no-warnings", "--no-playlist", `https://www.youtube.com/watch?v=${videoId}`],
       { timeout: 30_000 },
     );
     return String(stdout || "").split("\n")[0].trim().slice(0, 200);
@@ -4198,6 +4206,7 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
     await execFile(
       ytDlpPath,
       [
+        ...ytDlpNetworkArgs(),
         "-f", "bestaudio/best",
         "-x", "--audio-format", "mp3", "--audio-quality", "5",
         "--no-warnings", "--no-playlist",
@@ -4300,7 +4309,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId) {
   try {
     const { stdout } = await execFile(
       ytDlpPath,
-      ["-J", "--skip-download", "--no-warnings", "--no-playlist", videoUrl],
+      [...ytDlpNetworkArgs(), "-J", "--skip-download", "--no-warnings", "--no-playlist", videoUrl],
       { timeout: 60_000, maxBuffer: 1024 * 1024 * 64 },
     );
     const info = JSON.parse(stdout);
@@ -4346,6 +4355,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId) {
     await execFile(
       ytDlpPath,
       [
+        ...ytDlpNetworkArgs(),
         "--skip-download",
         ...subFlags,
         "--sub-format",
