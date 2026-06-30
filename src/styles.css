@@ -2548,7 +2548,21 @@ select:focus-visible {
 }
 
 .artifact-modal {
-  width: min(840px, calc(100vw - 32px));
+  width: min(1180px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+}
+
+/* Image-based artifacts (infographic, thumbnail) open large, like NotebookLM. */
+.artifact-modal .thumbnail-preview img {
+  width: auto;
+  max-width: 100%;
+  max-height: calc(100vh - 240px);
+  margin: 0 auto;
+  object-fit: contain;
+  border-radius: 12px;
+}
+.artifact-modal .thumbnail-preview {
+  align-items: center;
 }
 
 .source-modal {

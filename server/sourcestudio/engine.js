@@ -643,6 +643,8 @@ export async function createSourceStudioEngine(options = {}) {
         artifactPayload = await buildYouTubeKit(notebook, evidencePack, artifactOptions);
       } else if (parsed.type === "thumbnail") {
         artifactPayload = await buildThumbnail(notebook, evidencePack, artifactOptions);
+      } else if (parsed.type === "infographic") {
+        artifactPayload = await buildInfographic(notebook, evidencePack, artifactOptions);
       } else {
         const artifactResult = await buildArtifactPayload(parsed.type, notebook, evidencePack, artifactOptions);
         const localPayload = artifactResult?.payload || artifactResult;
@@ -658,6 +660,9 @@ export async function createSourceStudioEngine(options = {}) {
         artifactPayload = generation.payload;
         if (parsed.type === "infographic") {
           artifactPayload = finalizeInfographicPayload(artifactPayload, localPayload);
+        }
+        if (parsed.type === "slide-deck") {
+          artifactPayload = attachSlideSvgs(artifactPayload);
         }
         if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
           artifactPayload.generation_provider = generation.active_run.provider;
@@ -2768,7 +2773,51 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
-  async function generateThumbnailImage(prompt, references = []) {
+  async function buildInfographic(notebook, evidencePack, options = {}) {
+    // Use the same synthesized key points as the panel version, then have gpt-image-2
+    // design a real infographic poster from them (a fixed, branded infographic prompt).
+    const content = await buildArtifactPayload("infographic", notebook, evidencePack, options);
+    const data = content?.payload || content || {};
+    const panels = Array.isArray(data.panels) ? data.panels : [];
+    const title = truncate(notebook.title || data.title || "Infographic", 90);
+    const points = panels
+      .slice(0, 6)
+      .map((panel, index) => {
+        const heading = stripCitations(String(panel.heading || panel.title || "").trim());
+        const body = stripCitations(truncate(String(panel.body || panel.text || "").trim(), 130));
+        return `${index + 1}. ${heading}${body ? ` — ${body}` : ""}`;
+      })
+      .filter((line) => line.replace(/^\d+\.\s*/, "").trim().length > 2)
+      .join("\n");
+    const imagePrompt = String(options.prompt || "").trim() || infographicImagePrompt(title, points);
+    const result = await generateThumbnailImage(imagePrompt, [], "1024x1536");
+    return {
+      title: `${title}: Infographic`,
+      image_prompt: imagePrompt,
+      image_data: result.image_data || "",
+      image_status: result.image_data
+        ? "rendered"
+        : (result.error || "Image generation unavailable. Configure OpenAI billing for gpt-image-2."),
+      panels,
+      source_refs: collectSourceRefs(evidencePack),
+      generation_provider: "openai",
+      generation_model: env.OPENAI_IMAGE_MODEL || "gpt-image-2",
+    };
+  }
+
+  function infographicImagePrompt(title, points) {
+    return [
+      "Design a clean, modern, professional INFOGRAPHIC poster in portrait orientation.",
+      "Dark theme: near-black background (#0a0a0a) with a subtle grid texture, a vibrant green accent (#0fd070), and tasteful blue/purple highlights.",
+      `Bold title at the top: "${title}".`,
+      "Lay out these key points as distinct visual sections, each with a small relevant icon, a short heading, and one concise supporting line:",
+      points || "Summarize the most important themes from the sources.",
+      "Show any key numbers as big stat callouts. Use crisp sans-serif typography, clear visual hierarchy, generous spacing, and a polished editorial layout like a top-tier tech/finance infographic.",
+      "All text must be sharp, legible, and spelled correctly. No watermarks, no lorem ipsum, no gibberish text.",
+    ].join("\n");
+  }
+
+  async function generateThumbnailImage(prompt, references = [], size = "1536x1024") {
     const key = realProviderKey(env.OPENAI_API_KEY);
     if (!key) return { error: "OpenAI key not configured." };
     const imageModel = env.OPENAI_IMAGE_MODEL || "gpt-image-2";
@@ -2778,7 +2827,7 @@ export async function createSourceStudioEngine(options = {}) {
         const form = new FormData();
         form.append("model", imageModel);
         form.append("prompt", prompt);
-        form.append("size", "1536x1024");
+        form.append("size", size);
         references.forEach((ref, index) => {
           // Use the reference's real mime/extension — sending a JPEG/WebP labelled
           // "image/png" makes the images/edits endpoint reject it ("Invalid image file").
@@ -2796,7 +2845,7 @@ export async function createSourceStudioEngine(options = {}) {
         response = await fetchImpl("https://api.openai.com/v1/images/generations", {
           method: "POST",
           headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-          body: JSON.stringify({ model: imageModel, prompt, size: "1536x1024", n: 1 }),
+          body: JSON.stringify({ model: imageModel, prompt, size, n: 1 }),
         });
       }
       const body = await response.json().catch(() => ({}));
@@ -5315,6 +5364,7 @@ function finalizeInfographicPayload(generated, local) {
   const merged = { ...base };
   if (generated && typeof generated === "object") {
     if (typeof generated.title === "string" && generated.title.trim()) merged.title = generated.title.trim();
+    if (Array.isArray(generated.key_stats) && generated.key_stats.length) merged.key_stats = generated.key_stats;
     if (Array.isArray(generated.panels) && generated.panels.length) {
       merged.panels = generated.panels.map((g, index) => {
         const localPanel = (base.panels && base.panels[index]) || {};
@@ -5336,6 +5386,79 @@ function finalizeInfographicPayload(generated, local) {
   merged.render_status = "rendered_svg";
   merged.svg_markup = renderInfographicSvg(merged);
   return merged;
+}
+
+// ---------------- Slide deck: render each slide as a designed 16:9 SVG ----------------
+function attachSlideSvgs(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.slides)) return payload;
+  const total = payload.slides.length;
+  payload.slides = payload.slides.map((slide, index) =>
+    ({ ...slide, svg_markup: renderSlideSvg(slide, { index, total, deckTitle: payload.title || "" }) }));
+  payload.render_status = "rendered_svg";
+  payload.slide_format = "designed_svg_16x9";
+  return payload;
+}
+
+function renderSlideSvg(slide, { index, total, deckTitle }) {
+  const W = 1280, H = 720, M = 64;
+  const c = infographicPalette("evidence-dashboard");
+  const accent = c.accents[index % c.accents.length];
+  const layout = String(slide.layout_type || "content").toLowerCase();
+  const isTitle = layout === "title" || index === 0;
+  const isClosing = layout === "closing" || layout === "section" || (layout === "title" && index === total - 1 && total > 1);
+  const title = infographicCleanText(slide.title || (isTitle ? deckTitle : ""));
+  const subtitle = infographicCleanText(slide.subtitle || "");
+  const bullets = (slide.bullets || []).map((b) => infographicCleanText(b)).filter(Boolean).slice(0, 6);
+  const visual = infographicCleanText(slide.visual_suggestion || "");
+  const p = [];
+
+  p.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(title || "Slide")}">`);
+  p.push(`<defs>`);
+  p.push(`<linearGradient id="sl-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${c.bg1}"/><stop offset="1" stop-color="${c.bg0}"/></linearGradient>`);
+  p.push(`<linearGradient id="sl-acc" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${accent}" stop-opacity="0.20"/><stop offset="1" stop-color="${accent}" stop-opacity="0"/></linearGradient>`);
+  p.push(`</defs>`);
+  p.push(`<rect width="${W}" height="${H}" fill="url(#sl-bg)"/>`);
+  const gl = [];
+  for (let gx = 0; gx < W; gx += 48) gl.push(`<line x1="${gx}" y1="0" x2="${gx}" y2="${H}" stroke="${c.text}" stroke-opacity="0.014"/>`);
+  for (let gy = 0; gy < H; gy += 48) gl.push(`<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" stroke="${c.text}" stroke-opacity="0.014"/>`);
+  p.push(gl.join(""));
+  p.push(`<rect x="0" y="0" width="9" height="${H}" fill="${accent}"/>`);
+
+  if (isTitle || isClosing) {
+    p.push(`<rect x="${W - 360}" y="-60" width="420" height="420" rx="210" fill="url(#sl-acc)"/>`);
+    const tLines = wrapSvgText(title, 26, 3);
+    p.push(`<circle cx="${M + 6}" cy="248" r="4" fill="${accent}"/>`);
+    p.push(svgText(M + 18, 252, (isClosing ? "IN SUMMARY" : `${PRODUCT_NAME.toUpperCase()} · DECK`), { fill: accent, size: 14, weight: 800, spacing: 2.6 }));
+    p.push(svgTextBlock(tLines, M, 320, { fill: c.text, size: 56, weight: 800, lineHeight: 64 }));
+    const underY = 320 + tLines.length * 64 + 4;
+    p.push(`<rect x="${M}" y="${underY}" width="120" height="5" rx="2.5" fill="${accent}"/>`);
+    if (subtitle) p.push(svgTextBlock(wrapSvgText(subtitle, 64, 2), M, underY + 44, { fill: c.muted, size: 22, weight: 500, lineHeight: 30 }));
+  } else {
+    p.push(svgText(M, 96, infographicCleanText(deckTitle).toUpperCase() || "BRIEFING", { fill: accent, size: 13, weight: 800, spacing: 2.4 }));
+    const tLines = wrapSvgText(title, 38, 2);
+    p.push(svgTextBlock(tLines, M, 142, { fill: c.text, size: 40, weight: 800, lineHeight: 48 }));
+    let y = 142 + tLines.length * 48 + 14;
+    if (subtitle) { p.push(svgText(M, y, truncate(subtitle, 96), { fill: c.muted, size: 19, weight: 500 })); y += 36; }
+    p.push(`<rect x="${M}" y="${y - 4}" width="${W - M * 2}" height="1" fill="${c.panelEdge}"/>`);
+    y += 30;
+    const bulletAreaBottom = H - 96;
+    const perBullet = bullets.length ? Math.min(96, Math.floor((bulletAreaBottom - y) / bullets.length)) : 0;
+    bullets.forEach((b, i) => {
+      const by = y + i * perBullet;
+      const lines = wrapSvgText(b, 76, perBullet < 64 ? 2 : 3);
+      p.push(`<rect x="${M}" y="${by - 2}" width="14" height="14" rx="4" fill="${accent}"/>`);
+      p.push(svgTextBlock(lines, M + 30, by + 11, { fill: c.muted, size: 21, weight: 500, lineHeight: 27 }));
+    });
+    if (visual) p.push(svgText(M, H - 64, `▸ Visual: ${truncate(visual, 88)}`, { fill: c.faint, size: 13, weight: 600 }));
+  }
+
+  // footer: slide number + deck title + brand
+  p.push(`<rect x="${M}" y="${H - 44}" width="${W - M * 2}" height="1" fill="${c.panelEdge}"/>`);
+  p.push(svgText(M, H - 22, `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`, { fill: accent, size: 13, weight: 800 }));
+  p.push(svgText(W / 2, H - 22, truncate(infographicCleanText(deckTitle), 64), { fill: c.faint, size: 12.5, weight: 600, anchor: "middle" }));
+  p.push(svgText(W - M, H - 22, PRODUCT_NAME, { fill: c.muted, size: 12.5, weight: 800, anchor: "end" }));
+  p.push(`</svg>`);
+  return p.join("");
 }
 
 function normalizeChoice(value, allowed, fallback) {
@@ -5437,7 +5560,9 @@ function infographicIconMarkup(key, x, y, size, color, strokeW = 1.8) {
 // Pull the most quotable numbers (money, %, years, durations) out of the cited copy to
 // power the hero KPI strip. Backfills with structural coverage stats so we always get 3.
 const INFOGRAPHIC_KPI_STOP = new Set("the a an of on in at to and or for all with that this its his her their is are was were be been has have had includes include uses use built from than over per via into out up down new now first only also each both".split(" "));
-const INFOGRAPHIC_NUM_RE = /(\$\s?[\d.,]+\s?(?:k|m|bn)?(?:\s?\/\s?(?:month|year|mo|yr))?|\b(?:19|20)\d{2}\b|\b\d+(?:\.\d+)?\s?%|\b\d+(?:\.\d+)?\s?(?:years?|yrs?|months?|weeks?|days?|hours?|x)\b|\b\d{3,}\b)/gi;
+// The bare-number branch uses lookarounds so it never matches a fragment of a larger
+// number (e.g. "449" inside "$4,449").
+const INFOGRAPHIC_NUM_RE = /(\$\s?[\d.,]+\s?(?:k|m|bn)?(?:\s?\/\s?(?:month|year|mo|yr))?|\b(?:19|20)\d{2}\b|\b\d+(?:\.\d+)?\s?%|\b\d+(?:\.\d+)?\s?(?:years?|yrs?|months?|weeks?|days?|hours?|x)\b|(?<![\d.,$€£])\d{3,}(?![\d.,]))/gi;
 function infographicKpiLabel(before, after, fallbackTopic) {
   const pick = (arr) => arr.map((w) => w.toLowerCase()).filter((w) => w.length > 2 && !INFOGRAPHIC_KPI_STOP.has(w) && !/^https?/.test(w));
   let words = pick(after).slice(0, 2);
@@ -5447,6 +5572,21 @@ function infographicKpiLabel(before, after, fallbackTopic) {
 }
 function extractInfographicMetrics(payload) {
   const panels = payload.panels || [];
+  // Prefer model-provided key_stats (clean value + label) when available — they read far
+  // better than regex-extracted numbers. Fall back to extraction for the local path.
+  if (Array.isArray(payload.key_stats) && payload.key_stats.length) {
+    const stats = payload.key_stats
+      .filter((s) => s && (s.value || s.value === 0))
+      .slice(0, 3)
+      .map((s, i) => {
+        const value = infographicCleanText(String(s.value));
+        const label = infographicCleanText(String(s.label || ""));
+        const isMoney = /[$€£]/.test(value), isPct = /%/.test(value), isYear = /^(19|20)\d{2}$/.test(value.replace(/\D/g, "").slice(0, 4));
+        const icon = isMoney ? "dollar" : isPct ? "gauge" : isYear ? "calendar" : pickInfographicIcon(`${label} ${value}`, i);
+        return { value: truncate(value, 13), label: truncate(label || "From sources", 24), icon };
+      });
+    if (stats.length >= 1) return stats.length >= 3 ? stats.slice(0, 3) : stats;
+  }
   const entries = [
     ...panels.map((p) => ({ text: `${p.headline}. ${p.copy}`, topic: infographicCleanText(p.headline || "") })),
     ...(payload.evidence_appendix || []).map((e) => ({ text: e.quote || "", topic: infographicCleanText(e.source_title || "") })),
