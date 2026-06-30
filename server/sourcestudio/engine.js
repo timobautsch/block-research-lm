@@ -35,6 +35,10 @@ const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "sour
 const DEFAULT_CRAWL_MAX_PAGES = 12;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
 const PRODUCT_NAME = "Block Research LM";
+// Keep in sync with OVERVIEW_PROMPT in src/App.tsx — the auto-fired notebook overview
+// question. Filtered out of chat history so it never skews follow-up retrieval.
+const CHAT_OVERVIEW_PROMPT =
+  "Give me a quick, friendly overview of what these sources cover — and a couple of things worth digging into.";
 const execFile = promisify(execFileCallback);
 
 export async function createSourceStudioEngine(options = {}) {
@@ -474,9 +478,26 @@ export async function createSourceStudioEngine(options = {}) {
         question_chars: questionChars,
         answer_style: parsed.answer_style,
       });
+      // Gather recent conversation so follow-ups ("sicher?", "why?", "and the price?")
+      // resolve against the prior turns instead of being treated as standalone questions.
+      const sessionId = parsed.session_id || "default";
+      const priorMessages = state.chatMessages
+        .filter((message) => message.notebook_id === notebook.id && (message.session_id || "default") === sessionId)
+        .filter((message) => !(message.role === "user" && message.content.trim() === CHAT_OVERVIEW_PROMPT))
+        .slice(-6);
+      const recentUserQuestions = priorMessages
+        .filter((message) => message.role === "user")
+        .slice(-2)
+        .map((message) => message.content);
+      // Retrieval text blends the last user questions with the current one so a short
+      // follow-up still pulls the evidence the conversation is actually about.
+      const retrievalQuery = [...recentUserQuestions, parsed.question].join("\n");
+      const history = priorMessages.map((message) => ({ role: message.role, content: message.content }));
+
       const evidencePack = await buildEvidencePack({
         notebook_id: notebook.id,
         question: parsed.question,
+        retrieval_query: retrievalQuery,
         source_mode: parsed.source_mode,
         selected_source_ids: parsed.selected_source_ids,
       });
@@ -493,6 +514,7 @@ export async function createSourceStudioEngine(options = {}) {
         question: parsed.question,
         evidencePack,
         answerStyle: parsed.answer_style,
+        history,
         startRun: startModelRun,
       });
       const answer = generation.answer;
@@ -2106,20 +2128,22 @@ export async function createSourceStudioEngine(options = {}) {
     );
   }
 
-  async function buildEvidencePack({ notebook_id, question, source_mode = "active", selected_source_ids = [], artifact_type = "" }) {
+  async function buildEvidencePack({ notebook_id, question, source_mode = "active", selected_source_ids = [], artifact_type = "", retrieval_query = "" }) {
     const notebook = state.notebooks.find((item) => item.id === notebook_id);
     if (!notebook) throw statusError(404, "Notebook not found.");
-    const intent = detectIntent(question, artifact_type);
+    // retrievalText drives ranking/embedding; `question` stays the stored/displayed question.
+    const retrievalText = retrieval_query && retrieval_query.trim() ? retrieval_query : question;
+    const intent = detectIntent(retrievalText, artifact_type);
     const evidenceLimit = artifact_type === "audio"
       ? MAX_AUDIO_EVIDENCE_ITEMS
       : artifact_type
         ? MAX_ARTIFACT_EVIDENCE_ITEMS
         : MAX_EVIDENCE_ITEMS;
     const sourceIds = resolveSourceIds(notebook_id, source_mode, selected_source_ids);
-    const queryTokens = tokenize(question);
-    const rewrites = rewriteQuery(question, notebook_id, queryTokens);
+    const queryTokens = tokenize(retrievalText);
+    const rewrites = rewriteQuery(retrievalText, notebook_id, queryTokens);
     const corpusStats = buildRetrievalCorpusStats(sourceIds);
-    const queryVector = (await embedder.embed([rewrites.join(" ") || question], "query"))[0] || [];
+    const queryVector = (await embedder.embed([rewrites.join(" ") || retrievalText], "query"))[0] || [];
     const candidateLimit = Math.max(evidenceLimit * RETRIEVAL_CANDIDATE_MULTIPLIER, RETRIEVAL_MIN_CANDIDATES);
     let pgSimMap = null;
     if (pgStore.enabled) {
@@ -2525,29 +2549,13 @@ export async function createSourceStudioEngine(options = {}) {
     }
     if (type === "mindmap") {
       const topics = state.knowledgeObjects.find((object) => object.notebook_id === notebook.id && object.type === "topic_map")?.data?.topics || [];
-      return {
-        title: titleBase,
-        nodes: [
-          { id: "center", label: notebook.title, type: "notebook", source_refs: [] },
-          ...topics.slice(0, 7).map((topic, index) => ({
-            id: `topic-${index + 1}`,
-            label: titleCase(topic.label),
-            type: "topic",
-            source_refs: citations.slice(index, index + 1).map(sourceRefsFromEvidence),
-          })),
-          ...keyPoints.slice(0, 5).map((point, index) => ({
-            id: `claim-${index + 1}`,
-            label: truncate(stripCitations(point.text), 88),
-            type: "claim",
-            source_refs: point.source_refs,
-          })),
-        ],
-        edges: [
-          ...topics.slice(0, 7).map((_, index) => ({ id: `edge-topic-${index + 1}`, source: "center", target: `topic-${index + 1}` })),
-          ...keyPoints.slice(0, 5).map((_, index) => ({ id: `edge-claim-${index + 1}`, source: "center", target: `claim-${index + 1}` })),
-        ],
-        citations,
-      };
+      // The interactive tree wants more leaves than the 6 shared key points, so
+      // synthesize a wider claim set straight from the deduped evidence.
+      const mindMapPoints = citations.slice(0, 16).map((item) => ({
+        text: bestSentenceForQuestion(item.quote, evidencePack.user_question),
+        source_refs: sourceRefsFromEvidence(item),
+      }));
+      return buildMindMapPayload({ notebook, titleBase, topics, keyPoints: mindMapPoints, citations });
     }
     if (type === "flashcards") {
       return {
@@ -2783,8 +2791,8 @@ export async function createSourceStudioEngine(options = {}) {
     const points = panels
       .slice(0, 6)
       .map((panel, index) => {
-        const heading = stripCitations(String(panel.heading || panel.title || "").trim());
-        const body = stripCitations(truncate(String(panel.body || panel.text || "").trim(), 130));
+        const heading = stripCitations(String(panel.headline || panel.heading || panel.title || "").trim());
+        const body = stripCitations(truncate(String(panel.copy || panel.body || panel.text || "").trim(), 130));
         return `${index + 1}. ${heading}${body ? ` — ${body}` : ""}`;
       })
       .filter((line) => line.replace(/^\d+\.\s*/, "").trim().length > 2)
@@ -5678,8 +5686,9 @@ function renderInfographicSvg(payload) {
   const innerW = W - M * 2;
 
   const coverage = payload.source_coverage || {};
+  const activeSources = coverage.active_sources || 0;
   const subtitle = truncate(
-    `${panels.length} source-grounded panels · ${coverage.cited_sources || 0}/${coverage.active_sources || 0} sources cited · ${coverage.evidence_items || 0} evidence items`,
+    `${activeSources} ${activeSources === 1 ? "source" : "sources"} · ${coverage.evidence_items || 0} cited passages · ${panels.length} panels`,
     portrait ? 60 : 84,
   );
 
@@ -5984,6 +5993,113 @@ function insertCorrectOption(distractors, correct, correctIndex) {
 function topicFromSentence(sentence) {
   const terms = topTerms(sentence, 3).map((item) => item.term);
   return terms.length ? terms.join(" ") : "evidence";
+}
+
+// Build a genuine multi-level mind map (root -> category -> claim) from the
+// deterministic evidence. The interactive tree in the UI expands/collapses these
+// branches, so the local fallback must produce a real hierarchy (not a flat star)
+// even when no external LLM is configured.
+function buildMindMapPayload({ notebook, titleBase, topics = [], keyPoints = [], citations = [] }) {
+  const centerId = "center";
+  const nodes = [{ id: centerId, label: notebook.title || "Notebook", type: "notebook", source_refs: [] }];
+  const edges = [];
+
+  const points = (keyPoints || [])
+    .filter((point) => point && (point.text || "").trim())
+    .map((point, idx) => ({ ...point, idx }));
+
+  // Keep at least one claim available per category so every branch is expandable.
+  const maxCategories = Math.max(1, Math.min(7, points.length || 1));
+  let categoryLabels = (topics || [])
+    .map((topic) => titleCase(topic.label || topic.term || "").trim())
+    // Drop stop-word-ish single tokens that read as noise in a category chip.
+    .filter((label) => label.length >= 4 && !MIND_MAP_STOP_LABELS.has(label.toLowerCase()))
+    .filter(Boolean);
+  categoryLabels = [...new Set(categoryLabels)].slice(0, maxCategories);
+  if (!categoryLabels.length) categoryLabels = ["Key Themes"];
+
+  const categories = categoryLabels.map((label, ci) => ({
+    id: `cat-${ci + 1}`,
+    label,
+    term: label.toLowerCase(),
+    children: [],
+  }));
+
+  const used = new Set();
+  // Pass 1: attach each claim to the first category whose term it actually mentions.
+  for (const point of points) {
+    const text = (point.text || "").toLowerCase();
+    const match = categories.find(
+      (cat) => cat.children.length < 5 && cat.term.length > 2 && text.includes(cat.term),
+    );
+    if (match) {
+      match.children.push(point);
+      used.add(point.idx);
+    }
+  }
+  // Pass 2: round-robin the remainder onto the leanest category so nothing is dropped.
+  for (const point of points) {
+    if (used.has(point.idx)) continue;
+    const target = categories.reduce(
+      (leanest, cat) => (cat.children.length < leanest.children.length ? cat : leanest),
+      categories[0],
+    );
+    target.children.push(point);
+    used.add(point.idx);
+  }
+
+  // Drop categories that never received a claim — a childless category just
+  // dangles in the tree with no branch to unfold.
+  const filledCategories = categories.filter((cat) => cat.children.length > 0);
+  const emitCategories = filledCategories.length ? filledCategories : categories.slice(0, 1);
+
+  for (const cat of emitCategories) {
+    nodes.push({ id: cat.id, label: cat.label, type: "topic", source_refs: [] });
+    edges.push({ id: `edge-${cat.id}`, source: centerId, target: cat.id });
+    cat.children.slice(0, 6).forEach((point, ci) => {
+      const childId = `${cat.id}-claim-${ci + 1}`;
+      // A readable, source-grounded fragment beats a scrambled keyword salad.
+      const label = truncate(stripCitations(point.text || ""), 56) || cat.label;
+      nodes.push({
+        id: childId,
+        label,
+        type: "claim",
+        source_refs: normalizeMindMapRefs(point.source_refs),
+      });
+      edges.push({ id: `edge-${childId}`, source: cat.id, target: childId });
+    });
+  }
+
+  return { title: titleBase, nodes, edges, citations };
+}
+
+// Single tokens that surface from the keyword extractor but read as noise when
+// used as a top-level mind-map category label.
+const MIND_MAP_STOP_LABELS = new Set([
+  "answer",
+  "answers",
+  "another",
+  "based",
+  "become",
+  "these",
+  "those",
+  "their",
+  "there",
+  "which",
+  "while",
+  "about",
+  "would",
+  "could",
+  "should",
+  "every",
+  "other",
+  "value",
+  "values",
+]);
+
+function normalizeMindMapRefs(refs) {
+  if (Array.isArray(refs)) return refs.filter(Boolean);
+  return refs ? [refs] : [];
 }
 
 function titleCase(text) {

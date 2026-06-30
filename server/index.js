@@ -134,6 +134,10 @@ app.get("/api/notebooks/:id", routeHandler((req) => ({
   notebook: engine.getNotebook(req.params.id, userContext(req)),
 })));
 
+app.patch("/api/notebooks/:id", asyncHandler(async (req, res) => {
+  res.json({ notebook: await engine.renameNotebook(req.params.id, req.body, userContext(req)) });
+}));
+
 app.post("/api/notebooks/:id/sources", asyncHandler(async (req, res) => {
   res.status(201).json({ source: await engine.ingestSource(req.params.id, req.body, userContext(req)) });
 }));

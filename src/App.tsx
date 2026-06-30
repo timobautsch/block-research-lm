@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ChangeEvent, CSSProperties, DragEvent, FormEvent, ReactNode } from "react";
+import type {
+  ChangeEvent,
+  CSSProperties,
+  DragEvent,
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  WheelEvent as ReactWheelEvent,
+} from "react";
 import {
   ArrowRight,
   AudioLines,
@@ -8,6 +17,7 @@ import {
   CheckCircle,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Circle,
   ClipboardList,
   Compass,
@@ -29,6 +39,7 @@ import {
   Maximize2,
   MessageSquareText,
   Minimize2,
+  Minus,
   MoreVertical,
   NotebookPen,
   PanelLeft,
@@ -248,6 +259,7 @@ interface SlidePayload {
   visual_suggestion?: string;
   layout_type?: string;
   citations?: Citation[];
+  svg_markup?: string;
 }
 
 interface TranscriptPayload {
@@ -641,6 +653,7 @@ export default function App() {
   const [sourceBlocks, setSourceBlocks] = useState<SourceBlock[]>([]);
   const [highlightedBlockIds, setHighlightedBlockIds] = useState<string[]>([]);
   const [question, setQuestion] = useState("");
+  const [pendingQuestion, setPendingQuestion] = useState("");
   const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("Balanced");
   const [selectedArtifactId, setSelectedArtifactId] = useState("");
   const [audioOptions, setAudioOptions] = useState<AudioOverviewOptions>(defaultAudioOverviewOptions);
@@ -651,6 +664,10 @@ export default function App() {
   const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
+  const [isNotepadOpen, setIsNotepadOpen] = useState(false);
+  const [noteTitle, setNoteTitle] = useState("");
+  const [noteBody, setNoteBody] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
   const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail">("");
   const [thumbnailPrompt, setThumbnailPrompt] = useState("");
   const [thumbnailRefs, setThumbnailRefs] = useState<string[]>([]);
@@ -1012,6 +1029,44 @@ export default function App() {
     }
   }
 
+  function openNotepad() {
+    setNoteTitle("");
+    setNoteBody("");
+    setIsNotepadOpen(true);
+  }
+
+  async function handleSaveNote() {
+    if (!notebook) return;
+    const body = noteBody.trim();
+    if (!body) {
+      setError("Write something in the note before saving it as a source.");
+      return;
+    }
+    setNoteSaving(true);
+    setError("");
+    try {
+      const response = await api<{ source: Source }>(`/api/notebooks/${notebook.id}/sources`, {
+        method: "POST",
+        body: JSON.stringify({
+          type: "note",
+          title: noteTitle.trim() || "Note",
+          body,
+          active: true,
+        }),
+      });
+      setActiveSourceId(response.source.id);
+      setIsNotepadOpen(false);
+      setNoteTitle("");
+      setNoteBody("");
+      setToast("Note saved to sources.");
+      await refreshNotebook();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Could not save the note.");
+    } finally {
+      setNoteSaving(false);
+    }
+  }
+
   async function handleSourceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!notebook) return;
@@ -1116,10 +1171,13 @@ export default function App() {
   }
 
   async function askQuestion(input = question) {
-    if (!notebook || !input.trim()) return;
+    const trimmed = input.trim();
+    if (!notebook || !trimmed) return;
     setIsAsking(true);
     setError("");
     setQuestion("");
+    // Show the user's message on the right immediately (optimistic), before the answer returns.
+    setPendingQuestion(trimmed);
     try {
       const response = await api<{
         message: ChatMessage;
@@ -1128,12 +1186,16 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({
           notebook_id: notebook.id,
-          question: input,
+          question: trimmed,
           answer_style: answerStyle,
           chat_goal: "Source-only mode. Cite every factual claim.",
         }),
       });
-      await refreshNotebook();
+      // Load the fresh notebook, then swap in the persisted messages and drop the optimistic
+      // copy in the same render so the user's bubble never flashes twice.
+      const fresh = await loadNotebook(notebook.id);
+      setNotebook((current) => (current?.id === fresh.id ? fresh : current));
+      setPendingQuestion("");
       const firstCitation = response.message.citations?.[0];
       if (firstCitation) focusCitation(firstCitation);
       setToast(
@@ -1143,6 +1205,10 @@ export default function App() {
       );
       refreshDebugSilently();
     } catch (chatError) {
+      // On failure nothing was saved server-side: clear the optimistic bubble and
+      // restore the text to the input so the user doesn't lose it.
+      setPendingQuestion("");
+      setQuestion(trimmed);
       setError(messageFromError(chatError));
     } finally {
       setIsAsking(false);
@@ -1549,6 +1615,10 @@ export default function App() {
               <Plus size={16} />
               Add sources
             </button>
+            <button className="ghost-button new-note-button" type="button" onClick={() => openNotepad()}>
+              <NotebookPen size={15} />
+              New note
+            </button>
           </div>
 
           {sourceCount ? (
@@ -1650,6 +1720,13 @@ export default function App() {
                   <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
                 ))
             )}
+            {pendingQuestion ? (
+              <ChatBubble
+                key="pending-question"
+                message={{ id: "pending-question", role: "user", content: pendingQuestion, created_at: "", citations: [] }}
+                onCitationClick={focusCitation}
+              />
+            ) : null}
             {isAsking ? <ThinkingBubble topic={notebook?.title || ""} /> : null}
           </div>
 
@@ -2178,13 +2255,64 @@ export default function App() {
         </div>
       ) : null}
 
+      {isNotepadOpen ? (
+        <div className="notepad-backdrop" role="presentation" onClick={() => setIsNotepadOpen(false)}>
+          <section
+            className="notepad-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Note editor"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="notepad-header">
+              <div className="notepad-breadcrumb">
+                <NotebookPen size={15} />
+                <span>Studio</span>
+                <ChevronRight size={13} />
+                <span>Note</span>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsNotepadOpen(false)} aria-label="Close note">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <input
+              className="notepad-title"
+              value={noteTitle}
+              onChange={(event) => setNoteTitle(event.target.value)}
+              placeholder="Untitled note"
+              aria-label="Note title"
+            />
+            <textarea
+              className="notepad-body"
+              value={noteBody}
+              onChange={(event) => setNoteBody(event.target.value)}
+              placeholder="Write your note here. Save it to make it a grounded source the assistant and Studio can use."
+              aria-label="Note body"
+              autoFocus
+            />
+            <div className="notepad-footer">
+              <span className="notepad-hint">{noteBody.trim() ? `${noteBody.trim().split(/\s+/).length} words` : "Notes become source-grounded once saved"}</span>
+              <div className="notepad-actions">
+                <button type="button" className="secondary-button" onClick={() => setIsNotepadOpen(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="primary-button" disabled={noteSaving || !noteBody.trim()} onClick={() => void handleSaveNote()}>
+                  {noteSaving ? "Saving…" : "Save to sources"}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {isArtifactDetailOpen ? (
         <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsArtifactDetailOpen(false)}>
           <section className="modal artifact-modal" role="dialog" aria-modal="true" aria-label="Artifact preview" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <div>
                 <p className="panel-eyebrow">Studio artifact</p>
-                <h2>{selectedArtifact?.title || "Artifact preview"}</h2>
+                <h2>{artifactTypeLabel(selectedArtifact?.type)}</h2>
+                {selectedArtifact ? <p className="artifact-subhead">{artifactSubhead(selectedArtifact)}</p> : null}
               </div>
               <button className="icon-button subtle" type="button" onClick={() => setIsArtifactDetailOpen(false)} aria-label="Close artifact preview">
                 <XCircle size={17} />
@@ -3370,7 +3498,6 @@ function ArtifactPreview({
       {artifact.type !== "quiz" ? (
       <div className="artifact-preview-top">
         <div>
-          <p>{artifact.type}</p>
           <h3>{artifact.title}</h3>
         </div>
         <div className="artifact-downloads">
@@ -3550,6 +3677,7 @@ function ArtifactPayload({
       <MindMapPreview
         nodes={payload.nodes as MindMapNode[]}
         edges={payload.edges as MindMapEdge[]}
+        title={artifact.title || (typeof payload.title === "string" ? payload.title : "Mind map")}
         onCitationClick={onCitationClick}
       />
     );
@@ -3588,7 +3716,13 @@ function ArtifactPayload({
   }
   if (Array.isArray(payload.slides)) {
     return (
-      <SlideDeckPreview slides={payload.slides as SlidePayload[]} onCitationClick={onCitationClick} />
+      <SlideDeckPreview
+        slides={payload.slides as SlidePayload[]}
+        title={artifact.title}
+        onCitationClick={onCitationClick}
+        onToast={onToast}
+        onError={onError}
+      />
     );
   }
   if (Array.isArray(payload.transcript)) {
@@ -3656,67 +3790,625 @@ function ArtifactPayload({
   return <pre className="artifact-json">{JSON.stringify(payload, null, 2)}</pre>;
 }
 
+// ---------------------------------------------------------------------------
+// Interactive mind map (NotebookLM-style): a collapsible horizontal tree drawn
+// in SVG. Branches unfold on click, the canvas pans/zooms, and leaves stay
+// grounded — clicking one opens its source. The deterministic/LLM payload is a
+// nodes+edges graph; we rebuild the hierarchy here and lay it out tidily.
+// ---------------------------------------------------------------------------
+
+interface MMLaidNode {
+  id: string;
+  label: string;
+  type: string;
+  depth: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  lines: string[];
+  hasChildren: boolean;
+  expanded: boolean;
+  refs: Record<string, unknown>[];
+}
+
+interface MMLink {
+  id: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+interface MMLayout {
+  nodes: MMLaidNode[];
+  links: MMLink[];
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
+  rootId: string;
+}
+
+const MM_FONT = '600 14px "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif';
+const MM_TEXT_FONT_FAMILY = '"Inter", ui-sans-serif, system-ui, -apple-system, sans-serif';
+const MM_PAD_X = 15;
+const MM_PAD_Y = 11;
+const MM_LINE_H = 18;
+const MM_MAX_TEXT = 168;
+const MM_MIN_W = 116;
+const MM_H_GAP = 78;
+const MM_V_GAP = 14;
+const MM_TOGGLE_R = 11;
+const MM_TOGGLE_OFF = 18;
+
+let mmMeasureCtx: CanvasRenderingContext2D | null = null;
+function mmMeasure(text: string): number {
+  if (mmMeasureCtx === null) {
+    const canvas = typeof document !== "undefined" ? document.createElement("canvas") : null;
+    mmMeasureCtx = canvas ? canvas.getContext("2d") : null;
+    if (mmMeasureCtx) mmMeasureCtx.font = MM_FONT;
+  }
+  if (!mmMeasureCtx) return text.length * 7.7;
+  return mmMeasureCtx.measureText(text).width;
+}
+
+function mmTrimToWidth(line: string): string {
+  let trimmed = line;
+  while (trimmed.length > 1 && mmMeasure(trimmed) > MM_MAX_TEXT) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  return trimmed;
+}
+
+function mmWrap(label: string): string[] {
+  const text = String(label || "Node").replace(/\s+/g, " ").trim() || "Node";
+  if (mmMeasure(text) <= MM_MAX_TEXT) return [text];
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (mmMeasure(candidate) <= MM_MAX_TEXT || !current) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = word;
+      if (lines.length === 3) {
+        lines[2] = mmTrimToWidth(`${lines[2]} …`);
+        return lines;
+      }
+    }
+  }
+  if (current) lines.push(current);
+  if (lines.length > 3) {
+    const kept = lines.slice(0, 3);
+    kept[2] = mmTrimToWidth(`${kept[2]} …`);
+    return kept;
+  }
+  return lines.map((line) => (mmMeasure(line) > MM_MAX_TEXT ? mmTrimToWidth(line) : line));
+}
+
+function mmFindRoot(nodes: MindMapNode[], edges: MindMapEdge[]): string {
+  const ids = new Set(nodes.filter((node) => node && node.id).map((node) => node.id as string));
+  if (ids.has("center")) return "center";
+  const notebook = nodes.find((node) => node && node.id && (node.type === "notebook" || node.type === "root"));
+  if (notebook?.id) return notebook.id;
+  const hasParent = new Set<string>();
+  for (const edge of edges) {
+    if (!edge || !edge.source || !edge.target) continue;
+    if (edge.source === edge.target) continue;
+    if (ids.has(edge.source) && ids.has(edge.target)) hasParent.add(edge.target);
+  }
+  const orphan = nodes.find((node) => node && node.id && !hasParent.has(node.id));
+  return orphan?.id || nodes[0]?.id || "";
+}
+
+function mmRefs(refs: unknown): Record<string, unknown>[] {
+  if (Array.isArray(refs)) return refs.filter(Boolean) as Record<string, unknown>[];
+  if (refs && typeof refs === "object") return [refs as Record<string, unknown>];
+  return [];
+}
+
+function mmBuildLayout(nodes: MindMapNode[], edges: MindMapEdge[], expanded: Set<string>): MMLayout {
+  // NB: `Map` is imported from lucide-react (an icon) in this module and shadows
+  // the global Map constructor, so reach for it via globalThis.
+  const byId = new globalThis.Map<string, MindMapNode>();
+  for (const node of nodes) if (node && node.id) byId.set(node.id, node);
+
+  const childMap = new globalThis.Map<string, string[]>();
+  for (const edge of edges) {
+    if (!edge || !edge.source || !edge.target) continue;
+    if (edge.source === edge.target || !byId.has(edge.source) || !byId.has(edge.target)) continue;
+    const arr = childMap.get(edge.source) || [];
+    if (!arr.includes(edge.target)) arr.push(edge.target);
+    childMap.set(edge.source, arr);
+  }
+
+  const rootId = mmFindRoot(nodes, edges);
+  const laid: MMLaidNode[] = [];
+  const visited = new Set<string>();
+  let cursorY = 0;
+
+  const measure = (node: MindMapNode) => {
+    const lines = mmWrap(node.label || "Node");
+    let maxLine = 0;
+    for (const line of lines) maxLine = Math.max(maxLine, mmMeasure(line));
+    const width = Math.min(MM_MAX_TEXT + MM_PAD_X * 2, Math.max(MM_MIN_W, Math.round(maxLine + MM_PAD_X * 2)));
+    const height = Math.max(42, lines.length * MM_LINE_H + MM_PAD_Y * 2);
+    return { lines, width, height };
+  };
+
+  const walk = (id: string, depth: number, x: number): MMLaidNode | null => {
+    if (visited.has(id)) return null;
+    const node = byId.get(id);
+    if (!node) return null;
+    visited.add(id);
+    const { lines, width, height } = measure(node);
+    const childIds = (childMap.get(id) || []).filter((cid) => byId.has(cid) && !visited.has(cid));
+    const hasChildren = childIds.length > 0;
+    const isExpanded = expanded.has(id);
+    const laidNode: MMLaidNode = {
+      id,
+      label: node.label || "Node",
+      type: node.type || "node",
+      depth,
+      x,
+      y: 0,
+      width,
+      height,
+      lines,
+      hasChildren,
+      expanded: isExpanded,
+      refs: mmRefs(node.source_refs),
+    };
+    laid.push(laidNode);
+    if (hasChildren && isExpanded) {
+      const childX = x + width + MM_H_GAP;
+      const children: MMLaidNode[] = [];
+      for (const cid of childIds) {
+        const child = walk(cid, depth + 1, childX);
+        if (child) children.push(child);
+      }
+      if (children.length) {
+        laidNode.y = (children[0].y + children[children.length - 1].y) / 2;
+      } else {
+        laidNode.y = cursorY + height / 2;
+        cursorY += height + MM_V_GAP;
+      }
+    } else {
+      laidNode.y = cursorY + height / 2;
+      cursorY += height + MM_V_GAP;
+    }
+    return laidNode;
+  };
+
+  if (rootId) walk(rootId, 0, 0);
+
+  const laidById = new globalThis.Map(laid.map((node) => [node.id, node] as [string, MMLaidNode]));
+  const links: MMLink[] = [];
+  for (const parent of laid) {
+    if (!parent.expanded) continue;
+    for (const cid of childMap.get(parent.id) || []) {
+      const child = laidById.get(cid);
+      if (!child) continue;
+      const startX = parent.x + parent.width + MM_TOGGLE_OFF + MM_TOGGLE_R;
+      links.push({ id: `${parent.id}->${cid}`, x1: startX, y1: parent.y, x2: child.x, y2: child.y });
+    }
+  }
+
+  const bbox = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  if (laid.length) {
+    bbox.minX = Math.min(...laid.map((node) => node.x));
+    bbox.minY = Math.min(...laid.map((node) => node.y - node.height / 2));
+    bbox.maxX = Math.max(...laid.map((node) => node.x + node.width + (node.hasChildren ? MM_TOGGLE_OFF + MM_TOGGLE_R : 0)));
+    bbox.maxY = Math.max(...laid.map((node) => node.y + node.height / 2));
+  }
+  return { nodes: laid, links, bbox, rootId };
+}
+
+function mmComputeFit(
+  bbox: MMLayout["bbox"],
+  size: { w: number; h: number },
+): { scale: number; tx: number; ty: number } {
+  const contentW = Math.max(1, bbox.maxX - bbox.minX);
+  const contentH = Math.max(1, bbox.maxY - bbox.minY);
+  const padX = 48;
+  const padY = 36;
+  const scale = Math.max(0.35, Math.min(1.1, Math.min((size.w - padX * 2) / contentW, (size.h - padY * 2) / contentH)));
+  const tx = padX - bbox.minX * scale;
+  const ty = (size.h - contentH * scale) / 2 - bbox.minY * scale;
+  return { scale, tx, ty };
+}
+
+function mmChevron(cx: number, cy: number, expanded: boolean): string {
+  const dx = 2.6;
+  const dy = 4.2;
+  return expanded
+    ? `M ${cx + dx} ${cy - dy} L ${cx - dx} ${cy} L ${cx + dx} ${cy + dy}`
+    : `M ${cx - dx} ${cy - dy} L ${cx + dx} ${cy} L ${cx - dx} ${cy + dy}`;
+}
+
+function mmLinkPath(link: MMLink): string {
+  const mx = (link.x1 + link.x2) / 2;
+  return `M ${link.x1} ${link.y1} C ${mx} ${link.y1}, ${mx} ${link.y2}, ${link.x2} ${link.y2}`;
+}
+
+function mmPalette(depth: number, type: string): { fill: string; stroke: string; text: string } {
+  if (depth === 0 || type === "notebook" || type === "root") {
+    return { fill: "#2b3550", stroke: "#5b6aa6", text: "#eef1ff" };
+  }
+  if (depth === 1 || type === "topic") {
+    return { fill: "#222b38", stroke: "#3c4a5d", text: "#e8edf4" };
+  }
+  return { fill: "#163528", stroke: "#2f7d54", text: "#daf4e7" };
+}
+
+function mmTypeLabel(type: string): string {
+  const map: Record<string, string> = {
+    notebook: "Notebook",
+    root: "Notebook",
+    topic: "Category",
+    subtopic: "Subtopic",
+    claim: "Evidence",
+    entity: "Entity",
+    question: "Question",
+  };
+  return map[type] || "Node";
+}
+
+function MindMapNodeView({
+  node,
+  selected,
+  onActivate,
+}: {
+  node: MMLaidNode;
+  selected: boolean;
+  onActivate: () => void;
+}) {
+  const palette = mmPalette(node.depth, node.type);
+  const top = node.y - node.height / 2;
+  const cx = node.x + node.width / 2;
+  const firstLineY = node.y - ((node.lines.length - 1) * MM_LINE_H) / 2;
+  const toggleCx = node.x + node.width + MM_TOGGLE_OFF;
+  const onKeyDown = (event: ReactKeyboardEvent<SVGGElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onActivate();
+    }
+  };
+  return (
+    <g
+      className="mm-node"
+      role="button"
+      tabIndex={0}
+      aria-label={`${mmTypeLabel(node.type)}: ${node.label}${node.hasChildren ? (node.expanded ? " (expanded)" : " (collapsed)") : ""}`}
+      onClick={onActivate}
+      onKeyDown={onKeyDown}
+    >
+      <rect
+        x={node.x}
+        y={top}
+        width={node.width}
+        height={node.height}
+        rx={11}
+        ry={11}
+        fill={palette.fill}
+        stroke={selected ? "#16d07a" : palette.stroke}
+        strokeWidth={selected ? 2.2 : 1.3}
+      />
+      {node.lines.map((line, index) => (
+        <text
+          key={index}
+          x={cx}
+          y={firstLineY + index * MM_LINE_H}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontFamily={MM_TEXT_FONT_FAMILY}
+          fontSize={14}
+          fontWeight={600}
+          fill={palette.text}
+        >
+          {line}
+        </text>
+      ))}
+      {node.hasChildren ? (
+        <g>
+          <circle cx={toggleCx} cy={node.y} r={MM_TOGGLE_R} fill="#0f161e" stroke={palette.stroke} strokeWidth={1.2} />
+          <path
+            d={mmChevron(toggleCx, node.y, node.expanded)}
+            fill="none"
+            stroke="#aeb9c7"
+            strokeWidth={1.8}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </g>
+      ) : null}
+    </g>
+  );
+}
+
 function MindMapPreview({
   nodes,
   edges,
+  title,
   onCitationClick,
 }: {
   nodes: MindMapNode[];
   edges: MindMapEdge[];
+  title?: string;
   onCitationClick: (citation: Citation) => void;
 }) {
-  const [selectedId, setSelectedId] = useState(nodes[0]?.id || "center");
-  const selected = nodes.find((node) => node.id === selectedId) || nodes[0];
-  const connectedEdges = edges.filter((edge) => edge.source === selected?.id || edge.target === selected?.id);
-  const connectedNodes = connectedEdges
-    .map((edge) => nodes.find((node) => node.id === (edge.source === selected?.id ? edge.target : edge.source)))
-    .filter((node): node is MindMapNode => Boolean(node));
-  const sourceRef = selected?.source_refs?.[0];
+  const rootId = useMemo(() => mmFindRoot(nodes, edges), [nodes, edges]);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(rootId ? [rootId] : []));
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [view, setView] = useState({ scale: 1, tx: 48, ty: 48 });
+  const [size, setSize] = useState({ w: 880, h: 480 });
+  const containerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const contentRef = useRef<SVGGElement>(null);
+  const didFit = useRef(false);
+  const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
+
+  const layout = useMemo(() => mmBuildLayout(nodes, edges, expanded), [nodes, edges, expanded]);
+
+  // Always keep the central root open so there is something to unfold from.
+  useEffect(() => {
+    if (!rootId) return;
+    setExpanded((prev) => {
+      if (prev.has(rootId)) return prev;
+      const next = new Set(prev);
+      next.add(rootId);
+      return next;
+    });
+  }, [rootId]);
+
+  // Track the canvas size for fit-to-view, panning, and the viewBox.
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    const update = () => setSize({ w: element.clientWidth || 880, h: element.clientHeight || 480 });
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  // Fit the initial (compact) tree once, then leave the view under user control.
+  useEffect(() => {
+    if (didFit.current) return;
+    if (!layout.nodes.length || size.w <= 1) return;
+    setView(mmComputeFit(layout.bbox, size));
+    didFit.current = true;
+  }, [layout, size]);
+
+  const selectedNode = layout.nodes.find((node) => node.id === selectedId) || null;
+
+  const toggle = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const activateNode = (node: MMLaidNode) => {
+    setSelectedId(node.id);
+    if (node.hasChildren) {
+      toggle(node.id);
+      return;
+    }
+    const ref = node.refs[0];
+    if (ref) onCitationClick(citationFromSourceRef(ref, node.label));
+  };
+
+  const zoomAround = (factor: number, cx: number, cy: number) => {
+    setView((prev) => {
+      const scale = Math.max(0.35, Math.min(2.2, prev.scale * factor));
+      const k = scale / prev.scale;
+      return { scale, tx: cx - (cx - prev.tx) * k, ty: cy - (cy - prev.ty) * k };
+    });
+  };
+
+  const onWheel = (event: ReactWheelEvent<SVGSVGElement>) => {
+    event.preventDefault();
+    const rect = svgRef.current?.getBoundingClientRect();
+    const cx = rect ? event.clientX - rect.left : size.w / 2;
+    const cy = rect ? event.clientY - rect.top : size.h / 2;
+    zoomAround(event.deltaY < 0 ? 1.12 : 1 / 1.12, cx, cy);
+  };
+
+  const onPanDown = (event: ReactPointerEvent<SVGRectElement>) => {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    drag.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty };
+  };
+  const onPanMove = (event: ReactPointerEvent<SVGRectElement>) => {
+    const start = drag.current;
+    if (!start) return;
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    setView((prev) => ({ ...prev, tx: start.tx + dx, ty: start.ty + dy }));
+  };
+  const onPanUp = () => {
+    drag.current = null;
+  };
+
+  const fitView = () => setView(mmComputeFit(layout.bbox, size));
+
+  const downloadPng = () => {
+    const group = contentRef.current;
+    if (!group) return;
+    const { minX, minY, maxX, maxY } = layout.bbox;
+    const pad = 44;
+    const width = Math.max(1, Math.round(maxX - minX + pad * 2));
+    const height = Math.max(1, Math.round(maxY - minY + pad * 2));
+    const clone = group.cloneNode(true) as SVGGElement;
+    clone.setAttribute("transform", `translate(${pad - minX} ${pad - minY})`);
+    const serialized = new XMLSerializer().serializeToString(clone);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="${width}" height="${height}" fill="#0d141c"/>${serialized}</svg>`;
+    rasterizeSvg(svg, Math.min(2600, width * 2))
+      .then(({ dataUrl }) => {
+        const anchor = document.createElement("a");
+        anchor.href = dataUrl;
+        anchor.download = `${downloadSlug(title || "mind-map")}.png`;
+        anchor.click();
+      })
+      .catch(() => {});
+  };
 
   return (
-    <div className="mindmap-interactive">
-      <div className="mindmap-node-list">
-        {nodes.slice(0, 14).map((node, index) => (
-          <button
-            key={node.id || index}
-            type="button"
-            data-selected={(node.id || "") === selectedId}
-            onClick={() => setSelectedId(node.id || "")}
+    <div className="mm-wrap">
+      <div className="mm-canvas" ref={containerRef}>
+        {layout.nodes.length ? (
+          <svg
+            ref={svgRef}
+            className="mm-svg"
+            width="100%"
+            height="100%"
+            viewBox={`0 0 ${size.w} ${size.h}`}
+            onWheel={onWheel}
+            role="img"
+            aria-label={`Mind map: ${title || "Notebook"}`}
           >
-            <span>{node.type || "node"}</span>
-            <strong>{node.label || "Node"}</strong>
+            <rect
+              className="mm-pan"
+              x={0}
+              y={0}
+              width={size.w}
+              height={size.h}
+              fill="transparent"
+              onPointerDown={onPanDown}
+              onPointerMove={onPanMove}
+              onPointerUp={onPanUp}
+              onPointerCancel={onPanUp}
+            />
+            <g ref={contentRef} transform={`translate(${view.tx} ${view.ty}) scale(${view.scale})`}>
+              {layout.links.map((link) => (
+                <path key={link.id} d={mmLinkPath(link)} fill="none" stroke="#3c4a5e" strokeWidth={1.6} strokeOpacity={0.92} />
+              ))}
+              {layout.nodes.map((node) => (
+                <MindMapNodeView
+                  key={node.id}
+                  node={node}
+                  selected={node.id === selectedId}
+                  onActivate={() => activateNode(node)}
+                />
+              ))}
+            </g>
+          </svg>
+        ) : (
+          <div className="mm-empty">No mind map nodes are available for this notebook yet.</div>
+        )}
+        <div className="mm-controls">
+          <button type="button" className="mm-control-btn" onClick={() => zoomAround(1.18, size.w / 2, size.h / 2)} aria-label="Zoom in">
+            <Plus size={16} />
           </button>
-        ))}
+          <button type="button" className="mm-control-btn" onClick={() => zoomAround(1 / 1.18, size.w / 2, size.h / 2)} aria-label="Zoom out">
+            <Minus size={16} />
+          </button>
+          <button type="button" className="mm-control-btn" onClick={fitView} aria-label="Fit mind map to view">
+            <Maximize2 size={15} />
+          </button>
+          <button type="button" className="mm-control-btn" onClick={downloadPng} aria-label="Download mind map as PNG">
+            <Download size={15} />
+          </button>
+        </div>
+        <div className="mm-hint">Click a branch to unfold · drag to pan · scroll to zoom</div>
       </div>
-      {selected ? (
-        <article className="mindmap-detail">
-          <span>{selected.type || "node"}</span>
-          <strong>{selected.label || "Node"}</strong>
-          {connectedNodes.length ? (
-            <p>{connectedNodes.slice(0, 5).map((node) => node.label || "Node").join(" · ")}</p>
-          ) : (
-            <p>No connected child nodes in this artifact.</p>
-          )}
-          {sourceRef ? (
-            <button type="button" onClick={() => onCitationClick(citationFromSourceRef(sourceRef, selected.label || "Mind map evidence"))}>
-              <ShieldCheck size={15} />
+      {selectedNode ? (
+        <article className="mm-detail">
+          <span className="mm-detail-type">{mmTypeLabel(selectedNode.type)}</span>
+          <strong>{selectedNode.label}</strong>
+          {selectedNode.refs[0] ? (
+            <button
+              type="button"
+              className="mm-source-btn"
+              onClick={() => onCitationClick(citationFromSourceRef(selectedNode.refs[0], selectedNode.label))}
+            >
+              <ShieldCheck size={14} />
               Open source
             </button>
-          ) : null}
+          ) : selectedNode.hasChildren ? (
+            <span className="mm-detail-meta">{selectedNode.expanded ? "Branches expanded — click to collapse." : "Click to unfold its branches."}</span>
+          ) : (
+            <span className="mm-detail-meta">Leaf node.</span>
+          )}
         </article>
       ) : null}
     </div>
   );
 }
 
+// Rasterize an SVG string to a PNG data URL via an offscreen canvas (for PNG/PDF export).
+function rasterizeSvg(svgMarkup: string, width = 1600): Promise<{ dataUrl: string; width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const svgBlob = new Blob([svgMarkup], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(svgBlob);
+    const img = new window.Image();
+    img.onload = () => {
+      const ratio = img.height && img.width ? img.height / img.width : 0.5625;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = Math.round(width * ratio);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        URL.revokeObjectURL(url);
+        reject(new Error("Canvas unavailable"));
+        return;
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve({ dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not render SVG"));
+    };
+    img.src = url;
+  });
+}
+
+async function downloadSlideDeckPdf(slides: SlidePayload[], title: string) {
+  const withSvg = slides.filter((slide) => slide.svg_markup);
+  if (!withSvg.length) return;
+  const { jsPDF } = await import("jspdf");
+  const pdf = new jsPDF({ orientation: "landscape", unit: "px", format: [1280, 720], compress: true });
+  for (let index = 0; index < withSvg.length; index += 1) {
+    const { dataUrl } = await rasterizeSvg(withSvg[index].svg_markup as string, 1920);
+    if (index > 0) pdf.addPage([1280, 720], "landscape");
+    pdf.addImage(dataUrl, "PNG", 0, 0, 1280, 720);
+  }
+  pdf.save(`${downloadSlug(title || "slide-deck")}.pdf`);
+}
+
+async function downloadSvgAsPng(svgMarkup: string, fileName: string) {
+  const { dataUrl } = await rasterizeSvg(svgMarkup, 1920);
+  const link = document.createElement("a");
+  link.href = dataUrl;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 function SlideDeckPreview({
   slides,
+  title,
   onCitationClick,
+  onToast,
+  onError,
 }: {
   slides: SlidePayload[];
+  title: string;
   onCitationClick: (citation: Citation) => void;
+  onToast: (message: string) => void;
+  onError: (message: string) => void;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [exporting, setExporting] = useState<"" | "pdf" | "png">("");
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [slides.length, title]);
   const activeSlide = slides[Math.min(activeIndex, Math.max(0, slides.length - 1))];
   if (!activeSlide) {
     return (
@@ -3728,38 +4420,63 @@ function SlideDeckPreview({
       </div>
     );
   }
+  const svg = activeSlide.svg_markup || "";
+  const svgSrc = svg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}` : "";
+  const hasRenderedDeck = slides.some((slide) => slide.svg_markup);
+
+  const runExport = async (kind: "pdf" | "png") => {
+    setExporting(kind);
+    try {
+      if (kind === "pdf") {
+        await downloadSlideDeckPdf(slides, title);
+        onToast("Slide deck PDF downloaded.");
+      } else {
+        await downloadSvgAsPng(svg, `${downloadSlug(title || "slide")}-${activeIndex + 1}.png`);
+        onToast("Slide PNG downloaded.");
+      }
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      setExporting("");
+    }
+  };
 
   return (
     <div className="slide-preview">
-      <div className="slide-stage">
-        <span>{activeSlide.layout_type || "slide"} · {activeIndex + 1}/{slides.length}</span>
-        <h4>{activeSlide.title}</h4>
-        {activeSlide.subtitle ? <p>{activeSlide.subtitle}</p> : null}
-        <ul>
-          {(activeSlide.bullets || []).slice(0, 5).map((bullet, index) => (
-            <li key={`${bullet}-${index}`}>{bullet}</li>
-          ))}
-        </ul>
-      </div>
-      <div className="slide-notes">
-        {activeSlide.visual_suggestion ? <p><strong>Visual</strong>{activeSlide.visual_suggestion}</p> : null}
-        {activeSlide.speaker_notes ? <p><strong>Notes</strong>{activeSlide.speaker_notes}</p> : null}
-        {activeSlide.citations?.length ? (
-          <div className="slide-citations">
-            {activeSlide.citations.slice(0, 4).map((citation, index) => (
-              <button key={citation.evidence_id || index} type="button" onClick={() => onCitationClick(citation)}>
-                [{citation.index || index + 1}] {citation.source_title || citation.sourceTitle || "Source"}
-              </button>
+      {svgSrc ? (
+        <figure className="slide-frame">
+          <img src={svgSrc} alt={activeSlide.title || `Slide ${activeIndex + 1}`} />
+        </figure>
+      ) : (
+        <div className="slide-stage">
+          <span>{activeSlide.layout_type || "slide"} · {activeIndex + 1}/{slides.length}</span>
+          <h4>{activeSlide.title}</h4>
+          {activeSlide.subtitle ? <p>{activeSlide.subtitle}</p> : null}
+          <ul>
+            {(activeSlide.bullets || []).slice(0, 5).map((bullet, index) => (
+              <li key={`${bullet}-${index}`}>{bullet}</li>
             ))}
-          </div>
-        ) : null}
-      </div>
+          </ul>
+        </div>
+      )}
+
+      {hasRenderedDeck ? (
+        <div className="slide-export">
+          <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("pdf")}>
+            <Download size={14} /> {exporting === "pdf" ? "Building PDF…" : "Download deck (PDF)"}
+          </button>
+          <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("png")}>
+            <Download size={14} /> {exporting === "png" ? "Saving…" : "This slide (PNG)"}
+          </button>
+        </div>
+      ) : null}
+
       <div className="slide-controls">
         <button type="button" onClick={() => setActiveIndex((index) => Math.max(0, index - 1))} disabled={activeIndex === 0}>
           Previous
         </button>
         <div>
-          {slides.slice(0, 10).map((slide, index) => (
+          {slides.slice(0, 16).map((slide, index) => (
             <button
               key={`${slide.title}-${index}`}
               type="button"
@@ -3774,6 +4491,19 @@ function SlideDeckPreview({
         <button type="button" onClick={() => setActiveIndex((index) => Math.min(slides.length - 1, index + 1))} disabled={activeIndex >= slides.length - 1}>
           Next
         </button>
+      </div>
+
+      <div className="slide-notes">
+        {activeSlide.speaker_notes ? <p><strong>Speaker notes</strong>{activeSlide.speaker_notes}</p> : null}
+        {activeSlide.citations?.length ? (
+          <div className="slide-citations">
+            {activeSlide.citations.slice(0, 4).map((citation, index) => (
+              <button key={citation.evidence_id || index} type="button" onClick={() => onCitationClick(citation)}>
+                [{citation.index || index + 1}] {citation.source_title || citation.sourceTitle || "Source"}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -4622,6 +5352,51 @@ async function fileToBase64(file: File) {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+const ARTIFACT_TYPE_LABELS: Record<string, string> = {
+  "youtube-kit": "Title & Description",
+  thumbnail: "Thumbnail",
+  audio: "Audio Overview",
+  "slide-deck": "Slide Deck",
+  video: "Video Overview",
+  mindmap: "Mind Map",
+  report: "Report",
+  flashcards: "Flashcards",
+  quiz: "Quiz",
+  infographic: "Infographic",
+  "data-table": "Data Table",
+};
+
+function artifactTypeLabel(type?: string) {
+  if (!type) return "Artifact";
+  return ARTIFACT_TYPE_LABELS[type] || type.replace(/-/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function artifactSourceCount(artifact?: Artifact | null) {
+  if (!artifact) return 0;
+  const coverage = artifact.content_json?.source_coverage as { active_sources?: number } | undefined;
+  if (coverage?.active_sources) return coverage.active_sources;
+  const ids = new Set(
+    (artifact.source_refs_json || [])
+      .map((ref) => String((ref as Record<string, unknown>).source_id || ""))
+      .filter(Boolean),
+  );
+  return ids.size;
+}
+
+function formatArtifactTimestamp(iso?: string) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+function artifactSubhead(artifact?: Artifact | null) {
+  if (!artifact) return "";
+  const count = artifactSourceCount(artifact);
+  const stamp = formatArtifactTimestamp(artifact.created_at);
+  return [`${count} ${count === 1 ? "source" : "sources"}`, stamp].filter(Boolean).join(" · ");
 }
 
 function downloadText(fileName: string, text: string, mimeType = "application/json") {

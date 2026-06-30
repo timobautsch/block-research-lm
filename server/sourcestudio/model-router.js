@@ -77,6 +77,7 @@ export function createModelRouter({
     question,
     evidencePack,
     answerStyle,
+    history = [],
     startRun,
   }) {
     const selected = selectProvider("grounded_answer");
@@ -87,7 +88,7 @@ export function createModelRouter({
       return { answer, model_runs: [run], active_run: run };
     }
 
-    const prompt = buildGroundedAnswerPrompt({ question, evidencePack, answerStyle });
+    const prompt = buildGroundedAnswerPrompt({ question, evidencePack, answerStyle, history });
     const providerRun = startRun("grounded_answer", selected.provider, selected.model, prompt);
 
     try {
@@ -416,7 +417,7 @@ function normalizeAudioScript(rawPayload) {
   return AudioScriptSchema.parse(rawPayload);
 }
 
-function buildGroundedAnswerPrompt({ question, evidencePack, answerStyle }) {
+function buildGroundedAnswerPrompt({ question, evidencePack, answerStyle, history = [] }) {
   const compactEvidencePack = {
     user_question: question,
     answer_style: answerStyle,
@@ -430,18 +431,27 @@ function buildGroundedAnswerPrompt({ question, evidencePack, answerStyle }) {
       quote: item.quote,
     })),
   };
+  const conversation = (history || [])
+    .filter((turn) => turn && turn.content)
+    .slice(-6)
+    .map((turn) => `${turn.role === "assistant" ? "Assistant" : "User"}: ${String(turn.content).slice(0, 600)}`)
+    .join("\n");
   return [
-    "Answer the user question only from this Evidence Pack.",
+    "You are a grounded research assistant in a multi-turn chat. Answer the user's LATEST question only from this Evidence Pack.",
     "Return strict JSON matching this schema:",
     '{"abstained": boolean, "answer_markdown": string, "citations": [{"index": number, "evidence_id": "E1"}]}',
     "Rules:",
     "- Do not use general knowledge or unstated assumptions.",
+    "- Use the conversation history to resolve follow-ups, pronouns, and short references. A terse message like \"sicher?\", \"are you sure?\", \"why?\" or \"and the price?\" refers to your previous answer and its topic — interpret it that way.",
+    "- If the latest question asks you to confirm, double-check, or clarify your previous answer, do NOT abstain because it is short or meta. Re-verify the relevant facts against the Evidence Pack and answer (confirm or correct), with citations.",
+    "- Answer in the same language as the user's latest question.",
     "- Every factual sentence in answer_markdown must end with a citation like [1].",
     "- Citation indexes must map to the citations array.",
     "- citations[].evidence_id must be one of the provided evidence_id values.",
-    "- If the Evidence Pack is insufficient, set abstained true, use an abstention sentence, and return an empty citations array.",
+    "- Abstain (abstained true, empty citations) ONLY if the active sources genuinely do not support an answer to the user's underlying question — not merely because the latest message is short.",
     "- Do not invent source ids, block ids, citation ids, or quotes.",
     "",
+    conversation ? `Conversation so far (oldest to newest):\n${conversation}\n` : "",
     JSON.stringify(compactEvidencePack, null, 2),
   ].join("\n");
 }
@@ -482,24 +492,37 @@ function buildArtifactPrompt({ type, notebook, evidencePack, options, localPaylo
     "- Do not include a citations array; the server will attach canonical citations.",
     "",
     "Fallback schema example:",
-    JSON.stringify(localPayload, null, 2),
+    JSON.stringify(artifactExamplePayload(localPayload), null, 2),
     "",
     "Evidence Pack:",
     JSON.stringify(compactEvidencePack, null, 2),
   ].join("\n");
 }
 
+// The local payload is sent as a shape example, but it carries heavy/derived fields
+// (a full rendered SVG string, normalized text, dimensions) that bloat — and for the
+// infographic actively broke — the prompt. Strip them so the model sees a clean shape.
+function artifactExamplePayload(localPayload) {
+  if (!localPayload || typeof localPayload !== "object") return localPayload;
+  const clone = { ...localPayload };
+  for (const key of ["svg_markup", "citations", "renderer", "dimensions", "evidence_audit", "image_data"]) {
+    delete clone[key];
+  }
+  if (Array.isArray(clone.evidence_appendix)) clone.evidence_appendix = clone.evidence_appendix.slice(0, 3);
+  return clone;
+}
+
 function artifactShapeInstructions(type) {
   const instructions = {
     report: 'Report: {"title": string, "tldr": string[], "key_points": [{"text": string, "citation": "[1]"}], "detailed_sections": [{"heading": string, "body": string}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}',
-    mindmap: 'Mind map: {"title": string, "nodes": [{"id": string, "label": string, "type": "notebook|topic|entity|claim|question", "source_refs": []}], "edges": [{"id": string, "source": string, "target": string, "label": string}]}',
+    mindmap: 'Mind map (hierarchical, NotebookLM-style): {"title": string, "nodes": [{"id": string, "label": string (a SHORT noun phrase, 2-5 words, NO citation markers and NO full sentences), "type": "notebook|topic|subtopic|claim|entity", "source_refs": []}], "edges": [{"id": string, "source": string (parent id), "target": string (child id), "label": string}]}. Build a TREE, not a star: exactly ONE root node (type "notebook", the central subject); 4-7 first-level category nodes (type "topic") each connected FROM the root; under EACH category 3-6 child nodes (type "subtopic"|"claim"|"entity") connected FROM that category; optionally add a third level beneath the richest categories. Every non-root node must have exactly ONE parent edge so the graph forms a clean tree. Labels read like clickable topic chips ("Automated Grid Trading", "GDPR Compliance", "Architecture Layers") — never paragraphs and never with [n] markers.',
     flashcards: 'Flashcards: {"title": string, "cards": [{"question": string, "answer": string, "explanation": string, "difficulty": "easy|medium|hard", "tags": string[], "source_refs": []}]}',
     quiz: 'Quiz: {"title": string, "questions": [{"type": "multiple_choice", "question": string, "options": string[], "correct_index": number, "explanation": string, "difficulty": "easy|medium|hard", "source_refs": []}]}',
     "data-table": 'Data table: {"title": string, "columns": string[], "rows": [{"cells": object, "source_refs": []}]}',
-    "slide-deck": 'Slide deck: {"title": string, "deck_type": string, "slides": [{"title": string, "subtitle": string, "bullets": string[], "speaker_notes": string, "visual_suggestion": string, "layout_type": string}]}',
+    "slide-deck": 'Slide deck: {"title": string (concise deck title), "deck_type": string, "slides": [{"title": string (<= 7 words, the slide point), "subtitle": string (short framing, optional), "bullets": string[] (3-5 punchy bullets, each one idea + a [n] citation), "speaker_notes": string (2-3 sentences), "visual_suggestion": string (what to show), "layout_type": "title|section|content|comparison|closing"}]}. Make a real presentation: a title slide, several content slides, a closing slide. Bullets are short — not full paragraphs.',
     audio: 'Audio overview: {"title": string, "mode": string, "episode_format": string, "episode_outline": string[], "transcript": [{"host": "Host A|Host B", "text": string, "citations": []}]}',
     video: 'Video overview: {"title": string, "render_status": string, "storyboard": [{"scene": number, "title": string, "narration": string, "captions": string[], "visual": string}]}',
-    infographic: 'Infographic: {"title": string, "panels": [{"panel": number, "headline": string, "copy": string, "source_refs": []}]}',
+    infographic: 'Infographic: {"title": string (<= 9 words, the subject — NOT "X: Infographic"), "panels": [{"panel": number, "headline": string (<= 6 words, punchy and specific; NEVER prefixes like "Core Signal:"/"Workflow:"/"Risk:"), "copy": string (1-2 plain-language sentences ending with a [n] citation), "source_refs": []}], "key_stats": [{"value": string (a real number from the sources, e.g. "$4,449", "2017", "90 days", "56,800 USD"), "label": string (<= 4 words naming the stat)}]}. Provide 3 key_stats drawn from the most striking numbers in the evidence. Headlines must read like a designed infographic, not a database dump.',
   };
   return instructions[type] || 'Artifact: {"title": string, "panels": [{"panel": number, "headline": string, "copy": string, "source_refs": []}]}';
 }
@@ -535,7 +558,8 @@ function collectJsonStrings(value) {
 
 function artifactMaxTokens(type) {
   if (["report", "slide-deck", "audio", "video"].includes(type)) return 4096;
-  if (["mindmap", "quiz", "infographic", "data-table", "flashcards"].includes(type)) return 3200;
+  if (["infographic"].includes(type)) return 4096;
+  if (["mindmap", "quiz", "data-table", "flashcards"].includes(type)) return 3200;
   return 2400;
 }
 
