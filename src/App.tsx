@@ -249,6 +249,9 @@ interface QuizPayload {
 
 interface TableRowPayload {
   cells?: Record<string, unknown>;
+  cell_support?: Record<string, string>;
+  source_refs?: Array<Record<string, unknown>>;
+  support?: string;
 }
 
 interface SlidePayload {
@@ -523,7 +526,7 @@ const artifactTypes: Array<{
   { type: "thumbnail", title: "Thumbnail", action: "Image", icon: <Image size={18} /> },
   { type: "audio", title: "Audio Overview", action: "Script", icon: <AudioLines size={18} /> },
   { type: "slide-deck", title: "Slide Deck", action: "Slides", icon: <Presentation size={18} /> },
-  { type: "video", title: "Video Overview", action: "Storyboard", icon: <Video size={18} /> },
+  { type: "video", title: "Video Overview", action: "Render", icon: <Video size={18} /> },
   { type: "mindmap", title: "Mind Map", action: "Map", icon: <Map size={18} /> },
   { type: "report", title: "Reports", action: "Write", icon: <ClipboardList size={18} /> },
   { type: "flashcards", title: "Flashcards", action: "Cards", icon: <Layers3 size={18} /> },
@@ -3676,6 +3679,9 @@ function ArtifactPayload({
     return <QuizSession payload={payload} questions={payload.questions as QuizPayload[]} />;
   }
   if (Array.isArray(payload.rows)) {
+    if (artifact.type === "data-table") {
+      return <DataTablePreview artifact={artifact} payload={payload} rows={payload.rows as TableRowPayload[]} onCitationClick={onCitationClick} />;
+    }
     return (
       <div className="schema-table">
         {(payload.rows as TableRowPayload[]).slice(0, 6).map((row, index) => (
@@ -3756,18 +3762,176 @@ function ArtifactPayload({
     );
   }
   if (Array.isArray(payload.storyboard)) {
+    const videoUrl = typeof payload.video_url === "string" ? payload.video_url : "";
+    const videoStatus = typeof payload.video_status === "string" ? payload.video_status.replaceAll("_", " ") : "";
+    const renderStatus = typeof payload.render_status === "string" ? payload.render_status.replaceAll("_", " ") : "";
+    const duration = typeof payload.video_duration_seconds === "number" ? `${Math.round(payload.video_duration_seconds)}s` : "Pending";
+    const resolution = typeof payload.video_resolution === "string" ? payload.video_resolution : "1280x720";
+    const narration = typeof payload.video_narration_status === "string" ? payload.video_narration_status.replaceAll("_", " ") : "captioned";
+    const storyboard = payload.storyboard as StoryboardPayload[];
     return (
-      <div className="artifact-json">
-        {(payload.storyboard as StoryboardPayload[]).slice(0, 6).map((scene, index) => (
-          <article key={index}>
-            <strong>Scene {scene.scene}: {scene.title}</strong>
-            <p>{scene.narration}</p>
+      <div className="artifact-json video-artifact">
+        <article className="video-player-card">
+          <strong>Video rendering</strong>
+          <p>{videoUrl ? "MP4 rendered from the source-grounded storyboard." : String(payload.video_error || renderStatus || videoStatus || "Rendering video...")}</p>
+          {videoUrl ? <video controls preload="metadata" src={videoUrl} /> : (
+            <div className="video-empty">
+              <Video size={28} />
+              <span>{videoStatus || renderStatus || "Video not ready"}</span>
+            </div>
+          )}
+          {videoUrl ? <a className="video-download-link" href={videoUrl} download>Download video</a> : null}
+        </article>
+        <div className="video-meta-grid">
+          <article>
+            <strong>Format</strong>
+            <p>{resolution} · {duration} · MP4</p>
           </article>
-        ))}
+          <article>
+            <strong>Narration</strong>
+            <p>{narration}</p>
+          </article>
+        </div>
+        <div className="video-storyboard">
+          {storyboard.slice(0, 8).map((scene, index) => (
+            <article key={index}>
+              <strong>Scene {scene.scene}: {scene.title}</strong>
+              <p>{scene.narration}</p>
+            </article>
+          ))}
+        </div>
       </div>
     );
   }
   return <pre className="artifact-json">{JSON.stringify(payload, null, 2)}</pre>;
+}
+
+function DataTablePreview({
+  artifact,
+  payload,
+  rows,
+  onCitationClick,
+}: {
+  artifact: Artifact;
+  payload: Record<string, unknown>;
+  rows: TableRowPayload[];
+  onCitationClick: (citation: Citation) => void;
+}) {
+  const columns = dataTableColumns(payload, rows);
+  const sourceCount = new Set(
+    rows
+      .flatMap((row) => row.source_refs || [])
+      .map((ref) => String(ref.source_id || ""))
+      .filter(Boolean),
+  ).size;
+  const csv = () => {
+    const csvRows = [
+      columns,
+      ...rows.map((row) => columns.map((column) => dataTableCellText(row.cells?.[column]))),
+    ];
+    downloadText(`${downloadSlug(artifact.title)}.csv`, csvRows.map((row) => row.map(csvTextCell).join(",")).join("\n"), "text/csv");
+  };
+
+  return (
+    <div className="data-table-preview">
+      <div className="data-table-toolbar">
+        <div>
+          <span>{rows.length} rows</span>
+          <span>{columns.length} columns</span>
+          <span>{sourceCount || artifact.source_refs_json?.length || 0} sources</span>
+        </div>
+        <button type="button" onClick={csv} aria-label="Download data table CSV">
+          <Download size={14} />
+          CSV
+        </button>
+      </div>
+
+      <div className="data-table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th className="data-table-index" scope="col">#</th>
+              {columns.map((column) => (
+                <th key={column} scope="col">{column}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, rowIndex) => {
+              const refs = row.source_refs || [];
+              const rowCitation = refs[0] ? citationFromSourceRef(refs[0], `Row ${rowIndex + 1}`) : null;
+              return (
+                <tr key={rowIndex}>
+                  <td className="data-table-index">
+                    {rowCitation ? (
+                      <button type="button" onClick={() => onCitationClick(rowCitation)} aria-label={`Open source for row ${rowIndex + 1}`}>
+                        {rowIndex + 1}
+                      </button>
+                    ) : (
+                      rowIndex + 1
+                    )}
+                  </td>
+                  {columns.map((column) => {
+                    const rawValue = row.cells?.[column];
+                    const text = dataTableCellText(rawValue);
+                    const support = dataTableSupport(rawValue, row, column);
+                    const sourceRef = column.toLowerCase() === "source" && rowCitation;
+                    return (
+                      <td key={column} data-column={column}>
+                        {sourceRef ? (
+                          <button type="button" className="data-table-source-link" onClick={() => onCitationClick(sourceRef)}>
+                            {text || sourceRef.source_title}
+                          </button>
+                        ) : column.toLowerCase() === "support" ? (
+                          <span className="data-table-support" data-support={support || text}>{dataTableSupportLabel(support || text)}</span>
+                        ) : (
+                          <>
+                            <span>{text || "—"}</span>
+                            {support ? <span className="data-table-support" data-support={support}>{dataTableSupportLabel(support)}</span> : null}
+                          </>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function dataTableColumns(payload: Record<string, unknown>, rows: TableRowPayload[]) {
+  const payloadColumns = Array.isArray(payload.columns) ? payload.columns.map(String).filter(Boolean) : [];
+  const inferredColumns = rows.flatMap((row) => Object.keys(row.cells || {}));
+  return Array.from(new Set([...payloadColumns, ...inferredColumns]));
+}
+
+function dataTableCellText(value: unknown): string {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map(dataTableCellText).filter(Boolean).join(", ");
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if ("value" in record) return dataTableCellText(record.value);
+    if ("text" in record) return dataTableCellText(record.text);
+    return JSON.stringify(record);
+  }
+  return String(value);
+}
+
+function dataTableSupport(value: unknown, row: TableRowPayload, column: string) {
+  if (typeof value === "object" && value) {
+    const record = value as Record<string, unknown>;
+    if (typeof record.support === "string") return record.support;
+    if (typeof record.status === "string") return record.status;
+  }
+  return row.cell_support?.[column] || row.support || "";
+}
+
+function dataTableSupportLabel(value: string) {
+  return value.replaceAll("_", " ");
 }
 
 // ---------------------------------------------------------------------------
@@ -3794,6 +3958,7 @@ interface MMLaidNode {
 
 interface MMLink {
   id: string;
+  label: string;
   x1: number;
   y1: number;
   x2: number;
@@ -3866,6 +4031,11 @@ function mmWrap(label: string): string[] {
   return lines.map((line) => (mmMeasure(line) > MM_MAX_TEXT ? mmTrimToWidth(line) : line));
 }
 
+function mmShortLabel(label: string, max = 30): string {
+  const text = String(label || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…` : text;
+}
+
 function mmFindRoot(nodes: MindMapNode[], edges: MindMapEdge[]): string {
   const ids = new Set(nodes.filter((node) => node && node.id).map((node) => node.id as string));
   if (ids.has("center")) return "center";
@@ -3894,12 +4064,14 @@ function mmBuildLayout(nodes: MindMapNode[], edges: MindMapEdge[], expanded: Set
   for (const node of nodes) if (node && node.id) byId.set(node.id, node);
 
   const childMap = new globalThis.Map<string, string[]>();
+  const edgeLabels = new globalThis.Map<string, string>();
   for (const edge of edges) {
     if (!edge || !edge.source || !edge.target) continue;
     if (edge.source === edge.target || !byId.has(edge.source) || !byId.has(edge.target)) continue;
     const arr = childMap.get(edge.source) || [];
     if (!arr.includes(edge.target)) arr.push(edge.target);
     childMap.set(edge.source, arr);
+    if (edge.label) edgeLabels.set(`${edge.source}->${edge.target}`, edge.label);
   }
 
   const rootId = mmFindRoot(nodes, edges);
@@ -3970,7 +4142,8 @@ function mmBuildLayout(nodes: MindMapNode[], edges: MindMapEdge[], expanded: Set
       const child = laidById.get(cid);
       if (!child) continue;
       const startX = parent.x + parent.width + MM_TOGGLE_OFF + MM_TOGGLE_R;
-      links.push({ id: `${parent.id}->${cid}`, x1: startX, y1: parent.y, x2: child.x, y2: child.y });
+      const id = `${parent.id}->${cid}`;
+      links.push({ id, label: edgeLabels.get(id) || "", x1: startX, y1: parent.y, x2: child.x, y2: child.y });
     }
   }
 
@@ -4013,12 +4186,18 @@ function mmLinkPath(link: MMLink): string {
 
 function mmPalette(depth: number, type: string): { fill: string; stroke: string; text: string } {
   if (depth === 0 || type === "notebook" || type === "root") {
-    return { fill: "#2b3550", stroke: "#5b6aa6", text: "#eef1ff" };
+    return { fill: "#f4f1e8", stroke: "#d8d0bd", text: "#24231f" };
   }
   if (depth === 1 || type === "topic") {
-    return { fill: "#222b38", stroke: "#3c4a5d", text: "#e8edf4" };
+    return { fill: "#dceadf", stroke: "#8eb89b", text: "#18241d" };
   }
-  return { fill: "#163528", stroke: "#2f7d54", text: "#daf4e7" };
+  if (type === "question") {
+    return { fill: "#e8e1f5", stroke: "#b9a6d6", text: "#211c2d" };
+  }
+  if (type === "entity") {
+    return { fill: "#e7edf5", stroke: "#9db1c9", text: "#172131" };
+  }
+  return { fill: "#f4e7d9", stroke: "#cfaa83", text: "#2c2117" };
 }
 
 function mmTypeLabel(type: string): string {
@@ -4064,6 +4243,7 @@ function MindMapNodeView({
       onKeyDown={onKeyDown}
     >
       <rect
+        className="mm-node-card"
         x={node.x}
         y={top}
         width={node.width}
@@ -4074,11 +4254,22 @@ function MindMapNodeView({
         stroke={selected ? "#16d07a" : palette.stroke}
         strokeWidth={selected ? 2.2 : 1.3}
       />
+      <text
+        x={node.x + MM_PAD_X}
+        y={top + 15}
+        fontFamily={MM_TEXT_FONT_FAMILY}
+        fontSize={8.8}
+        fontWeight={800}
+        letterSpacing={0.6}
+        fill={node.depth === 0 ? "#706a5d" : "#657064"}
+      >
+        {mmTypeLabel(node.type).toUpperCase()}
+      </text>
       {node.lines.map((line, index) => (
         <text
           key={index}
           x={cx}
-          y={firstLineY + index * MM_LINE_H}
+          y={firstLineY + index * MM_LINE_H + 6}
           textAnchor="middle"
           dominantBaseline="middle"
           fontFamily={MM_TEXT_FONT_FAMILY}
@@ -4091,11 +4282,11 @@ function MindMapNodeView({
       ))}
       {node.hasChildren ? (
         <g>
-          <circle cx={toggleCx} cy={node.y} r={MM_TOGGLE_R} fill="#0f161e" stroke={palette.stroke} strokeWidth={1.2} />
+          <circle className="mm-toggle-dot" cx={toggleCx} cy={node.y} r={MM_TOGGLE_R} fill="#fcfaf4" stroke={palette.stroke} strokeWidth={1.2} />
           <path
             d={mmChevron(toggleCx, node.y, node.expanded)}
             fill="none"
-            stroke="#aeb9c7"
+            stroke="#4f5b54"
             strokeWidth={1.8}
             strokeLinecap="round"
             strokeLinejoin="round"
@@ -4238,6 +4429,13 @@ function MindMapPreview({
 
   return (
     <div className="mm-wrap">
+      <div className="mm-topline">
+        <div>
+          <span>Mind Map</span>
+          <strong>{title || "Notebook map"}</strong>
+        </div>
+        <small>{layout.nodes.length} nodes · {layout.links.length} visible branches</small>
+      </div>
       <div className="mm-canvas" ref={containerRef}>
         {layout.nodes.length ? (
           <svg
@@ -4264,7 +4462,20 @@ function MindMapPreview({
             />
             <g ref={contentRef} transform={`translate(${view.tx} ${view.ty}) scale(${view.scale})`}>
               {layout.links.map((link) => (
-                <path key={link.id} d={mmLinkPath(link)} fill="none" stroke="#3c4a5e" strokeWidth={1.6} strokeOpacity={0.92} />
+                <g key={link.id}>
+                  <path className="mm-link" d={mmLinkPath(link)} fill="none" />
+                  {link.label ? (
+                    <text
+                      className="mm-link-label"
+                      x={(link.x1 + link.x2) / 2}
+                      y={(link.y1 + link.y2) / 2 - 7}
+                      textAnchor="middle"
+                      fontFamily={MM_TEXT_FONT_FAMILY}
+                    >
+                      {mmShortLabel(link.label, 30)}
+                    </text>
+                  ) : null}
+                </g>
               ))}
               {layout.nodes.map((node) => (
                 <MindMapNodeView
@@ -4293,7 +4504,6 @@ function MindMapPreview({
             <Download size={15} />
           </button>
         </div>
-        <div className="mm-hint">Click a branch to unfold · drag to pan · scroll to zoom</div>
       </div>
       {selectedNode ? (
         <article className="mm-detail">

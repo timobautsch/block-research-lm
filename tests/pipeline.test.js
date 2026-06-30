@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -12,7 +12,9 @@ async function withEngine(fn) {
     root: resolve("."),
     storageDir: dir,
     stateFile: join(dir, "state.json"),
-    env: {},
+    env: {
+      SOURCESTUDIO_VIDEO_TTS: "false",
+    },
   });
   try {
     await fn(engine);
@@ -353,6 +355,31 @@ test("generates all required source-backed Studio artifacts", async () => {
         assert.equal(pptxBytes.subarray(0, 2).toString("utf8"), "PK");
       }
     }
+  });
+});
+
+test("renders Video Overview as playable MP4 media", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Video test" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Video source",
+      body: "# Video Source\n\nVideo overviews should turn cited Evidence Pack passages into a rendered MP4 with captions, scenes, narration metadata, and source references.",
+    });
+    const response = await engine.createArtifact({ notebook_id: notebook.id, type: "video", options: {} });
+    assert.equal(response.job.status, "completed");
+    assert.equal(response.artifact.type, "video");
+    assert.equal(response.artifact.content_json.render_status, "rendered_mp4");
+    assert.equal(response.artifact.content_json.video_status, "rendered");
+    assert.match(response.artifact.content_json.video_url, /\/api\/artifacts\/.+\/media/);
+    assert.match(response.artifact.content_json.video_file_name, /\.mp4$/);
+    assert.ok(response.artifact.content_json.video_duration_seconds > 0);
+    assert.ok(response.artifact.content_json.storyboard.length >= 1);
+    const media = engine.getArtifactMedia(response.artifact.id);
+    assert.equal(media.content_type, "video/mp4");
+    assert.match(media.file_name, /\.mp4$/);
+    const savedVideo = await stat(media.path);
+    assert.ok(savedVideo.size > 1000);
   });
 });
 
