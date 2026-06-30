@@ -342,6 +342,16 @@ test("generates all required source-backed Studio artifacts", async () => {
       assert.ok(response.artifact.content_json.evidence_audit.source_coverage > 0, `${type} should cite at least one retrieved source`);
       assert.equal(response.artifact.content_json.evidence_audit.invalid_citation_count, 0, `${type} should not cite invalid evidence`);
       assert.ok(response.artifact.content_json.evidence_audit.top_sources.length >= 1, `${type} should expose source audit details`);
+      if (type === "slide-deck") {
+        assert.equal(response.artifact.content_json.render_status, "rendered_svg_pptx");
+        assert.ok(response.artifact.content_json.slides.every((slide) => /^<svg/.test(slide.svg_markup)));
+        assert.match(response.artifact.content_json.pptx_url, /\/api\/artifacts\/.+\/media/);
+        const media = engine.getArtifactMedia(response.artifact.id);
+        assert.equal(media.content_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+        assert.match(media.file_name, /\.pptx$/);
+        const pptxBytes = await readFile(media.path);
+        assert.equal(pptxBytes.subarray(0, 2).toString("utf8"), "PK");
+      }
     }
   });
 });

@@ -320,6 +320,8 @@ interface Source {
   word_count: number;
   summary: string;
   knowledge: KnowledgeObject[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface Citation {
@@ -425,6 +427,8 @@ interface Notebook {
   messages: ChatMessage[];
   suggested_questions: string[];
   suggested_artifacts: ArtifactType[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface ProviderStatus {
@@ -526,17 +530,6 @@ const artifactTypes: Array<{
   { type: "quiz", title: "Quiz", action: "Test", icon: <ListChecks size={18} /> },
   { type: "infographic", title: "Infographic", action: "Visual", icon: <Sparkles size={18} /> },
   { type: "data-table", title: "Data Table", action: "Extract", icon: <Table2 size={18} /> },
-];
-
-const sourceTypeOptions: Array<{ type: SourceType; label: string }> = [
-  { type: "markdown", label: "Document" },
-  { type: "note", label: "Note" },
-  { type: "url", label: "Website" },
-  { type: "youtube", label: "YouTube" },
-  { type: "google_doc", label: "Google Doc" },
-  { type: "pdf", label: "PDF" },
-  { type: "docx", label: "DOCX" },
-  { type: "audio", label: "Audio" },
 ];
 
 const sourceTabs: Array<{ type: SourceType; label: string; icon: ReactNode }> = [
@@ -650,8 +643,8 @@ export default function App() {
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
   const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
   const [activeSourceId, setActiveSourceId] = useState("");
-  const [sourceBlocks, setSourceBlocks] = useState<SourceBlock[]>([]);
-  const [highlightedBlockIds, setHighlightedBlockIds] = useState<string[]>([]);
+  const [, setSourceBlocks] = useState<SourceBlock[]>([]);
+  const [, setHighlightedBlockIds] = useState<string[]>([]);
   const [question, setQuestion] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
   const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("Balanced");
@@ -686,14 +679,9 @@ export default function App() {
   const [error, setError] = useState("");
   const [sourceFormNotice, setSourceFormNotice] = useState("");
   const didBootRef = useRef(false);
-  const overviewFiredRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const sourceBodyRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const activeSource = useMemo(
-    () => notebook?.sources.find((source) => source.id === activeSourceId) || notebook?.sources[0] || null,
-    [activeSourceId, notebook],
-  );
   const selectedArtifact = useMemo(
     () =>
       notebook?.artifacts.find((artifact) => artifact.id === selectedArtifactId) ||
@@ -701,9 +689,13 @@ export default function App() {
       null,
     [notebook, selectedArtifactId],
   );
-  const latestAssistant = useMemo(
-    () => [...(notebook?.messages || [])].reverse().find((message) => message.role === "assistant"),
+  const visibleMessages = useMemo(
+    () => visibleNotebookMessages(notebook?.messages || []),
     [notebook?.messages],
+  );
+  const latestAssistant = useMemo(
+    () => [...visibleMessages].reverse().find((message) => message.role === "assistant"),
+    [visibleMessages],
   );
   const isSourceReady = useMemo(() => {
     const body = sourceForm.body.trim();
@@ -722,24 +714,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // NotebookLM-style opening: the first time a notebook has indexed sources but no
-  // chat yet, auto-generate a grounded overview so the assistant shows it understood
-  // what was loaded. Fires once per notebook; the synthetic prompt is hidden in the UI.
-  useEffect(() => {
-    const id = notebook?.id;
-    if (!id || isBooting || isAsking) return;
-    if ((notebook?.messages.length || 0) > 0) {
-      overviewFiredRef.current.add(id);
-      return;
-    }
-    const hasIndexed = (notebook?.sources || []).some((source) => source.active && source.status === "indexed");
-    if (hasIndexed && !overviewFiredRef.current.has(id)) {
-      overviewFiredRef.current.add(id);
-      void askQuestion(OVERVIEW_PROMPT);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [notebook?.id, notebook?.messages.length, notebook?.sources, isBooting]);
-
   useEffect(() => {
     if (notebook?.sources.length && !activeSourceId) {
       setActiveSourceId(notebook.sources[0].id);
@@ -755,7 +729,7 @@ export default function App() {
     const messagesNode = messagesRef.current;
     if (!messagesNode) return;
     messagesNode.scrollTop = messagesNode.scrollHeight;
-  }, [notebook?.messages.length, isAsking]);
+  }, [visibleMessages.length, isAsking]);
 
   useEffect(() => {
     if (!authUser || showLanding) return;
@@ -1029,9 +1003,9 @@ export default function App() {
     }
   }
 
-  function openNotepad() {
-    setNoteTitle("");
-    setNoteBody("");
+  function openNotepad(initial: { title?: string; body?: string } = {}) {
+    setNoteTitle(initial.title || "");
+    setNoteBody(initial.body || "");
     setIsNotepadOpen(true);
   }
 
@@ -1310,6 +1284,19 @@ export default function App() {
   function startNoteSource() {
     setMobilePanel("sources");
     openAddSource("note");
+  }
+
+  function saveOverviewToNote() {
+    if (!notebook) return;
+    const activeSources = notebook.sources.filter((source) => source.active);
+    const summary = notebook.summary || activeSources.find((source) => source.summary)?.summary || "";
+    const sourceLine = activeSources.length
+      ? `Sources: ${activeSources.map((source) => source.title).join(", ")}`
+      : "";
+    openNotepad({
+      title: `${notebook.title} overview`,
+      body: [summary, sourceLine].filter(Boolean).join("\n\n"),
+    });
   }
 
   async function handleThumbnailRefs(event: ChangeEvent<HTMLInputElement>) {
@@ -1706,19 +1693,21 @@ export default function App() {
           </div>
 
           <div className="messages" ref={messagesRef} role="log" aria-live="polite">
-            {!notebook?.messages.length && !isAsking ? (
+            {!visibleMessages.length && !isAsking ? (
               <ResearchCanvas
+                title={notebook?.title || BRAND_NAME}
                 activeCount={activeCount}
+                sources={notebook?.sources || []}
                 summary={notebook?.summary || ""}
+                createdAt={notebook?.created_at || notebook?.sources[0]?.created_at || ""}
                 suggestions={notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions}
                 onAsk={(prompt) => void askQuestion(prompt)}
+                onSaveSummary={saveOverviewToNote}
               />
             ) : (
-              (notebook?.messages ?? [])
-                .filter((message) => !(message.role === "user" && message.content.trim() === OVERVIEW_PROMPT))
-                .map((message) => (
-                  <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
-                ))
+              visibleMessages.map((message) => (
+                <ChatBubble key={message.id} message={message} onCitationClick={focusCitation} />
+              ))
             )}
             {pendingQuestion ? (
               <ChatBubble
@@ -3008,68 +2997,57 @@ function LandingPage({
   );
 }
 
-function SourceDetail({
-  source,
-  blocks,
-  highlightedBlockIds,
-}: {
-  source: Source | null;
-  blocks: SourceBlock[];
-  highlightedBlockIds: string[];
-}) {
-  if (!source) {
-    return (
-      <div className="source-viewer">
-        <p>Select or add a source to inspect citation blocks.</p>
-      </div>
-    );
-  }
-  return (
-    <div className="source-viewer">
-      <div className="source-viewer-top">
-        <div>
-          <p>{source.type}</p>
-          <h3>{source.title}</h3>
-        </div>
-        <span className="source-accent" />
-      </div>
-      <p>{source.summary || "Source indexed. Summary will appear after parsing."}</p>
-      <div className="source-block-list">
-        {blocks.slice(0, 24).map((block) => (
-          <article key={block.block_id} data-highlight={highlightedBlockIds.includes(block.block_id)}>
-            <small>
-              {block.type} · {block.heading_path.join(" / ") || "Overview"} · {block.block_id}
-            </small>
-            <p>{block.text}</p>
-          </article>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function ResearchCanvas({
+  title,
   activeCount,
+  sources,
   summary,
+  createdAt,
   suggestions,
   onAsk,
+  onSaveSummary,
 }: {
+  title: string;
   activeCount: number;
+  sources: Source[];
   summary: string;
+  createdAt: string;
   suggestions: string[];
   onAsk: (prompt: string) => void;
+  onSaveSummary: () => void;
 }) {
-  const hasOverview = Boolean(activeCount && summary.trim());
+  const activeSources = sources.filter((source) => source.active);
+  const firstSourceSummary = activeSources.find((source) => source.summary)?.summary || "";
+  const overview = (summary || firstSourceSummary).trim();
+  const hasOverview = Boolean(activeCount && overview);
+  const meta = [
+    `${activeCount} source${activeCount === 1 ? "" : "s"}`,
+    formatNotebookDate(createdAt || activeSources[0]?.created_at),
+  ].filter(Boolean).join(" · ");
   return (
-    <section className="research-canvas" aria-label="Notebook overview">
+    <section className="research-canvas" data-overview={hasOverview} aria-label="Notebook overview">
       {hasOverview ? (
-        <article className="canvas-overview">
-          <div className="canvas-overview-top">
-            <span className="avatar"><Bot size={17} /></span>
-            <strong>{ASSISTANT_NAME}</strong>
-            <span className="canvas-overview-meta">{activeCount} source{activeCount === 1 ? "" : "s"} loaded</span>
+        <article className="source-overview">
+          <span className="source-overview-symbol" aria-hidden="true">
+            <ScaleIcon />
+          </span>
+          <h3>{title}</h3>
+          <p className="source-overview-meta">{meta}</p>
+          <p className="source-overview-text">{overview}</p>
+          <div className="source-overview-actions" aria-label="Overview actions">
+            <button type="button" onClick={onSaveSummary}>
+              <ClipboardList size={15} />
+              Save to note
+            </button>
+            <button
+              type="button"
+              onClick={() => void navigator.clipboard?.writeText(overview)}
+              aria-label="Copy overview"
+              title="Copy overview"
+            >
+              <Copy size={16} />
+            </button>
           </div>
-          <p className="canvas-overview-text">{summary}</p>
         </article>
       ) : (
         <>
@@ -3086,16 +3064,22 @@ function ResearchCanvas({
       )}
       {activeCount && suggestions.length ? (
         <div className="canvas-suggestions">
-          {hasOverview ? <span className="canvas-suggestions-label">Try asking</span> : null}
-          {suggestions.slice(0, 4).map((prompt) => (
+          {suggestions.slice(0, hasOverview ? 3 : 4).map((prompt) => (
             <button key={prompt} type="button" onClick={() => onAsk(prompt)}>
-              <MessageSquareText size={15} />
               <span>{prompt}</span>
             </button>
           ))}
         </div>
       ) : null}
     </section>
+  );
+}
+
+function ScaleIcon() {
+  return (
+    <span className="scale-icon" aria-hidden="true">
+      ⚖
+    </span>
   );
 }
 
@@ -3500,6 +3484,10 @@ function ArtifactPreview({
             <a className="icon-button subtle" href={String(payload.image_data)} download={`${downloadSlug(artifact.title)}.png`} aria-label="Download thumbnail image">
               <Download size={15} />
             </a>
+          ) : artifact.type === "slide-deck" && typeof payload.pptx_url === "string" ? (
+            <a className="icon-button subtle" href={payload.pptx_url} download={String(payload.pptx_file_name || `${downloadSlug(artifact.title)}.pptx`)} aria-label="Download slide deck presentation">
+              <Download size={15} />
+            </a>
           ) : artifact.type !== "thumbnail" ? (
             <button className="icon-button subtle" type="button" onClick={() => downloadText(`${downloadSlug(artifact.title)}.json`, JSON.stringify(payload, null, 2))} aria-label="Download artifact JSON">
               <Download size={15} />
@@ -3708,6 +3696,9 @@ function ArtifactPayload({
       <SlideDeckPreview
         slides={payload.slides as SlidePayload[]}
         title={artifact.title}
+        pptxUrl={typeof payload.pptx_url === "string" ? payload.pptx_url : ""}
+        pptxFileName={typeof payload.pptx_file_name === "string" ? payload.pptx_file_name : ""}
+        renderStatus={typeof payload.render_status === "string" ? payload.render_status : ""}
         onCitationClick={onCitationClick}
         onToast={onToast}
         onError={onError}
@@ -4383,12 +4374,18 @@ async function downloadSvgAsPng(svgMarkup: string, fileName: string) {
 function SlideDeckPreview({
   slides,
   title,
+  pptxUrl,
+  pptxFileName,
+  renderStatus,
   onCitationClick,
   onToast,
   onError,
 }: {
   slides: SlidePayload[];
   title: string;
+  pptxUrl: string;
+  pptxFileName: string;
+  renderStatus: string;
   onCitationClick: (citation: Citation) => void;
   onToast: (message: string) => void;
   onError: (message: string) => void;
@@ -4412,6 +4409,7 @@ function SlideDeckPreview({
   const svg = activeSlide.svg_markup || "";
   const svgSrc = svg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}` : "";
   const hasRenderedDeck = slides.some((slide) => slide.svg_markup);
+  const hasPresentationFile = Boolean(pptxUrl);
 
   const runExport = async (kind: "pdf" | "png") => {
     setExporting(kind);
@@ -4432,6 +4430,10 @@ function SlideDeckPreview({
 
   return (
     <div className="slide-preview">
+      <div className="slide-deck-meta">
+        <span>{renderStatus === "rendered_svg_pptx" ? "Keynote-ready presentation" : "Slide deck"}</span>
+        <strong>{slides.length} slides</strong>
+      </div>
       {svgSrc ? (
         <figure className="slide-frame">
           <img src={svgSrc} alt={activeSlide.title || `Slide ${activeIndex + 1}`} />
@@ -4451,6 +4453,11 @@ function SlideDeckPreview({
 
       {hasRenderedDeck ? (
         <div className="slide-export">
+          {hasPresentationFile ? (
+            <a className="secondary-button" href={pptxUrl} download={pptxFileName || `${downloadSlug(title || "slide-deck")}.pptx`}>
+              <Download size={14} /> Download deck (PPTX)
+            </a>
+          ) : null}
           <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("pdf")}>
             <Download size={14} /> {exporting === "pdf" ? "Building PDF…" : "Download deck (PDF)"}
           </button>
@@ -5124,10 +5131,28 @@ const defaultQuestions = [
   "Create an executive brief from all active sources.",
 ];
 
-// Synthetic prompt used to auto-generate the opening overview. Hidden in the UI so
-// only the assistant's overview shows (NotebookLM-style).
+// Legacy prompt used by earlier builds to auto-generate the opening overview.
+// Keep it here so old persisted synthetic messages do not appear as normal chat.
 const OVERVIEW_PROMPT =
   "Give me a quick, friendly overview of what these sources cover — and a couple of things worth digging into.";
+
+function visibleNotebookMessages(messages: ChatMessage[]) {
+  const visible: ChatMessage[] = [];
+  let hideNextAssistant = false;
+  for (const message of messages) {
+    if (message.role === "user" && message.content.trim() === OVERVIEW_PROMPT) {
+      hideNextAssistant = true;
+      continue;
+    }
+    if (hideNextAssistant && message.role === "assistant") {
+      hideNextAssistant = false;
+      continue;
+    }
+    hideNextAssistant = false;
+    visible.push(message);
+  }
+  return visible;
+}
 
 function sourceIcon(type: SourceType) {
   if (type === "url") return <Globe size={16} />;
@@ -5231,6 +5256,17 @@ function relativeTime(value: string) {
   const months = Math.round(days / 30);
   if (months < 12) return `${months}mo ago`;
   return `${Math.round(months / 12)}y ago`;
+}
+
+function formatNotebookDate(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(date);
 }
 
 function artifactIcon(type: ArtifactType) {
@@ -5404,11 +5440,6 @@ function downloadSlug(input: string) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80) || "sourcestudio-notebook";
-}
-
-function truncate(input: string, maxLength: number) {
-  const clean = String(input || "").replace(/\s+/g, " ").trim();
-  return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trim()}...` : clean;
 }
 
 function formatDebugTime(value: string) {

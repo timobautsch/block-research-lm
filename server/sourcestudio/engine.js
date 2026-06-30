@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import PptxGenJS from "pptxgenjs";
 import {
   ActiveSourceSchema,
   ArtifactRequestSchema,
@@ -35,8 +36,8 @@ const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "sour
 const DEFAULT_CRAWL_MAX_PAGES = 12;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
 const PRODUCT_NAME = "Block Research LM";
-// Keep in sync with OVERVIEW_PROMPT in src/App.tsx — the auto-fired notebook overview
-// question. Filtered out of chat history so it never skews follow-up retrieval.
+// Keep in sync with the legacy OVERVIEW_PROMPT in src/App.tsx. Earlier builds
+// auto-fired this question; it is filtered out so it never skews retrieval.
 const CHAT_OVERVIEW_PROMPT =
   "Give me a quick, friendly overview of what these sources cover — and a couple of things worth digging into.";
 const execFile = promisify(execFileCallback);
@@ -324,7 +325,7 @@ export async function createSourceStudioEngine(options = {}) {
      }
     };
 
-    if (context.sync) {
+    if (context.sync || shouldIndexSynchronously(parsed)) {
       return runIngest();
     }
     // Parse in the background so long parses (YouTube audio transcription, large
@@ -335,6 +336,13 @@ export async function createSourceStudioEngine(options = {}) {
       // Failure is already recorded on the source (status + metadata error).
     });
     return decorateSource(sourceId, { includeBlocks: false });
+  }
+
+  function shouldIndexSynchronously(parsed) {
+    if (parsed.base64) return false;
+    if (["markdown", "text", "note"].includes(parsed.type)) return true;
+    if (parsed.body && parsed.type === "url" && parsed.crawl === false) return true;
+    return false;
   }
 
   async function renameNotebook(notebookId, input = {}, context = {}) {
@@ -685,6 +693,11 @@ export async function createSourceStudioEngine(options = {}) {
         }
         if (parsed.type === "slide-deck") {
           artifactPayload = attachSlideSvgs(artifactPayload);
+          await renderSlideDeckPptx({
+            artifactDir,
+            artifactId,
+            payload: artifactPayload,
+          });
         }
         if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
           artifactPayload.generation_provider = generation.active_run.provider;
@@ -705,6 +718,9 @@ export async function createSourceStudioEngine(options = {}) {
           state.modelRuns.push(audioRun);
           modelRunIds.push(audioRun.id);
         }
+      }
+      if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
+        artifactPayload.evidence_audit ||= buildArtifactEvidenceAudit(evidencePack, artifactPayload);
       }
       const artifact = {
         id: artifactId,
@@ -769,7 +785,7 @@ export async function createSourceStudioEngine(options = {}) {
     // Legacy/sync callers await the full artifact. The default path runs the job in
     // the background and returns immediately, so long artifacts (audio/video, 60-120s)
     // never hit Firebase Hosting's ~60s rewrite-proxy timeout — the client polls the job.
-    if (context.sync) {
+    if (context.sync || !context.requestId) {
       return runJob();
     }
     runJob().catch(() => {
@@ -966,12 +982,18 @@ export async function createSourceStudioEngine(options = {}) {
 
   function getArtifactMedia(artifactId, context = {}) {
     const artifact = getArtifact(artifactId, context);
-    const mediaPath = artifact.content_json?.audio_file_path || "";
+    const mediaPath = artifact.type === "slide-deck"
+      ? artifact.content_json?.pptx_file_path || ""
+      : artifact.content_json?.audio_file_path || "";
     if (!mediaPath) throw statusError(404, "Artifact has no rendered media file.");
     return {
       path: resolve(root, mediaPath),
-      content_type: artifact.content_json?.audio_content_type || "audio/mpeg",
-      file_name: artifact.content_json?.audio_file_name || `${artifact.id}.mp3`,
+      content_type: artifact.type === "slide-deck"
+        ? artifact.content_json?.pptx_content_type || "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        : artifact.content_json?.audio_content_type || "audio/mpeg",
+      file_name: artifact.type === "slide-deck"
+        ? artifact.content_json?.pptx_file_name || `${artifact.id}.pptx`
+        : artifact.content_json?.audio_file_name || `${artifact.id}.mp3`,
     };
   }
 
@@ -1495,31 +1517,50 @@ export async function createSourceStudioEngine(options = {}) {
   async function parseSource(source, payload, context = {}) {
     if (source.type === "youtube") {
       const videoId = youtubeVideoId(source.original_url);
-      let rawText = payload.body?.trim()
+      const hasUserTranscript = Boolean(payload.body?.trim());
+      const deepgramKey = realProviderKey(env.DEEPGRAM_API_KEY);
+      let rawText = hasUserTranscript
         ? payload.body
-        : await fetchYouTubeTranscript(source.original_url, fetchImpl);
-      let parser = payload.body?.trim() ? "youtube-user-transcript" : "youtube-transcript-fetcher";
+        : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId });
+      let parser = hasUserTranscript ? "youtube-user-transcript" : "youtube-transcript-fetcher";
       // No captions available? Transcribe the audio track with Deepgram so the
       // video is still fully transcribed instead of left as a short placeholder.
       if (
-        !payload.body?.trim() &&
-        /no public or auto-generated captions|did not include a youtube video id|transcript was not available|no captions/i.test(rawText) &&
-        realProviderKey(env.DEEPGRAM_API_KEY)
+        !hasUserTranscript &&
+        isYouTubeTranscriptFallback(rawText) &&
+        deepgramKey
       ) {
         logger.info("youtube.audio_transcribe.start", { request_id: context.requestId, video_id: videoId });
         const audioText = await fetchYouTubeAudioTranscript(videoId, {
-          apiKey: realProviderKey(env.DEEPGRAM_API_KEY),
+          apiKey: deepgramKey,
           model: env.DEEPGRAM_MODEL || "nova-3",
           fetchImpl,
+          logger,
+          requestId: context.requestId,
         });
-        if (audioText && audioText.split(/\s+/).length > 30) {
+        const audioWords = audioText ? audioText.split(/\s+/).filter(Boolean).length : 0;
+        if (audioWords > 30) {
           rawText = `# YouTube transcript (audio)\n\n${audioText}`;
           parser = "youtube-deepgram-asr";
-          logger.info("youtube.audio_transcribe.complete", { request_id: context.requestId, video_id: videoId, words: audioText.split(/\s+/).length });
+          logger.info("youtube.audio_transcribe.complete", { request_id: context.requestId, video_id: videoId, words: audioWords });
+        } else {
+          logger.warn("youtube.audio_transcribe.empty", { request_id: context.requestId, video_id: videoId, words: audioWords });
         }
       }
+      if (!hasUserTranscript && isYouTubeTranscriptFallback(rawText)) {
+        logger.warn("youtube.transcript.unavailable", {
+          request_id: context.requestId,
+          video_id: videoId,
+          has_deepgram: Boolean(deepgramKey),
+          words: rawText.split(/\s+/).filter(Boolean).length,
+        });
+        throw statusError(
+          422,
+          "Could not load the YouTube transcript. Captions and automatic audio transcription were unavailable; paste the transcript manually or retry with a working YouTube transcript path.",
+        );
+      }
       // Use the real video title when the user didn't name the source (avoids "youtube.com").
-      if (!payload.title?.trim() && !payload.body?.trim()) {
+      if (!payload.title?.trim() && !hasUserTranscript) {
         const ytTitle = await fetchYouTubeTitle(videoId);
         if (ytTitle) source.title = ytTitle;
       }
@@ -1527,7 +1568,7 @@ export async function createSourceStudioEngine(options = {}) {
         rawText,
         cleanedText: normalizeWhitespace(rawText),
         parser,
-        fallback: !payload.body?.trim() && /transcript was not available|no public or auto-generated captions/i.test(rawText),
+        fallback: !hasUserTranscript && isYouTubeTranscriptFallback(rawText),
         metadata: {
           original_url: source.original_url,
           video_id: videoId,
@@ -2610,29 +2651,65 @@ export async function createSourceStudioEngine(options = {}) {
       };
     }
     if (type === "slide-deck") {
+      const slideTopics = keyPoints.slice(0, 5).map((point) => titleCase(topicFromSentence(point.text)));
+      const evidenceSlides = keyPoints.slice(0, 5).map((point, index) => ({
+        title: titleCase(topicFromSentence(point.text)),
+        subtitle: citations[index]?.source_title || "Source-backed evidence",
+        bullets: [
+          `${stripCitations(point.text)} ${point.citation}`,
+          `Evidence comes from ${citations[index]?.source_title || "an active source"} ${point.citation}`,
+          "Use this point as a talk track, not as a paragraph slide.",
+        ],
+        speaker_notes: `Explain the slide from the cited evidence only. Keep the claim narrow and point back to ${point.citation}.`,
+        citations: [citations[index]].filter(Boolean),
+        visual_suggestion: index % 2 === 0 ? "Large evidence statement with source rail" : "Two-column source quote and implication",
+        layout_type: index % 2 === 0 ? "content" : "comparison",
+      }));
       return {
         title: titleBase,
         deck_type: options.deck_type || "Executive",
+        presentation_style: "keynote",
         slides: [
           {
             title: notebook.title,
-            subtitle: "Source-grounded briefing",
-            bullets: keyPoints.slice(0, 2).map((point) => `${stripCitations(point.text)} ${point.citation}`),
-            speaker_notes: "Open by explaining that all statements are evidence-backed.",
-            citations: citations.slice(0, 2),
-            visual_suggestion: "Notebook evidence map",
+            subtitle: "Source-grounded presentation",
+            bullets: keyPoints.slice(0, 3).map((point) => `${stripCitations(point.text)} ${point.citation}`),
+            speaker_notes: "Open by framing this as a source-grounded presentation. Every factual statement is tied to the active notebook evidence.",
+            citations: citations.slice(0, 3),
+            visual_suggestion: "Full-screen title slide with evidence-backed thesis",
             layout_type: "title",
           },
-          ...keyPoints.slice(2, 7).map((point, index) => ({
-            title: titleCase(topicFromSentence(point.text)),
-            bullets: [`${stripCitations(point.text)} ${point.citation}`],
-            speaker_notes: "Keep the explanation tied to the citation shown on the slide.",
-            citations: [citations[index + 2]].filter(Boolean),
-            visual_suggestion: "Evidence card with source highlight",
-            layout_type: "evidence",
-          })),
+          {
+            title: "Presentation flow",
+            subtitle: "The deck is structured for a live walkthrough.",
+            bullets: slideTopics.slice(0, 5).map((topic, index) => `${index + 1}. ${topic}`),
+            speaker_notes: "Use this slide to orient the audience before moving into the evidence slides.",
+            citations: citations.slice(0, 5),
+            visual_suggestion: "Agenda rail with numbered sections",
+            layout_type: "section",
+          },
+          ...evidenceSlides,
+          {
+            title: "Close with the source-backed takeaway",
+            subtitle: "Decision-ready summary",
+            bullets: [
+              keyPoints[0] ? `${stripCitations(keyPoints[0].text)} ${keyPoints[0].citation}` : "The active sources define the main takeaway.",
+              "Keep follow-up discussion anchored to the cited source blocks.",
+              "Use the citation audit to decide which claims need stronger evidence.",
+            ],
+            speaker_notes: "End by restating the supported takeaway and inviting source-level review of disputed points.",
+            citations: citations.slice(0, 3),
+            visual_suggestion: "Closing slide with takeaway, source count, and evidence status",
+            layout_type: "closing",
+          },
         ],
         citations,
+        citation_appendix: citations.map((citation) => ({
+          citation: citation.citation,
+          source_title: citation.source_title,
+          evidence_id: citation.evidence_id,
+          quote: truncate(citation.quote, 220),
+        })),
       };
     }
     if (type === "infographic") {
@@ -2799,13 +2876,21 @@ export async function createSourceStudioEngine(options = {}) {
       .join("\n");
     const imagePrompt = String(options.prompt || "").trim() || infographicImagePrompt(title, points);
     const result = await generateThumbnailImage(imagePrompt, [], "1024x1536");
+    if (!result.image_data) {
+      return {
+        ...data,
+        image_prompt: imagePrompt,
+        image_status: result.error || "Image generation unavailable. Rendered local SVG infographic instead.",
+        generation_provider: data.generation_provider || "local",
+        generation_model: data.generation_model || "local-grounded-v1",
+      };
+    }
     return {
+      ...data,
       title: `${title}: Infographic`,
       image_prompt: imagePrompt,
-      image_data: result.image_data || "",
-      image_status: result.image_data
-        ? "rendered"
-        : (result.error || "Image generation unavailable. Configure OpenAI billing for gpt-image-2."),
+      image_data: result.image_data,
+      image_status: "rendered",
       panels,
       source_refs: collectSourceRefs(evidencePack),
       generation_provider: "openai",
@@ -3753,13 +3838,6 @@ export async function createSourceStudioEngine(options = {}) {
     return first;
   }
 
-  function chooseEmbeddingProvider() {
-    if (env.DEFAULT_EMBEDDING_PROVIDER) return env.DEFAULT_EMBEDDING_PROVIDER;
-    if (env.GOOGLE_API_KEY) return "gemini-configured-local-cache";
-    if (env.OPENAI_API_KEY) return "openai-configured-local-cache";
-    return "deterministic-local";
-  }
-
   function openQuestionsForNotebook(notebookId) {
     return state.knowledgeObjects
       .filter((object) => object.notebook_id === notebookId && object.type === "open_questions")
@@ -4170,6 +4248,19 @@ async function normalizeAudioForAsr(buffer) {
 
 const YOUTUBE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const YOUTUBE_TRANSCRIPT_FALLBACK_PATTERN =
+  /no public or auto-generated captions|did not include a youtube video id|transcript was not available|no captions/i;
+
+function isYouTubeTranscriptFallback(text) {
+  return YOUTUBE_TRANSCRIPT_FALLBACK_PATTERN.test(String(text || ""));
+}
+
+function externalToolErrorSummary(error, maxLength = 300) {
+  return String(error?.stderr || error?.stdout || error?.message || error || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
 
 // Optional egress proxy for yt-dlp. YouTube blocks caption/audio downloads from
 // datacenter IPs (Cloud Run), so route yt-dlp through a (residential) proxy when
@@ -4197,7 +4288,7 @@ async function fetchYouTubeTitle(videoId) {
 // When a video has no captions, download its audio track (yt-dlp) and transcribe
 // it with Deepgram, so a YouTube source is still fully transcribed rather than a
 // placeholder. ffmpeg (inside transcribeAudioWithDeepgram) normalizes the audio.
-async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch } = {}) {
+async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch, logger, requestId } = {}) {
   if (!videoId || !apiKey || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
   const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
   let dir;
@@ -4220,14 +4311,20 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
     if (!audioFile) return "";
     const buffer = await readFile(join(dir, audioFile));
     return (await transcribeAudioWithDeepgram(buffer, { apiKey, model, fetchImpl })) || "";
-  } catch {
+  } catch (error) {
+    logger?.warn("youtube.audio_transcribe.failed", {
+      request_id: requestId,
+      video_id: videoId,
+      error: externalToolErrorSummary(error),
+    });
     return "";
   } finally {
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
+async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options = {}) {
+  const { logger, requestId } = options;
   const videoId = youtubeVideoId(url);
   if (!videoId) {
     return `# YouTube source\n\nThe supplied URL did not include a YouTube video ID. Paste the transcript to index this source.\n\nSource URL: ${url || "n/a"}`;
@@ -4238,9 +4335,14 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
   // the bare timedtext endpoints below return empty without that token.
   if (fetchImpl === globalThis.fetch && process.env.SOURCESTUDIO_DISABLE_YTDLP !== "1") {
     try {
-      const viaYtDlp = await fetchYouTubeTranscriptViaYtDlp(videoId);
+      const viaYtDlp = await fetchYouTubeTranscriptViaYtDlp(videoId, options);
       if (viaYtDlp) return viaYtDlp;
-    } catch {
+    } catch (error) {
+      logger?.warn("youtube.transcript.ytdlp.failed", {
+        request_id: requestId,
+        video_id: videoId,
+        error: externalToolErrorSummary(error),
+      });
       // yt-dlp may be missing or rate-limited; fall back to the direct fetch paths.
     }
   }
@@ -4273,7 +4375,12 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
         }
       }
     }
-  } catch {
+  } catch (error) {
+    logger?.warn("youtube.transcript.caption_tracks.failed", {
+      request_id: requestId,
+      video_id: videoId,
+      error: externalToolErrorSummary(error),
+    });
     // Fall through to the legacy direct endpoint.
   }
 
@@ -4289,7 +4396,13 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
       if (transcript) {
         return [`# YouTube transcript`, "", `Video ID: ${videoId}`, `Language: ${lang}`, "", transcript].join("\n");
       }
-    } catch {
+    } catch (error) {
+      logger?.warn("youtube.transcript.timedtext.failed", {
+        request_id: requestId,
+        video_id: videoId,
+        lang,
+        error: externalToolErrorSummary(error),
+      });
       // Transcript fetching is opportunistic; users can still paste transcripts.
     }
   }
@@ -4297,7 +4410,8 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch) {
   return `# YouTube source\n\nNo public or auto-generated captions were available for video ${videoId} (the uploader may have disabled captions). Paste the transcript into the source body, or configure speech-to-text (Deepgram or Whisper) to transcribe the audio automatically.\n\nSource URL: ${url}`;
 }
 
-async function fetchYouTubeTranscriptViaYtDlp(videoId) {
+async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
+  const { logger, requestId } = options;
   const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
@@ -4343,7 +4457,12 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId) {
       chosenLang = pickAuto(auto);
       chosenIsAuto = true;
     }
-  } catch {
+  } catch (error) {
+    logger?.warn("youtube.transcript.ytdlp.metadata_failed", {
+      request_id: requestId,
+      video_id: videoId,
+      error: externalToolErrorSummary(error),
+    });
     // Metadata probe failed; fall back to a small fixed request set below.
   }
 
@@ -4375,7 +4494,13 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId) {
         videoUrl,
       ],
       { timeout: 90_000, maxBuffer: 1024 * 1024 * 8 },
-    ).catch(() => {
+    ).catch((error) => {
+      logger?.warn("youtube.transcript.ytdlp.download_failed", {
+        request_id: requestId,
+        video_id: videoId,
+        lang: chosenLang || "fallback",
+        error: externalToolErrorSummary(error),
+      });
       // --ignore-errors keeps successful tracks; read whatever was written below.
     });
     const files = (await readdir(workDir)).filter((name) => name.endsWith(".json3"));
@@ -5415,6 +5540,63 @@ function attachSlideSvgs(payload) {
   payload.render_status = "rendered_svg";
   payload.slide_format = "designed_svg_16x9";
   return payload;
+}
+
+async function renderSlideDeckPptx({ artifactDir, artifactId, payload }) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.slides)) return null;
+  const renderedSlides = payload.slides.filter((slide) => typeof slide.svg_markup === "string" && slide.svg_markup.trim());
+  if (!renderedSlides.length) {
+    payload.pptx_status = "skipped_no_rendered_slides";
+    return null;
+  }
+
+  const pptx = new PptxGenJS();
+  pptx.layout = "LAYOUT_WIDE";
+  pptx.author = PRODUCT_NAME;
+  pptx.company = PRODUCT_NAME;
+  pptx.subject = "Source-grounded slide deck";
+  pptx.title = String(payload.title || "Slide Deck").slice(0, 180);
+  pptx.theme = {
+    headFontFace: "Aptos Display",
+    bodyFontFace: "Aptos",
+    lang: "en-US",
+  };
+
+  renderedSlides.forEach((slide, index) => {
+    const deckSlide = pptx.addSlide();
+    deckSlide.background = { color: "0B0D0C" };
+    deckSlide.addImage({
+      data: svgDataUri(slide.svg_markup),
+      x: 0,
+      y: 0,
+      w: 13.333,
+      h: 7.5,
+    });
+    const notes = [
+      String(slide.speaker_notes || "").trim(),
+      slide.citations?.length
+        ? `Sources: ${slide.citations.map((citation) =>
+            `[${citation.index || index + 1}] ${citation.source_title || citation.sourceTitle || "Source"}`).join("; ")}`
+        : "",
+    ].filter(Boolean).join("\n\n");
+    if (notes) deckSlide.addNotes(notes);
+  });
+
+  const fileName = `${sanitizeFileName(`slide-deck-${artifactId}`)}.pptx`;
+  const filePath = join(artifactDir, fileName);
+  await pptx.writeFile({ fileName: filePath });
+  payload.pptx_status = "rendered";
+  payload.pptx_file_name = fileName;
+  payload.pptx_file_path = filePath;
+  payload.pptx_url = `/api/artifacts/${artifactId}/media`;
+  payload.pptx_content_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  payload.render_status = "rendered_svg_pptx";
+  payload.export_formats = ["pptx", "pdf", "png", "json"];
+  return filePath;
+}
+
+function svgDataUri(svgMarkup) {
+  return `data:image/svg+xml;base64,${Buffer.from(String(svgMarkup || ""), "utf8").toString("base64")}`;
 }
 
 function renderSlideSvg(slide, { index, total, deckTitle }) {
