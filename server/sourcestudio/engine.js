@@ -691,6 +691,9 @@ export async function createSourceStudioEngine(options = {}) {
         if (parsed.type === "infographic") {
           artifactPayload = finalizeInfographicPayload(artifactPayload, localPayload);
         }
+        if (parsed.type === "video") {
+          artifactPayload = finalizeVideoPayload(artifactPayload, localPayload);
+        }
         if (parsed.type === "slide-deck") {
           artifactPayload = attachSlideSvgs(artifactPayload);
           await renderSlideDeckPptx({
@@ -718,6 +721,13 @@ export async function createSourceStudioEngine(options = {}) {
           state.modelRuns.push(audioRun);
           modelRunIds.push(audioRun.id);
         }
+      }
+      if (parsed.type === "video") {
+        await renderVideoArtifact({
+          artifactDir,
+          artifactId,
+          payload: artifactPayload,
+        });
       }
       if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
         artifactPayload.evidence_audit ||= buildArtifactEvidenceAudit(evidencePack, artifactPayload);
@@ -984,15 +994,21 @@ export async function createSourceStudioEngine(options = {}) {
     const artifact = getArtifact(artifactId, context);
     const mediaPath = artifact.type === "slide-deck"
       ? artifact.content_json?.pptx_file_path || ""
-      : artifact.content_json?.audio_file_path || "";
+      : artifact.type === "video"
+        ? artifact.content_json?.video_file_path || ""
+        : artifact.content_json?.audio_file_path || "";
     if (!mediaPath) throw statusError(404, "Artifact has no rendered media file.");
     return {
       path: resolve(root, mediaPath),
       content_type: artifact.type === "slide-deck"
         ? artifact.content_json?.pptx_content_type || "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        : artifact.type === "video"
+          ? artifact.content_json?.video_content_type || "video/mp4"
         : artifact.content_json?.audio_content_type || "audio/mpeg",
       file_name: artifact.type === "slide-deck"
         ? artifact.content_json?.pptx_file_name || `${artifact.id}.pptx`
+        : artifact.type === "video"
+          ? artifact.content_json?.video_file_name || `${artifact.id}.mp4`
         : artifact.content_json?.audio_file_name || `${artifact.id}.mp3`,
     };
   }
@@ -2730,17 +2746,29 @@ export async function createSourceStudioEngine(options = {}) {
       });
     }
     if (type === "video") {
-      return {
-        title: titleBase,
-        render_status: "Storyboard and captions generated. MP4 rendering is a documented production extension.",
-        storyboard: keyPoints.slice(0, 6).map((point, index) => ({
+      const storyboard = keyPoints.slice(0, 6).map((point, index) => ({
           scene: index + 1,
           title: titleCase(topicFromSentence(point.text)),
           narration: `${stripCitations(point.text)} ${point.citation}`,
           captions: [stripCitations(point.text)],
-          visual: "Source card, highlighted citation, and Knowledge Layer node",
+          visual: index % 2 === 0 ? "Evidence card with citation rail" : "Source quote with animated topic nodes",
           citations: [citations[index]].filter(Boolean),
-        })),
+      }));
+      return {
+        title: titleBase,
+        video_format: "rendered_mp4_16x9",
+        render_status: "pending_render",
+        video_status: "pending_render",
+        video_style: options.style || "explainer",
+        language: options.language || "English",
+        dimensions: { width: 1280, height: 720 },
+        storyboard,
+        source_coverage: {
+          active_sources: evidencePack.active_source_ids.length,
+          evidence_items: evidencePack.evidence_items.length,
+          cited_sources: new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size,
+          scenes: storyboard.length,
+        },
         citations,
       };
     }
@@ -3689,6 +3717,168 @@ export async function createSourceStudioEngine(options = {}) {
     } finally {
       await rm(textPath, { force: true });
       await rm(aiffPath, { force: true });
+    }
+  }
+
+  async function renderVideoArtifact({ artifactDir, artifactId, payload }) {
+    const storyboard = normalizeVideoStoryboard(payload);
+    if (!storyboard.length) throw new Error("Video Overview needs at least one source-grounded scene.");
+    const startedAt = Date.now();
+    const tempDir = await mkdtemp(join(tmpdir(), `sourcestudio-video-${artifactId}-`));
+    const fileBase = sanitizeFileName(`video-${artifactId}`);
+    const videoPath = join(artifactDir, `${fileBase}.mp4`);
+    const ffmpegPath = env.FFMPEG_PATH || "ffmpeg";
+    const sipsPath = env.SIPS_PATH || "sips";
+    logger.info("video.render.start", {
+      artifact_id: artifactId,
+      scenes: storyboard.length,
+      renderer: "local-ffmpeg-sips",
+    });
+
+    try {
+      const narration = await renderVideoNarrationAudio({
+        tempDir,
+        artifactId,
+        payload,
+        storyboard,
+      });
+      const durations = videoSceneDurations(storyboard, narration?.duration_seconds || 0);
+      const pngPaths = [];
+      for (let index = 0; index < storyboard.length; index += 1) {
+        const svgPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.svg`);
+        const pngPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.png`);
+        await writeFile(svgPath, renderVideoSceneSvg(payload, storyboard[index], {
+          index,
+          total: storyboard.length,
+          duration: durations[index],
+        }));
+        await execFile(sipsPath, ["-s", "format", "png", svgPath, "--out", pngPath], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+        pngPaths.push(pngPath);
+      }
+
+      const concatPath = join(tempDir, "frames.txt");
+      await writeFile(concatPath, videoConcatFile(pngPaths, durations));
+      const totalDuration = Number(durations.reduce((sum, value) => sum + value, 0).toFixed(2));
+      const ffmpegArgs = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        concatPath,
+      ];
+      if (narration?.path) {
+        ffmpegArgs.push("-i", narration.path);
+      } else {
+        ffmpegArgs.push("-f", "lavfi", "-t", String(totalDuration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100");
+      }
+      ffmpegArgs.push(
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-vf",
+        "fps=30,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        videoPath,
+      );
+      await execFile(ffmpegPath, ffmpegArgs, {
+        timeout: 240_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const { size } = await stat(videoPath);
+      const probedDuration = await probeMediaDuration(videoPath, env.FFPROBE_PATH || "ffprobe").catch(() => totalDuration);
+      payload.storyboard = storyboard;
+      payload.video_status = "rendered";
+      payload.render_status = "rendered_mp4";
+      payload.video_renderer = "local-ffmpeg-sips";
+      payload.video_content_type = "video/mp4";
+      payload.video_file_name = `${fileBase}.mp4`;
+      payload.video_file_path = videoPath;
+      payload.video_url = `/api/artifacts/${artifactId}/media`;
+      payload.video_duration_seconds = Number((probedDuration || totalDuration).toFixed(2));
+      payload.video_size_bytes = size;
+      payload.video_resolution = "1280x720";
+      payload.video_scene_count = storyboard.length;
+      payload.video_narration_status = narration?.path ? "rendered_macos_tts" : "silent_track";
+      payload.video_tts_voice = narration?.voice || "";
+      logger.info("video.render.completed", {
+        artifact_id: artifactId,
+        scenes: storyboard.length,
+        bytes: size,
+        duration_seconds: payload.video_duration_seconds,
+        latency_ms: Date.now() - startedAt,
+      });
+    } catch (error) {
+      payload.video_status = "failed";
+      payload.render_status = "render_failed";
+      payload.video_error = safeProviderError(error);
+      logger.error("video.render.failed", {
+        artifact_id: artifactId,
+        latency_ms: Date.now() - startedAt,
+        error: payload.video_error,
+      });
+      throw error;
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  async function renderVideoNarrationAudio({ tempDir, artifactId, payload, storyboard }) {
+    if (env.SOURCESTUDIO_VIDEO_TTS === "false" || process.platform !== "darwin") return null;
+    const script = videoNarrationScript(payload, storyboard);
+    if (!script.trim()) return null;
+    const voice = env.SOURCESTUDIO_VIDEO_TTS_VOICE || env.SOURCESTUDIO_LOCAL_TTS_VOICE || "Alex";
+    const textPath = join(tempDir, "narration.txt");
+    const aiffPath = join(tempDir, "narration.aiff");
+    const audioPath = join(tempDir, "narration.m4a");
+    await writeFile(textPath, script);
+    try {
+      await execFile("say", ["-v", voice, "-f", textPath, "-o", aiffPath], {
+        timeout: 180_000,
+        maxBuffer: 1024 * 1024,
+      });
+      await execFile("afconvert", [aiffPath, audioPath, "-f", "m4af", "-d", "aac"], {
+        timeout: 180_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const duration = await probeMediaDuration(audioPath, env.FFPROBE_PATH || "ffprobe").catch(() => 0);
+      logger.info("video.narration.rendered", {
+        artifact_id: artifactId,
+        provider: "macos-say-fallback",
+        voice,
+        duration_seconds: duration,
+      });
+      return {
+        path: audioPath,
+        voice,
+        duration_seconds: duration,
+      };
+    } catch (error) {
+      logger.warn("video.narration.skipped", {
+        artifact_id: artifactId,
+        error: safeProviderError(error),
+      });
+      return null;
     }
   }
 
@@ -5531,6 +5721,42 @@ function finalizeInfographicPayload(generated, local) {
   return merged;
 }
 
+function finalizeVideoPayload(generated, local) {
+  const base = local && typeof local === "object" && Array.isArray(local.storyboard) ? local : generated;
+  if (!base || typeof base !== "object") return generated;
+  const merged = { ...base, ...(generated && typeof generated === "object" ? generated : {}) };
+  const localScenes = Array.isArray(base.storyboard) ? base.storyboard : [];
+  const generatedScenes = generated && Array.isArray(generated.storyboard) ? generated.storyboard : [];
+  const citations = Array.isArray(base.citations) ? base.citations : Array.isArray(merged.citations) ? merged.citations : [];
+  merged.storyboard = (generatedScenes.length ? generatedScenes : localScenes).slice(0, 8).map((scene, index) => {
+    const localScene = localScenes[index] || {};
+    const citation = scene?.citations?.[0] || localScene?.citations?.[0] || citations[index] || citations[0] || null;
+    const citationLabel = citation?.citation || `[${index + 1}]`;
+    let narration = String(scene?.narration || localScene?.narration || scene?.text || "").trim();
+    if (narration && citationLabel && !/\[\d+\]/.test(narration)) narration = `${narration} ${citationLabel}`;
+    const captions = Array.isArray(scene?.captions) && scene.captions.length
+      ? scene.captions
+      : Array.isArray(localScene?.captions) && localScene.captions.length
+        ? localScene.captions
+        : [stripCitations(narration)];
+    return {
+      ...localScene,
+      ...scene,
+      scene: Number(scene?.scene || localScene?.scene || index + 1),
+      title: String(scene?.title || localScene?.title || `Scene ${index + 1}`).trim(),
+      narration,
+      captions,
+      visual: String(scene?.visual || localScene?.visual || "Source card with highlighted citation").trim(),
+      citations: citation ? [citation] : [],
+    };
+  }).filter((scene) => scene.title || scene.narration);
+  merged.render_status = "pending_render";
+  merged.video_status = "pending_render";
+  merged.video_format = "rendered_mp4_16x9";
+  merged.dimensions = merged.dimensions || { width: 1280, height: 720 };
+  return merged;
+}
+
 // ---------------- Slide deck: render each slide as a designed 16:9 SVG ----------------
 function attachSlideSvgs(payload) {
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.slides)) return payload;
@@ -5659,6 +5885,145 @@ function renderSlideSvg(slide, { index, total, deckTitle }) {
   p.push(svgText(W - M, H - 22, PRODUCT_NAME, { fill: c.muted, size: 12.5, weight: 800, anchor: "end" }));
   p.push(`</svg>`);
   return p.join("");
+}
+
+function normalizeVideoStoryboard(payload) {
+  const citations = Array.isArray(payload?.citations) ? payload.citations : [];
+  const scenes = Array.isArray(payload?.storyboard) ? payload.storyboard : [];
+  return scenes.slice(0, 8).map((scene, index) => {
+    const citation = scene?.citations?.[0] || citations[index] || citations[0] || null;
+    const citationLabel = citation?.citation || `[${index + 1}]`;
+    let narration = String(scene?.narration || scene?.text || scene?.copy || "").trim();
+    if (!narration && Array.isArray(scene?.captions)) narration = String(scene.captions[0] || "").trim();
+    if (narration && citationLabel && !/\[\d+\]/.test(narration)) narration = `${narration} ${citationLabel}`;
+    const captionText = Array.isArray(scene?.captions) && scene.captions.length
+      ? scene.captions.map((caption) => stripCitations(String(caption))).filter(Boolean)
+      : [stripCitations(narration)].filter(Boolean);
+    return {
+      scene: Number(scene?.scene || index + 1),
+      title: truncate(String(scene?.title || `Scene ${index + 1}`).trim(), 72),
+      narration: truncate(narration, 520),
+      captions: captionText.length ? captionText : [truncate(stripCitations(narration), 180)],
+      visual: truncate(String(scene?.visual || "Source-backed evidence card").trim(), 120),
+      citations: citation ? [citation] : [],
+    };
+  }).filter((scene) => scene.title || scene.narration);
+}
+
+function renderVideoSceneSvg(payload, scene, { index, total, duration }) {
+  const W = 1280, H = 720, M = 64;
+  const c = infographicPalette(index % 2 ? "study-map" : "evidence-dashboard");
+  const accent = c.accents[index % c.accents.length];
+  const title = infographicCleanText(scene.title || `Scene ${index + 1}`);
+  const narration = infographicCleanText(scene.narration || "");
+  const caption = infographicCleanText((scene.captions || [])[0] || narration);
+  const citation = scene.citations?.[0] || {};
+  const sourceTitle = truncate(citation.source_title || citation.sourceTitle || "Evidence Pack", 46);
+  const citationLabel = citation.citation || `[${index + 1}]`;
+  const progressW = Math.max(80, Math.round(((index + 1) / Math.max(1, total)) * 260));
+  const titleLines = wrapSvgText(title, 30, 2);
+  const narrationLines = wrapSvgText(narration, 58, 6);
+  const captionLines = wrapSvgText(caption, 82, 2);
+  const parts = [];
+
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(title)}">`);
+  parts.push(`<defs>`);
+  parts.push(`<linearGradient id="vo-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${c.bg0}"/><stop offset="0.62" stop-color="${c.bg1}"/><stop offset="1" stop-color="#10140f"/></linearGradient>`);
+  parts.push(`<linearGradient id="vo-accent" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${accent}" stop-opacity="0.28"/><stop offset="1" stop-color="${accent}" stop-opacity="0.02"/></linearGradient>`);
+  parts.push(`</defs>`);
+  parts.push(`<rect width="${W}" height="${H}" fill="url(#vo-bg)"/>`);
+  for (let gx = M; gx <= W - M; gx += 54) parts.push(`<line x1="${gx}" y1="${M}" x2="${gx}" y2="${H - M}" stroke="${c.text}" stroke-opacity="0.018"/>`);
+  for (let gy = M; gy <= H - M; gy += 54) parts.push(`<line x1="${M}" y1="${gy}" x2="${W - M}" y2="${gy}" stroke="${c.text}" stroke-opacity="0.018"/>`);
+  parts.push(`<circle cx="${W - 168}" cy="118" r="160" fill="${accent}" fill-opacity="0.08"/>`);
+  parts.push(`<circle cx="${W - 168}" cy="118" r="82" fill="none" stroke="${accent}" stroke-opacity="0.18"/>`);
+
+  parts.push(`<rect x="${M}" y="${M}" width="${W - M * 2}" height="${H - M * 2}" rx="28" fill="#111713" fill-opacity="0.76" stroke="${c.panelEdge}"/>`);
+  parts.push(`<rect x="${M}" y="${M}" width="9" height="${H - M * 2}" rx="4.5" fill="${accent}"/>`);
+  parts.push(svgText(M + 28, M + 36, `${PRODUCT_NAME.toUpperCase()} · VIDEO OVERVIEW`, { fill: accent, size: 12.5, weight: 800, spacing: 2.1 }));
+  parts.push(svgText(W - M - 28, M + 36, `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`, { fill: c.muted, size: 13, weight: 800, anchor: "end" }));
+
+  parts.push(`<rect x="${M + 28}" y="${M + 66}" width="272" height="6" rx="3" fill="${c.panelEdge}"/>`);
+  parts.push(`<rect x="${M + 28}" y="${M + 66}" width="${progressW}" height="6" rx="3" fill="${accent}"/>`);
+
+  const leftX = M + 34;
+  const topY = M + 116;
+  parts.push(svgTextBlock(titleLines, leftX, topY, { fill: c.text, size: 48, weight: 850, lineHeight: 56 }));
+  const titleBottom = topY + titleLines.length * 56 + 16;
+  parts.push(`<rect x="${leftX}" y="${titleBottom}" width="486" height="210" rx="24" fill="url(#vo-accent)" stroke="${accent}" stroke-opacity="0.35"/>`);
+  parts.push(`<circle cx="${leftX + 56}" cy="${titleBottom + 56}" r="28" fill="${accent}" fill-opacity="0.18" stroke="${accent}" stroke-opacity="0.48"/>`);
+  parts.push(svgText(leftX + 56, titleBottom + 64, String(index + 1), { fill: accent, size: 25, weight: 850, anchor: "middle" }));
+  parts.push(svgText(leftX + 102, titleBottom + 52, "SOURCE CARD", { fill: accent, size: 12, weight: 850, spacing: 1.4 }));
+  parts.push(svgText(leftX + 102, titleBottom + 82, sourceTitle, { fill: c.text, size: 21, weight: 780 }));
+  parts.push(svgTextBlock(wrapSvgText(scene.visual || "Evidence-backed visual", 42, 3), leftX + 30, titleBottom + 132, { fill: c.muted, size: 18, weight: 560, lineHeight: 25 }));
+  parts.push(`<rect x="${leftX + 30}" y="${titleBottom + 166}" width="74" height="30" rx="15" fill="${accent}" fill-opacity="0.15"/>`);
+  parts.push(svgText(leftX + 67, titleBottom + 187, citationLabel, { fill: accent, size: 14, weight: 850, anchor: "middle" }));
+
+  const rightX = M + 570;
+  parts.push(`<rect x="${rightX}" y="${M + 132}" width="${W - M - rightX - 34}" height="330" rx="24" fill="${c.panel}" stroke="${c.panelEdge}"/>`);
+  parts.push(svgText(rightX + 34, M + 174, "NARRATION", { fill: accent, size: 12, weight: 850, spacing: 1.8 }));
+  parts.push(svgTextBlock(narrationLines, rightX + 34, M + 220, { fill: c.text, size: 24, weight: 620, lineHeight: 33 }));
+  parts.push(`<rect x="${rightX + 34}" y="${M + 490}" width="${W - M - rightX - 102}" height="1" fill="${c.panelEdge}"/>`);
+  parts.push(svgText(rightX + 34, M + 528, `Duration ${Math.max(1, Math.round(duration || 0))}s`, { fill: c.faint, size: 13, weight: 700 }));
+
+  parts.push(`<rect x="${M + 34}" y="${H - M - 102}" width="${W - M * 2 - 68}" height="78" rx="22" fill="#050806" fill-opacity="0.84" stroke="${c.panelEdge}"/>`);
+  parts.push(`<circle cx="${M + 66}" cy="${H - M - 62}" r="5" fill="${accent}"/>`);
+  parts.push(svgTextBlock(captionLines, M + 86, H - M - 71, { fill: c.text, size: 20, weight: 650, lineHeight: 26 }));
+  parts.push(svgText(W - M - 34, H - M - 31, "Source-grounded MP4", { fill: c.faint, size: 12.5, weight: 750, anchor: "end" }));
+  parts.push(`</svg>`);
+  return parts.join("");
+}
+
+function videoSceneDurations(storyboard, audioDuration = 0) {
+  const base = storyboard.map((scene) => {
+    const words = stripCitations(`${scene.title || ""} ${scene.narration || ""}`).split(/\s+/).filter(Boolean).length;
+    return Math.max(5.5, Math.min(13, 3.2 + words / 2.4));
+  });
+  const baseTotal = base.reduce((sum, value) => sum + value, 0) || 1;
+  if (audioDuration > 1) {
+    const scaled = base.map((value) => Math.max(3.5, value * (audioDuration / baseTotal)));
+    const drift = audioDuration - scaled.reduce((sum, value) => sum + value, 0);
+    scaled[scaled.length - 1] += drift;
+    return scaled.map((value) => Number(Math.max(3.5, value).toFixed(2)));
+  }
+  return base.map((value) => Number(value.toFixed(2)));
+}
+
+function videoConcatFile(pngPaths, durations) {
+  const lines = [];
+  pngPaths.forEach((pngPath, index) => {
+    lines.push(`file '${ffconcatPath(pngPath)}'`);
+    lines.push(`duration ${Math.max(0.5, durations[index] || 5).toFixed(2)}`);
+  });
+  if (pngPaths.length) lines.push(`file '${ffconcatPath(pngPaths[pngPaths.length - 1])}'`);
+  return `${lines.join("\n")}\n`;
+}
+
+function ffconcatPath(filePath) {
+  return String(filePath).replaceAll("'", "'\\''");
+}
+
+function videoNarrationScript(payload, storyboard) {
+  const title = infographicCleanText(payload?.title || "Video Overview");
+  return [
+    title,
+    ...storyboard.map((scene) => `${infographicCleanText(scene.title)}. ${spokenAudioText(scene.narration)}`),
+  ].filter(Boolean).join("\n\n");
+}
+
+async function probeMediaDuration(filePath, ffprobePath = "ffprobe") {
+  const { stdout } = await execFile(ffprobePath, [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ], {
+    timeout: 30_000,
+    maxBuffer: 128 * 1024,
+  });
+  return Number(stdout.trim()) || 0;
 }
 
 function normalizeChoice(value, allowed, fallback) {
