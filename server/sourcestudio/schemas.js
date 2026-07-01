@@ -67,6 +67,16 @@ export const CreateSourceSchema = z.object({
   crawl: z.boolean().optional().default(true),
   crawl_max_pages: z.number().int().min(1).max(200).optional(),
   defer_indexing: z.boolean().optional().default(false),
+}).superRefine((value, ctx) => {
+  // Link-based sources without a URL would otherwise be accepted and fail
+  // asynchronously with an opaque TypeError during ingestion.
+  if (["url", "youtube", "google_doc"].includes(value.type) && !value.original_url && !value.body?.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["original_url"],
+      message: `A ${value.type} source needs an original_url (or pasted body text).`,
+    });
+  }
 });
 
 export const ChatRequestSchema = z.object({

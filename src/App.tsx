@@ -8,7 +8,6 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
   ReactNode,
-  WheelEvent as ReactWheelEvent,
 } from "react";
 import {
   ArrowRight,
@@ -306,15 +305,6 @@ interface InfographicPanelPayload {
   metric_value?: string;
 }
 
-interface SourceBlock {
-  block_id: string;
-  source_id: string;
-  type: string;
-  text: string;
-  heading_path: string[];
-  order_index: number;
-}
-
 interface KnowledgeObject {
   id: string;
   type: string;
@@ -513,6 +503,7 @@ const MAX_SOURCE_UPLOAD_MB = 200;
 const MAX_SOURCE_UPLOAD_BYTES = MAX_SOURCE_UPLOAD_MB * 1024 * 1024;
 const SOURCE_UPLOAD_LIMIT_LABEL = `${MAX_SOURCE_UPLOAD_MB} MB`;
 const SOURCE_UPLOAD_PARALLELISM = 3;
+const LARGE_UPLOAD_SEQUENTIAL_BYTES = 32 * 1024 * 1024;
 
 const emptySourceForm: SourceForm = {
   type: "markdown",
@@ -596,31 +587,31 @@ const sourceModeOptions: Array<{ value: SourceMode; label: string }> = [
 const baseReportFormatOptions: ReportFormatOption[] = [
   {
     id: "custom",
-    title: "Create Your Own",
-    description: "Craft reports your way by specifying structure, style, tone, and more",
+    title: "Custom Report",
+    description: "Define the report question, audience, scope, and decision context",
     kind: "custom",
-    prompt: "Create a custom source-grounded report using the structure, style, tone, and focus requested by the user.",
+    prompt: "Create a formal source-grounded report using the user's requested scope, audience, and decision context.",
   },
   {
-    id: "briefing-doc",
-    title: "Briefing Doc",
-    description: "Overview of your sources featuring key insights and quotes",
+    id: "research-report",
+    title: "Research Report",
+    description: "Formal synthesis with abstract, scope, method, findings, analysis, and appendix",
     kind: "template",
-    prompt: "Create a concise briefing document with summary, key insights, direct quotes, risks, open questions, and bibliography.",
+    prompt: "Create a formal research report with abstract, scope, methodology, principal findings, analytical sections, recommendations, limitations, and bibliography.",
   },
   {
-    id: "study-guide",
-    title: "Study Guide",
-    description: "Short-answer quiz, suggested essay questions, and glossary of key terms",
+    id: "decision-report",
+    title: "Decision Report",
+    description: "Decision-ready analysis of context, options, tradeoffs, recommendation, and risks",
     kind: "template",
-    prompt: "Create a study guide with core concepts, short-answer questions, essay prompts, glossary terms, citations, and source-backed explanations.",
+    prompt: "Create a decision report with context, decision question, options, evidence-backed analysis, recommended course of action, risk register, and next steps.",
   },
   {
-    id: "blog-post",
-    title: "Blog Post",
-    description: "Insightful takeaways distilled into a highly readable article",
+    id: "technical-report",
+    title: "Technical Report",
+    description: "Precise analysis of architecture, workflow, implementation state, gaps, and controls",
     kind: "template",
-    prompt: "Create a readable blog post that distills source-backed takeaways, examples, caveats, and citations without adding outside facts.",
+    prompt: "Create a technical report with system context, architecture or workflow analysis, observed evidence, implementation gaps, operational risks, and recommendations.",
   },
 ];
 
@@ -698,6 +689,9 @@ export default function App() {
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
   const deletingSourceIdsRef = useRef<Set<string>>(new Set());
   const pendingSourceActiveOverridesRef = useRef<globalThis.Map<string, boolean>>(new globalThis.Map());
+  // Ref (not state): two Enter keydowns can land in the same render batch, where
+  // isAsking is still stale — the disabled send button doesn't cover the key path.
+  const askInFlightRef = useRef(false);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
   const workspacePreferredLayoutRef = useRef<WorkspaceLayout>(readWorkspaceLayout());
@@ -706,7 +700,6 @@ export default function App() {
   const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
   const [sourceFileQueue, setSourceFileQueue] = useState<QueuedSourceFile[]>([]);
   const [activeSourceId, setActiveSourceId] = useState("");
-  const [, setSourceBlocks] = useState<SourceBlock[]>([]);
   const [, setHighlightedBlockIds] = useState<string[]>([]);
   const [question, setQuestion] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
@@ -793,11 +786,6 @@ export default function App() {
     setSelectedArtifactId("");
     setIsArtifactDetailOpen(false);
   }, [notebook, selectedArtifactId]);
-
-  useEffect(() => {
-    if (!activeSourceId) return;
-    void loadSourceBlocks(activeSourceId);
-  }, [activeSourceId]);
 
   useEffect(() => {
     const messagesNode = messagesRef.current;
@@ -1020,6 +1008,33 @@ export default function App() {
     }
   }
 
+  async function deleteNotebookById(item: Notebook) {
+    const label = item.title || "Untitled notebook";
+    if (!window.confirm(`Delete notebook "${label}" with all its sources and outputs? This cannot be undone.`)) return;
+    setOpenMenu("");
+    setError("");
+    try {
+      await api(`/api/notebooks/${item.id}`, { method: "DELETE" });
+      const remaining = notebooks.filter((entry) => entry.id !== item.id);
+      setNotebooks(remaining);
+      if (notebook?.id === item.id) {
+        forgetRememberedNotebookId();
+        const next = remaining[0];
+        if (next) {
+          await switchNotebook(next.id);
+        } else {
+          setNotebook(null);
+          setActiveSourceId("");
+          setSelectedArtifactId("");
+        }
+      }
+      setToast(`Notebook "${label}" deleted.`);
+      refreshDebugSilently();
+    } catch (deleteError) {
+      setError(messageFromError(deleteError));
+    }
+  }
+
   function openAddSource(type: SourceType = "markdown") {
     setSourceForm({ ...emptySourceForm, type });
     setSourceFileQueue([]);
@@ -1112,7 +1127,9 @@ export default function App() {
 
   async function refreshNotebook(id = notebook?.id) {
     if (!id) return;
-    setNotebook(notebookWithPendingSourceOverrides(await loadNotebook(id)));
+    const fresh = notebookWithPendingSourceOverrides(await loadNotebook(id));
+    // Guard against late responses hijacking the UI after a notebook switch.
+    setNotebook((current) => (current?.id === id ? fresh : current));
   }
 
   async function loadNotebook(id: string) {
@@ -1275,10 +1292,11 @@ export default function App() {
       }
       setNotebook((current) => {
         if (current?.id !== notebookId) return current;
-        if (!deletingSourceIdsRef.current.size) return fresh;
-        const sources = fresh.sources.filter((source) => !deletingSourceIdsRef.current.has(source.id));
+        const withOverrides = notebookWithPendingSourceOverrides(fresh);
+        if (!deletingSourceIdsRef.current.size) return withOverrides;
+        const sources = withOverrides.sources.filter((source) => !deletingSourceIdsRef.current.has(source.id));
         return {
-          ...fresh,
+          ...withOverrides,
           sources,
           source_count: sources.length,
           active_source_count: sources.filter((source) => source.active).length,
@@ -1308,7 +1326,7 @@ export default function App() {
             } catch {
               break;
             }
-            setNotebook((current) => (current?.id === notebookId ? fresh : current));
+            setNotebook((current) => (current?.id === notebookId ? notebookWithPendingSourceOverrides(fresh) : current));
           }
         }
         refreshDebugSilently();
@@ -1319,15 +1337,6 @@ export default function App() {
 
   async function pollSourceUntilReady(sourceId: string, notebookId: string) {
     await pollSourcesUntilReady([sourceId], notebookId);
-  }
-
-  async function loadSourceBlocks(sourceId: string) {
-    try {
-      const response = await api<{ blocks: SourceBlock[] }>(`/api/sources/${sourceId}/blocks`);
-      setSourceBlocks(response.blocks);
-    } catch (blockError) {
-      setError(messageFromError(blockError));
-    }
   }
 
   async function handleSeedReset() {
@@ -1516,7 +1525,7 @@ export default function App() {
             }
           : queued,
       ));
-      const results = await mapWithConcurrency(queue, SOURCE_UPLOAD_PARALLELISM, async (item) => {
+      const uploadOne = async (item: (typeof queue)[number]) => {
         let lastUploadPercent = 0;
         const updateQueuedFile = (patch: Partial<QueuedSourceFile>) => {
           setSourceFileQueue((current) => current.map((queued) =>
@@ -1585,7 +1594,15 @@ export default function App() {
           });
           return { itemId: item.id, error: messageFromError(uploadError), ok: false as const };
         }
-      });
+      };
+      // Base64-encoding holds ~1.33x the file in memory per upload; big files in
+      // parallel can OOM the tab, so anything above the threshold runs alone.
+      const smallFiles = queue.filter((item) => item.size < LARGE_UPLOAD_SEQUENTIAL_BYTES);
+      const largeFiles = queue.filter((item) => item.size >= LARGE_UPLOAD_SEQUENTIAL_BYTES);
+      const results = [
+        ...(await mapWithConcurrency(smallFiles, SOURCE_UPLOAD_PARALLELISM, uploadOne)),
+        ...(await mapWithConcurrency(largeFiles, 1, uploadOne)),
+      ];
       const addedSources = results.filter((result): result is Extract<typeof result, { ok: true }> => result.ok);
       const failed = results.length - addedSources.length;
       const sourceIds = addedSources.map((result) => result.sourceId);
@@ -1704,7 +1721,8 @@ export default function App() {
 
   async function askQuestion(input = question) {
     const trimmed = input.trim();
-    if (!notebook || !trimmed) return;
+    if (!notebook || !trimmed || askInFlightRef.current) return;
+    askInFlightRef.current = true;
     setIsAsking(true);
     setError("");
     setQuestion("");
@@ -1743,6 +1761,7 @@ export default function App() {
       setQuestion(trimmed);
       setError(messageFromError(chatError));
     } finally {
+      askInFlightRef.current = false;
       setIsAsking(false);
     }
   }
@@ -1784,10 +1803,20 @@ export default function App() {
       // ~60s rewrite-proxy timeout. Each poll is a fast request, so it stays well under.
       let job = start.job;
       const deadline = Date.now() + artifactPollDeadlineMs(type);
+      let pollFailures = 0;
       while (job && (job.status === "queued" || job.status === "running") && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        const poll = await api<{ job: ArtifactJob }>(`/api/jobs/${job.id}`);
-        job = poll.job;
+        try {
+          const poll = await api<{ job: ArtifactJob }>(`/api/jobs/${job.id}`);
+          job = poll.job;
+          pollFailures = 0;
+        } catch (pollError) {
+          // The job keeps running server-side; a transient network blip while
+          // polling must not surface as a generation failure.
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          continue;
+        }
         if (job?.status === "running" && job.progress > 0) {
           setToast(`Generating ${artifactLabel}… ${job.progress}%`);
         }
@@ -2195,17 +2224,27 @@ export default function App() {
                   <Menu align="start" onClose={() => setOpenMenu("")}>
                     <p className="menu-label">Your notebooks</p>
                     {notebooks.map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        className="menu-item"
-                        data-active={item.id === notebook?.id}
-                        onClick={() => void switchNotebook(item.id)}
-                      >
-                        <Library size={15} />
-                        <span>{item.title || "Untitled notebook"}</span>
-                        {item.id === notebook?.id ? <CheckCircle2 size={15} /> : null}
-                      </button>
+                      <div key={item.id} className="menu-item-row">
+                        <button
+                          type="button"
+                          className="menu-item"
+                          data-active={item.id === notebook?.id}
+                          onClick={() => void switchNotebook(item.id)}
+                        >
+                          <Library size={15} />
+                          <span>{item.title || "Untitled notebook"}</span>
+                          {item.id === notebook?.id ? <CheckCircle2 size={15} /> : null}
+                        </button>
+                        <button
+                          type="button"
+                          className="menu-item-delete"
+                          aria-label={`Delete notebook ${item.title || "Untitled notebook"}`}
+                          title="Delete notebook"
+                          onClick={() => void deleteNotebookById(item)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
                     ))}
                     <div className="menu-divider" />
                     <button type="button" className="menu-item" onClick={() => void createNotebook()} disabled={isCreatingNotebook}>
@@ -4780,6 +4819,27 @@ function reportItemText(item: unknown): string {
     .join("; ");
 }
 
+function reportHeadingFromText(value: string, fallback: string) {
+  const cleaned = value
+    .replace(/\[[0-9]+\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return fallback;
+  const firstSentence = cleaned.split(/[.!?]/)[0]?.trim() || cleaned;
+  return clipReportText(firstSentence, 78);
+}
+
+function isReportAuditSection(section: Record<string, unknown>) {
+  const heading = String(section.heading || section.title || "").trim();
+  return /^(evidence\s+audit|citation\s+audit|source\s+audit|audit)$/i.test(heading);
+}
+
+function reportFindingDisplayHeading(finding: Record<string, unknown>, index: number) {
+  const heading = String(finding.heading || finding.title || "").trim();
+  if (heading && !/^finding\s+\d+$/i.test(heading)) return heading;
+  return reportHeadingFromText(reportItemText(finding), `Finding ${index + 1}`);
+}
+
 function ReportPreview({
   payload,
   onCitationClick,
@@ -4788,45 +4848,51 @@ function ReportPreview({
   onCitationClick: (citation: Citation) => void;
 }) {
   const citations = Array.isArray(payload.citations) ? payload.citations as Citation[] : [];
+  const abstract = reportItems(payload.abstract);
   const executiveSummary = reportItems(payload.executive_summary);
-  const tldr = reportItems(payload.tldr).slice(0, 6);
+  const scope = reportItems(payload.scope);
+  const methodology = reportItems(payload.methodology);
   const findings = Array.isArray(payload.key_findings)
     ? payload.key_findings as Array<Record<string, unknown>>
     : (Array.isArray(payload.key_points) ? payload.key_points as Array<Record<string, unknown>> : []);
-  const sections = Array.isArray(payload.detailed_sections) ? payload.detailed_sections as Array<Record<string, unknown>> : [];
+  const sections = Array.isArray(payload.detailed_sections)
+    ? (payload.detailed_sections as Array<Record<string, unknown>>).filter((section) => !isReportAuditSection(section))
+    : [];
   const recommendations = reportItems(payload.recommendations);
   const risks = reportItems(payload.risks_limitations);
   const questions = reportItems(payload.open_questions);
   const bibliography = reportItems(payload.bibliography);
+  const intro = abstract.length ? abstract : executiveSummary;
 
   return (
     <article className="report-preview">
-      {executiveSummary.length ? (
+      {intro.length ? (
         <section className="report-section report-executive">
-          <h4>Executive summary</h4>
-          {executiveSummary.map((paragraph, index) => (
+          <h4>Executive Summary</h4>
+          {intro.map((paragraph, index) => (
             <p key={index}>{renderInline(paragraph, citations, onCitationClick, `report-exec-${index}`)}</p>
           ))}
         </section>
       ) : null}
 
-      {tldr.length ? (
-        <section className="report-section report-brief">
-          <h4>TL;DR</h4>
-          <ul>
-            {tldr.map((item, index) => (
-              <li key={index}>{renderInline(item, citations, onCitationClick, `report-tldr-${index}`)}</li>
-            ))}
-          </ul>
+      {scope.length || methodology.length ? (
+        <section className="report-section report-method">
+          <h4>Scope and Method</h4>
+          {scope.map((paragraph, index) => (
+            <p key={`scope-${index}`}>{renderInline(paragraph, citations, onCitationClick, `report-scope-${index}`)}</p>
+          ))}
+          {methodology.map((paragraph, index) => (
+            <p key={`method-${index}`}>{renderInline(paragraph, citations, onCitationClick, `report-method-${index}`)}</p>
+          ))}
         </section>
       ) : null}
 
       {findings.length ? (
         <section className="report-section">
-          <h4>Key findings</h4>
+          <h4>Principal Findings</h4>
           <div className="report-finding-list">
             {findings.slice(0, 8).map((finding, index) => {
-              const heading = String(finding.heading || `Finding ${index + 1}`);
+              const heading = reportFindingDisplayHeading(finding, index);
               const text = reportItemText(finding);
               const analysis = typeof finding.analysis === "string" ? finding.analysis : "";
               return (
@@ -4889,7 +4955,7 @@ function ReportPreview({
       <section className="report-section report-appendix">
         {risks.length ? (
           <div>
-            <h4>Risks and limitations</h4>
+            <h4>Limitations and Risks</h4>
             <ul>{risks.map((item, index) => <li key={index}>{renderInline(item, citations, onCitationClick, `report-risk-${index}`)}</li>)}</ul>
           </div>
         ) : null}
@@ -5534,13 +5600,22 @@ function MindMapPreview({
     });
   };
 
-  const onWheel = (event: ReactWheelEvent<SVGSVGElement>) => {
-    event.preventDefault();
-    const rect = svgRef.current?.getBoundingClientRect();
-    const cx = rect ? event.clientX - rect.left : size.w / 2;
-    const cy = rect ? event.clientY - rect.top : size.h / 2;
-    zoomAround(event.deltaY < 0 ? 1.12 : 1 / 1.12, cx, cy);
-  };
+  // Native non-passive listener: React registers onWheel passively on the root,
+  // so preventDefault() there is a no-op and the page scrolls while zooming.
+  const zoomAroundRef = useRef(zoomAround);
+  zoomAroundRef.current = zoomAround;
+  const hasNodes = layout.nodes.length > 0;
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg || !hasNodes) return;
+    const handler = (event: WheelEvent) => {
+      event.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      zoomAroundRef.current(event.deltaY < 0 ? 1.12 : 1 / 1.12, event.clientX - rect.left, event.clientY - rect.top);
+    };
+    svg.addEventListener("wheel", handler, { passive: false });
+    return () => svg.removeEventListener("wheel", handler);
+  }, [hasNodes]);
 
   const onPanDown = (event: ReactPointerEvent<SVGRectElement>) => {
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -5569,7 +5644,10 @@ function MindMapPreview({
     const clone = group.cloneNode(true) as SVGGElement;
     clone.setAttribute("transform", `translate(${pad - minX} ${pad - minY})`);
     const serialized = new XMLSerializer().serializeToString(clone);
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="${width}" height="${height}" fill="#0d141c"/>${serialized}</svg>`;
+    // The live SVG gets connector strokes from the app stylesheet; a standalone
+    // export has no stylesheet, so without this the links rasterize invisible.
+    const exportStyles = "<style>.mm-link{stroke:rgba(214,221,215,0.38);stroke-width:1.7px;stroke-linecap:round}.mm-link-label{display:none}</style>";
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${exportStyles}<rect width="${width}" height="${height}" fill="#0d141c"/>${serialized}</svg>`;
     rasterizeSvg(svg, Math.min(2600, width * 2))
       .then(({ dataUrl }) => {
         const anchor = document.createElement("a");
@@ -5597,7 +5675,6 @@ function MindMapPreview({
             width="100%"
             height="100%"
             viewBox={`0 0 ${size.w} ${size.h}`}
-            onWheel={onWheel}
             role="img"
             aria-label={`Mind map: ${title || "Notebook"}`}
           >
@@ -5746,6 +5823,11 @@ function SlideDeckPreview({
   const [presentationIndex, setPresentationIndex] = useState<number | null>(null);
   const [exporting, setExporting] = useState<"" | "pdf" | "png">("");
   const slideStackRef = useRef<HTMLDivElement | null>(null);
+  const presenterCloseRef = useRef<HTMLButtonElement | null>(null);
+  const presentationOpen = presentationIndex !== null;
+  useEffect(() => {
+    if (presentationOpen) presenterCloseRef.current?.focus();
+  }, [presentationOpen]);
   useEffect(() => {
     setActiveIndex(0);
     setPresentationIndex(null);
@@ -5766,6 +5848,15 @@ function SlideDeckPreview({
     };
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (!slides.length || isTypingTarget(event.target)) return;
+      const inPresentation = presentationIndex !== null;
+      // Only steal keys app-wide in presentation mode; embedded in the studio
+      // panel the deck responds only while it has focus.
+      if (!inPresentation && !slideStackRef.current?.contains(document.activeElement)) return;
+      if (event.key === "Escape" && inPresentation) {
+        event.preventDefault();
+        setPresentationIndex(null);
+        return;
+      }
       if (event.key === "ArrowRight" || event.key === "ArrowDown" || event.key === "PageDown" || event.key === " ") {
         event.preventDefault();
         const base = presentationIndex === null ? activeIndex : presentationIndex;
@@ -5920,7 +6011,7 @@ function SlideDeckPreview({
       {presentationSlide && currentPresentationIndex !== null ? createPortal(
         <div className="slide-presenter-backdrop" role="dialog" aria-modal="true" aria-label="Slide deck presentation" onClick={() => setPresentationIndex(null)}>
           <div className="slide-presenter" onClick={(event) => event.stopPropagation()}>
-            <button type="button" className="icon-button subtle slide-presenter-close" onClick={() => setPresentationIndex(null)} aria-label="Close presentation">
+            <button ref={presenterCloseRef} type="button" className="icon-button subtle slide-presenter-close" onClick={() => setPresentationIndex(null)} aria-label="Close presentation">
               <XCircle size={22} />
             </button>
             <button
@@ -7036,7 +7127,10 @@ function citationFromSourceRef(ref: Record<string, unknown>, fallbackTitle: stri
 }
 
 function csvTextCell(value: unknown) {
-  const text = String(value ?? "");
+  let text = String(value ?? "");
+  // Source content is untrusted; a leading =/+/-/@ would execute as a formula
+  // when the exported CSV is opened in Excel/Sheets.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 

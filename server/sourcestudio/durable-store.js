@@ -68,7 +68,7 @@ export function createDurableStore({ env = process.env, logger } = {}) {
       await ready();
       const pool = await getPool();
       const result = await pool.query("select value from app_kv where key = $1", [key]);
-      return decodeValue(result.rows[0]?.value ?? null);
+      return await decodeValue(result.rows[0]?.value ?? null);
     } catch (error) {
       logger?.warn?.("kv.get.failed", { key, error: String(error?.message || error).slice(0, 160) });
       return null;
