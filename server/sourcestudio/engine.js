@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import PptxGenJS from "pptxgenjs";
+import { fetch as undiciFetch, ProxyAgent as UndiciProxyAgent } from "undici";
 import {
   ActiveSourceSchema,
   ArtifactRequestSchema,
@@ -2016,9 +2017,12 @@ export async function createSourceStudioEngine(options = {}) {
       const videoId = youtubeVideoId(source.original_url);
       const hasUserTranscript = Boolean(payload.body?.trim());
       const deepgramKey = realProviderKey(env.DEEPGRAM_API_KEY);
+      // Tracks whether any fetch path hit YouTube's datacenter-IP bot check, so
+      // the final error can name the real cause instead of "no captions".
+      const ytDiag = { botCheck: false };
       let rawText = hasUserTranscript
         ? payload.body
-        : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId });
+        : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId, diag: ytDiag });
       let parser = hasUserTranscript ? "youtube-user-transcript" : "youtube-transcript-fetcher";
       // No captions available? Transcribe the audio track with Deepgram so the
       // video is still fully transcribed instead of left as a short placeholder.
@@ -2034,6 +2038,7 @@ export async function createSourceStudioEngine(options = {}) {
           fetchImpl,
           logger,
           requestId: context.requestId,
+          diag: ytDiag,
         });
         const audioWords = audioText ? audioText.split(/\s+/).filter(Boolean).length : 0;
         if (audioWords > 30) {
@@ -2049,8 +2054,16 @@ export async function createSourceStudioEngine(options = {}) {
           request_id: context.requestId,
           video_id: videoId,
           has_deepgram: Boolean(deepgramKey),
+          bot_check: ytDiag.botCheck,
           words: rawText.split(/\s+/).filter(Boolean).length,
         });
+        if (ytDiag.botCheck) {
+          logger.warn("youtube.blocked_ip", { request_id: context.requestId, video_id: videoId });
+          throw statusError(
+            422,
+            "YouTube blocked this server's requests (cloud-IP bot check), so captions and audio transcription could not be fetched. Paste the video transcript into the source body to import it now — or configure a residential egress proxy (YTDLP_PROXY) to restore automatic YouTube ingestion.",
+          );
+        }
         throw statusError(
           422,
           "Could not load the YouTube transcript. Captions and automatic audio transcription were unavailable; paste the transcript manually or retry with a working YouTube transcript path.",
@@ -5807,12 +5820,62 @@ function externalToolErrorSummary(error, maxLength = 300) {
     .slice(0, maxLength);
 }
 
-// Optional egress proxy for yt-dlp. YouTube blocks caption/audio downloads from
-// datacenter IPs (Cloud Run), so route yt-dlp through a (residential) proxy when
-// YTDLP_PROXY is set. No-op locally / when unset.
+// YouTube rejects unauthenticated requests from datacenter IPs (Cloud Run) with a
+// "confirm you're not a bot" check. Two escape hatches, both optional:
+//  - YTDLP_PROXY: residential egress proxy — the reliable fix; also used for the
+//    direct caption fetches below so all YouTube traffic shares one egress IP.
+//  - YTDLP_COOKIES_B64 / YTDLP_COOKIES_FILE: Netscape cookies from a logged-in
+//    session. Works but cookies expire unpredictably and carry account risk.
+const YOUTUBE_BOT_CHECK_PATTERN = /sign in to confirm|confirm you.{0,3}re not a bot|login_required/i;
+
+function noteYouTubeBotCheck(diag, errorText) {
+  if (diag && YOUTUBE_BOT_CHECK_PATTERN.test(String(errorText || ""))) diag.botCheck = true;
+  return errorText;
+}
+
 function ytDlpNetworkArgs() {
+  const args = [];
   const proxy = String(process.env.YTDLP_PROXY || "").trim();
-  return proxy ? ["--proxy", proxy] : [];
+  if (proxy) args.push("--proxy", proxy);
+  const cookies = ytDlpCookiesFile();
+  if (cookies) args.push("--cookies", cookies);
+  return args;
+}
+
+// yt-dlp rewrites its cookie file after every run, so the cookies must live on a
+// writable path even when they arrive via env var or a read-only secret mount.
+let ytDlpCookiesCache = { key: null, file: "" };
+function ytDlpCookiesFile() {
+  const explicit = String(process.env.YTDLP_COOKIES_FILE || "").trim();
+  const b64 = String(process.env.YTDLP_COOKIES_B64 || "").trim();
+  const key = `${explicit}\n${b64}`;
+  if (ytDlpCookiesCache.key === key) return ytDlpCookiesCache.file;
+  let file = "";
+  try {
+    if (explicit || b64) {
+      const dir = mkdtempSync(join(tmpdir(), "ytdlp-cookies-"));
+      file = join(dir, "cookies.txt");
+      writeFileSync(file, explicit ? readFileSync(explicit) : Buffer.from(b64, "base64"));
+    }
+  } catch {
+    file = "";
+  }
+  ytDlpCookiesCache = { key, file };
+  return file;
+}
+
+// Route the direct watch-page/timedtext fetches through the same proxy as yt-dlp.
+// Node's global fetch ignores proxy env vars, and mixing npm-undici dispatchers
+// into the built-in fetch is unsupported — so use undici's own fetch when proxied.
+let youtubeProxyState = null;
+function youtubeEgressFetch(fetchImpl) {
+  const proxy = String(process.env.YTDLP_PROXY || "").trim();
+  if (!proxy || fetchImpl !== globalThis.fetch) return fetchImpl;
+  if (!youtubeProxyState || youtubeProxyState.proxy !== proxy) {
+    youtubeProxyState = { proxy, dispatcher: new UndiciProxyAgent(proxy) };
+  }
+  const { dispatcher } = youtubeProxyState;
+  return (url, init = {}) => undiciFetch(url, { ...init, dispatcher });
 }
 
 async function fetchYouTubeTitle(videoId) {
@@ -5833,7 +5896,7 @@ async function fetchYouTubeTitle(videoId) {
 // When a video has no captions, download its audio track (yt-dlp) and transcribe
 // it with Deepgram, so a YouTube source is still fully transcribed rather than a
 // placeholder. ffmpeg (inside transcribeAudioWithDeepgram) normalizes the audio.
-async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch, logger, requestId } = {}) {
+async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch, logger, requestId, diag } = {}) {
   if (!videoId || !apiKey || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
   const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
   let dir;
@@ -5860,7 +5923,7 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
     logger?.warn("youtube.audio_transcribe.failed", {
       request_id: requestId,
       video_id: videoId,
-      error: externalToolErrorSummary(error),
+      error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
     });
     return "";
   } finally {
@@ -5886,22 +5949,26 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
       logger?.warn("youtube.transcript.ytdlp.failed", {
         request_id: requestId,
         video_id: videoId,
-        error: externalToolErrorSummary(error),
+        error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
       });
       // yt-dlp may be missing or rate-limited; fall back to the direct fetch paths.
     }
   }
 
+  // The direct fallbacks must egress through the same proxy as yt-dlp, otherwise
+  // they are guaranteed-blocked exactly when the primary path needed the proxy.
+  const directFetch = youtubeEgressFetch(fetchImpl);
+
   // Preferred path: read the watch page and use the real caption-track URLs.
   // Unlike the bare timedtext endpoint, this works for auto-generated ("asr")
   // captions and any available language, which is what most videos actually have.
   try {
-    const tracks = await fetchYouTubeCaptionTracks(videoId, fetchImpl);
+    const tracks = await fetchYouTubeCaptionTracks(videoId, directFetch);
     const track = pickBestCaptionTrack(tracks);
     if (track?.baseUrl) {
       const baseUrl = track.baseUrl.replace(/\\u0026/g, "&");
       const trackUrl = /[?&]fmt=/.test(baseUrl) ? baseUrl : `${baseUrl}&fmt=json3`;
-      const response = await fetchImpl(trackUrl, {
+      const response = await directFetch(trackUrl, {
         headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
       });
       if (response.ok) {
@@ -5933,7 +6000,7 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
   for (const lang of ["en", "en-US", "de"]) {
     try {
       const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${encodeURIComponent(videoId)}&lang=${encodeURIComponent(lang)}&fmt=json3`;
-      const response = await fetchImpl(transcriptUrl, {
+      const response = await directFetch(transcriptUrl, {
         headers: { "user-agent": YOUTUBE_UA },
       });
       if (!response.ok) continue;
@@ -6006,7 +6073,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
     logger?.warn("youtube.transcript.ytdlp.metadata_failed", {
       request_id: requestId,
       video_id: videoId,
-      error: externalToolErrorSummary(error),
+      error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
     });
     // Metadata probe failed; fall back to a small fixed request set below.
   }
@@ -6044,7 +6111,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
         request_id: requestId,
         video_id: videoId,
         lang: chosenLang || "fallback",
-        error: externalToolErrorSummary(error),
+        error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
       });
       // --ignore-errors keeps successful tracks; read whatever was written below.
     });

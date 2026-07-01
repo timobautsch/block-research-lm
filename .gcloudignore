@@ -10,3 +10,6 @@ dist
 *.log
 scratchpad
 .DS_Store
+# Local screen recordings must never end up in the build context (165MB+ each).
+CleanShot*
+*.mp4
