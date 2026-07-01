@@ -5994,6 +5994,11 @@ function FlashcardSession({
   const [mode, setMode] = useState<"all" | "missed">("all");
   const [isExpanded, setIsExpanded] = useState(false);
   const [order, setOrder] = useState<string[]>([]);
+  const onArtifactRefreshRef = useRef(onArtifactRefresh);
+
+  useEffect(() => {
+    onArtifactRefreshRef.current = onArtifactRefresh;
+  }, [onArtifactRefresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -6003,7 +6008,14 @@ function FlashcardSession({
         const response = await api<{ deck: FlashcardDeck }>(`/api/artifacts/${artifact.id}/flashcard-deck`);
         if (!cancelled) setDeck(response.deck);
       } catch (deckError) {
-        if (!cancelled) onError(messageFromError(deckError));
+        if (!cancelled) {
+          const message = messageFromError(deckError);
+          if (message.toLowerCase().includes("artifact not found")) {
+            onArtifactRefreshRef.current();
+          } else {
+            onError(message);
+          }
+        }
       } finally {
         if (!cancelled) setIsLoading(false);
       }
