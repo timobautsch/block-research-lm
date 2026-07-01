@@ -2064,6 +2064,12 @@ export async function createSourceStudioEngine(options = {}) {
             "YouTube blocked this server's requests (cloud-IP bot check), so captions and audio transcription could not be fetched. Paste the video transcript into the source body to import it now — or configure a residential egress proxy (YTDLP_PROXY) to restore automatic YouTube ingestion.",
           );
         }
+        if (ytDiag.audioDownloaded) {
+          throw statusError(
+            422,
+            "This video has no captions and its audio contains no recognizable speech (music-only video?), so there is no transcript to index. Paste your own notes or a transcript into the source body to import it anyway.",
+          );
+        }
         throw statusError(
           422,
           "Could not load the YouTube transcript. Captions and automatic audio transcription were unavailable; paste the transcript manually or retry with a working YouTube transcript path.",
@@ -5833,9 +5839,21 @@ function noteYouTubeBotCheck(diag, errorText) {
   return errorText;
 }
 
+// YTDLP_PROXY may contain a "{session}" placeholder (rotating-proxy sticky
+// sessions, e.g. IPRoyal's password_session-XXX_lifetime-30m). Each yt-dlp
+// invocation gets a fresh session token so one download sticks to ONE egress
+// IP — YouTube binds media URLs to the requesting IP, so per-request rotation
+// breaks/stalls audio downloads — while separate downloads still rotate.
+function ytDlpProxyUrl(sessionToken = "") {
+  const proxy = String(process.env.YTDLP_PROXY || "").trim();
+  if (!proxy || !proxy.includes("{session}")) return proxy;
+  const token = sessionToken || randomUUID().replace(/-/g, "").slice(0, 12);
+  return proxy.replaceAll("{session}", token);
+}
+
 function ytDlpNetworkArgs() {
   const args = [];
-  const proxy = String(process.env.YTDLP_PROXY || "").trim();
+  const proxy = ytDlpProxyUrl();
   if (proxy) args.push("--proxy", proxy);
   const cookies = ytDlpCookiesFile();
   if (cookies) args.push("--cookies", cookies);
@@ -5868,9 +5886,10 @@ function ytDlpCookiesFile() {
 // Node's global fetch ignores proxy env vars, and mixing npm-undici dispatchers
 // into the built-in fetch is unsupported — so use undici's own fetch when proxied.
 let youtubeProxyState = null;
+const youtubeFetchSessionToken = randomUUID().replace(/-/g, "").slice(0, 12);
 function youtubeEgressFetch(fetchImpl) {
-  const proxy = String(process.env.YTDLP_PROXY || "").trim();
-  if (!proxy || fetchImpl !== globalThis.fetch) return fetchImpl;
+  if (!String(process.env.YTDLP_PROXY || "").trim() || fetchImpl !== globalThis.fetch) return fetchImpl;
+  const proxy = ytDlpProxyUrl(youtubeFetchSessionToken);
   if (!youtubeProxyState || youtubeProxyState.proxy !== proxy) {
     youtubeProxyState = { proxy, dispatcher: new UndiciProxyAgent(proxy) };
   }
@@ -5906,18 +5925,24 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
       ytDlpPath,
       [
         ...ytDlpNetworkArgs(),
-        "-f", "bestaudio/best",
+        // Speech doesn't need high bitrates: prefer a small audio format so
+        // downloads stay fast (and cheap) over residential-proxy bandwidth.
+        "-f", "bestaudio[abr<=80]/bestaudio/best",
         "-x", "--audio-format", "mp3", "--audio-quality", "5",
         "--no-warnings", "--no-playlist",
+        "--retries", "3", "--socket-timeout", "20",
         "-o", join(dir, "audio.%(ext)s"),
         `https://www.youtube.com/watch?v=${videoId}`,
       ],
-      { timeout: 300_000, maxBuffer: 1024 * 1024 * 64 },
+      { timeout: 480_000, maxBuffer: 1024 * 1024 * 64 },
     );
     const files = await readdir(dir);
     const audioFile = files.find((name) => /\.mp3$/i.test(name)) || files[0];
     if (!audioFile) return "";
     const buffer = await readFile(join(dir, audioFile));
+    // Distinguishes "download blocked" from "downloaded fine but no speech"
+    // (music-only videos) so the final error can say which one happened.
+    if (diag && buffer.length > 0) diag.audioDownloaded = true;
     return (await transcribeAudioWithDeepgram(buffer, { apiKey, model, fetchImpl })) || "";
   } catch (error) {
     logger?.warn("youtube.audio_transcribe.failed", {
