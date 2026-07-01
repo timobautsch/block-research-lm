@@ -33,7 +33,7 @@ const AudioScriptSchema = z.object({
 const ArtifactPayloadSchema = z.object({}).passthrough();
 
 const ARTIFACT_REQUIRED_ARRAYS = {
-  report: ["key_points"],
+  report: ["key_points", "detailed_sections"],
   mindmap: ["nodes", "edges"],
   flashcards: ["cards"],
   quiz: ["questions"],
@@ -514,9 +514,9 @@ function artifactExamplePayload(localPayload) {
 
 function artifactShapeInstructions(type) {
   const instructions = {
-    report: 'Report: {"title": string, "tldr": string[], "key_points": [{"text": string, "citation": "[1]"}], "detailed_sections": [{"heading": string, "body": string}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}',
+    report: 'Report: {"title": string, "executive_summary": string[] (3 substantial paragraphs, each 2-4 sentences and cited), "tldr": string[] (4-6 concise bullets), "key_points": [{"text": string (full finding sentence + citation), "citation": "[1]"}], "key_findings": [{"heading": string, "text": string, "analysis": string (2-4 cited sentences), "citation": "[1]"}], "detailed_sections": [{"heading": string, "body": string[] (3-5 cited analytical paragraphs, not bullets)}], "recommendations": [{"action": string, "text": string (actionable cited recommendation), "citation": "[1]"}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}. Make it a real report: at least 5 detailed sections and at least 900 words when evidence allows. Do not return only a TL;DR or a list of key points.',
     mindmap: 'Mind map (hierarchical, NotebookLM-style): {"title": string, "nodes": [{"id": string, "label": string (a SHORT noun phrase, 2-5 words, NO citation markers and NO full sentences), "type": "notebook|topic|subtopic|claim|entity", "source_refs": []}], "edges": [{"id": string, "source": string (parent id), "target": string (child id), "label": string}]}. Build a TREE, not a star: exactly ONE root node (type "notebook", the central subject); 4-7 first-level category nodes (type "topic") each connected FROM the root; under EACH category 3-6 child nodes (type "subtopic"|"claim"|"entity") connected FROM that category; optionally add a third level beneath the richest categories. Every non-root node must have exactly ONE parent edge so the graph forms a clean tree. Labels read like clickable topic chips ("Automated Grid Trading", "GDPR Compliance", "Architecture Layers") — never paragraphs and never with [n] markers.',
-    flashcards: 'Flashcards: {"title": string, "cards": [{"question": string, "answer": string, "explanation": string, "difficulty": "easy|medium|hard", "tags": string[], "source_refs": []}]}',
+    flashcards: 'Flashcards: {"title": string, "cards": [{"question": string (a real study question ending with "?"; never a quote), "answer": string (a concise conceptual answer in the learner\'s own words plus citation marker; never just a copied evidence sentence), "explanation": string (why this answer follows from the cited evidence), "difficulty": "easy|medium|hard", "tags": string[], "source_refs": []}]}. Build learning cards from the meaning of the evidence: ask what the learner should understand, decide, avoid, compare, or apply. Do not use cloze quote blanks unless the user explicitly asks for cloze drills.',
     quiz: 'Quiz: {"title": string, "questions": [{"type": "multiple_choice", "question": string, "options": string[], "correct_index": number, "explanation": string, "difficulty": "easy|medium|hard", "source_refs": []}]}',
     "data-table": 'Data table: {"title": string, "columns": string[], "rows": [{"cells": object, "source_refs": []}]}',
     "slide-deck": 'Slide deck: {"title": string (concise deck title), "deck_type": string, "slides": [{"title": string (<= 7 words, the slide point), "subtitle": string (short framing, optional), "bullets": string[] (3-5 punchy bullets, each one idea + a [n] citation), "speaker_notes": string (2-3 sentences), "visual_suggestion": string (what to show), "layout_type": "title|section|content|comparison|closing"}]}. Make a real presentation: a title slide, several content slides, a closing slide. Bullets are short — not full paragraphs.',
@@ -557,7 +557,8 @@ function collectJsonStrings(value) {
 }
 
 function artifactMaxTokens(type) {
-  if (["report", "slide-deck", "audio", "video"].includes(type)) return 4096;
+  if (type === "report") return 8192;
+  if (["slide-deck", "audio", "video"].includes(type)) return 4096;
   if (["infographic"].includes(type)) return 4096;
   if (["mindmap", "quiz", "data-table", "flashcards"].includes(type)) return 3200;
   return 2400;

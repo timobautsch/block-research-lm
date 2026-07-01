@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -21,11 +21,20 @@ import { noopLogger } from "./logger.js";
 const VECTOR_SIZE = 96;
 const CHUNK_TOKEN_TARGET = 650;
 const CHUNK_TOKEN_OVERLAP = 90;
+const CHUNK_SEMANTIC_MIN = 180;
+const CHUNK_SEMANTIC_MAX = 950;
+const CHUNK_SEMANTIC_BREAK_SIMILARITY = 0.18;
+const CHUNK_SEMANTIC_BREAK_OVERLAP = 0.08;
 const MAX_EVIDENCE_ITEMS = 8;
 const MAX_ARTIFACT_EVIDENCE_ITEMS = 12;
 const MAX_AUDIO_EVIDENCE_ITEMS = 18;
 const RETRIEVAL_CANDIDATE_MULTIPLIER = 4;
 const RETRIEVAL_MIN_CANDIDATES = 24;
+const RERANK_CANDIDATE_LIMIT = 40;
+const RERANK_WEIGHT = 0.68;
+const MAX_DIRECT_SOURCE_TEXT_CHARS = 80_000;
+const DEFAULT_LOCAL_MODEL_VECTOR_DIM = 384;
+const DEFAULT_COHERE_RERANK_MODEL = "rerank-v4.0-pro";
 const FLASHCARD_COUNT_PRESETS = {
   fewer: 6,
   standard: 10,
@@ -33,6 +42,7 @@ const FLASHCARD_COUNT_PRESETS = {
 };
 const FLASHCARD_DIFFICULTIES = new Set(["easy", "medium", "hard", "mixed"]);
 const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "source-check", "compare"];
+const FLASHCARD_CONTENT_VERSION = 4;
 const DEFAULT_CRAWL_MAX_PAGES = 12;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
 const PRODUCT_NAME = "Block Research LM";
@@ -58,14 +68,39 @@ export async function createSourceStudioEngine(options = {}) {
     estimateTokens,
   });
   const embedder = createEmbedder({ env, fetchImpl, logger });
-  const pgStore = createPgStore({ env, logger });
+  const reranker = createReranker({ env, fetchImpl });
+  const pgStore = createPgStore({ env, logger, defaultDimension: embedder.defaultDimension, embeddingProvider: embedder.provider, embeddingModel: embedder.model });
   const durable = createDurableStore({ env, logger });
+  const configuredDurableDebounceMs = Number(env.SOURCESTUDIO_DURABLE_DEBOUNCE_MS || 750);
+  const durablePersistDebounceMs = Number.isFinite(configuredDurableDebounceMs) && configuredDurableDebounceMs >= 0
+    ? configuredDurableDebounceMs
+    : 750;
+  const configuredLocalDebounceMs = Number(env.SOURCESTUDIO_LOCAL_PERSIST_DEBOUNCE_MS || 500);
+  const localPersistDebounceMs = Number.isFinite(configuredLocalDebounceMs) && configuredLocalDebounceMs >= 0
+    ? configuredLocalDebounceMs
+    : 500;
+  const configuredIngestConcurrency = Number(env.SOURCESTUDIO_INGEST_CONCURRENCY || 3);
+  const ingestConcurrency = Number.isFinite(configuredIngestConcurrency)
+    ? Math.max(1, Math.min(8, Math.floor(configuredIngestConcurrency)))
+    : 3;
+  const allowLocalSnapshotOverride =
+    env.NODE_ENV !== "production" || String(env.SOURCESTUDIO_ALLOW_LOCAL_SNAPSHOT_OVERRIDE || "").toLowerCase() === "true";
 
   await mkdir(fileDir, { recursive: true });
   await mkdir(artifactDir, { recursive: true });
 
   let state = await loadInitialState();
   let audioOverviewPromptSpec = null;
+  let localPersistTimer = null;
+  let localPersistRunning = false;
+  let localPersistQueued = false;
+  let localPersistWaiters = [];
+  let durablePersistTimer = null;
+  let durablePersistChain = Promise.resolve();
+  let activeIngestJobs = 0;
+  const ingestQueue = [];
+  const recoveredInterruptedJobs = recoverInterruptedArtifactJobs();
+  if (recoveredInterruptedJobs) await persist();
   logger.info("engine.ready", {
     storage_dir: storageLabel(root, storageDir),
     durable: durable.enabled,
@@ -73,21 +108,177 @@ export async function createSourceStudioEngine(options = {}) {
   });
 
   // Load the durable snapshot (Supabase) first so notebooks/sources survive
-  // Cloud Run restarts and redeploys; fall back to the local disk copy.
+  // Cloud Run restarts and redeploys. In local development, the filesystem can
+  // be newer than the durable copy, so prefer the freshest snapshot.
   async function loadInitialState() {
+    const localState = await loadState(stateFile);
     if (durable.enabled) {
       const stored = await durable.get("engine_state");
       if (stored && typeof stored === "object") {
-        return { ...createEmptyState(), ...stored };
+        const durableState = { ...createEmptyState(), ...stored };
+        if (allowLocalSnapshotOverride && stateFreshness(localState) > stateFreshness(durableState)) {
+          logger.warn("durable.snapshot.skipped_stale", {
+            local_freshness: stateFreshness(localState),
+            durable_freshness: stateFreshness(durableState),
+          });
+          return localState;
+        }
+        if (!allowLocalSnapshotOverride && stateFreshness(localState) > stateFreshness(durableState)) {
+          logger.warn("durable.snapshot.preferred_over_local", {
+            local_freshness: stateFreshness(localState),
+            durable_freshness: stateFreshness(durableState),
+          });
+        }
+        return durableState;
       }
     }
-    return loadState(stateFile);
+    return localState;
   }
 
-  async function persist() {
+  async function persist({ durable: persistDurable = true, waitForDurable = true, waitForLocal = true } = {}) {
+    if (waitForLocal) {
+      clearScheduledLocalPersist();
+      await enqueueLocalPersist();
+    } else {
+      scheduleLocalPersist();
+    }
+    if (!persistDurable || !durable.enabled) return;
+    if (waitForDurable) {
+      clearScheduledDurablePersist();
+      await enqueueDurablePersist();
+      return;
+    }
+    scheduleDurablePersist();
+  }
+
+  function persistInBackground(options = {}) {
+    persist({ waitForLocal: false, ...options }).catch((error) => {
+      logger.warn("state.persist.background.failed", { error: String(error?.message || error).slice(0, 160) });
+    });
+  }
+
+  function scheduleLocalPersist() {
+    clearScheduledLocalPersist();
+    localPersistTimer = setTimeout(() => {
+      localPersistTimer = null;
+      enqueueLocalPersist();
+    }, localPersistDebounceMs);
+    localPersistTimer.unref?.();
+  }
+
+  function clearScheduledLocalPersist() {
+    if (!localPersistTimer) return;
+    clearTimeout(localPersistTimer);
+    localPersistTimer = null;
+  }
+
+  function enqueueLocalPersist() {
+    localPersistQueued = true;
+    const writePromise = new Promise((resolve, reject) => {
+      localPersistWaiters.push({ resolve, reject });
+    });
+    drainLocalPersistQueue();
+    return writePromise;
+  }
+
+  async function drainLocalPersistQueue() {
+    if (localPersistRunning) return;
+    localPersistRunning = true;
+    try {
+      while (localPersistQueued) {
+        localPersistQueued = false;
+        const waiters = localPersistWaiters;
+        localPersistWaiters = [];
+        try {
+          await writeLocalState();
+          for (const waiter of waiters) waiter.resolve();
+        } catch (error) {
+          logger.warn("state.persist.local.failed", { error: String(error?.message || error).slice(0, 160) });
+          for (const waiter of waiters) waiter.reject(error);
+        }
+      }
+    } finally {
+      localPersistRunning = false;
+      if (localPersistQueued) drainLocalPersistQueue();
+    }
+  }
+
+  async function writeLocalState() {
     await mkdir(dirname(stateFile), { recursive: true });
-    await writeFile(stateFile, JSON.stringify(state, null, 2));
-    if (durable.enabled) await durable.set("engine_state", state);
+    const tmpFile = `${stateFile}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    await writeFile(tmpFile, JSON.stringify(state));
+    await rename(tmpFile, stateFile);
+  }
+
+  function scheduleDurablePersist() {
+    if (!durable.enabled) return;
+    clearScheduledDurablePersist();
+    durablePersistTimer = setTimeout(() => {
+      durablePersistTimer = null;
+      enqueueDurablePersist();
+    }, durablePersistDebounceMs);
+    durablePersistTimer.unref?.();
+  }
+
+  function clearScheduledDurablePersist() {
+    if (!durablePersistTimer) return;
+    clearTimeout(durablePersistTimer);
+    durablePersistTimer = null;
+  }
+
+  function enqueueDurablePersist() {
+    durablePersistChain = durablePersistChain
+      .catch(() => undefined)
+      .then(async () => {
+        const startedAt = Date.now();
+        const persisted = await durable.set("engine_state", state);
+        if (!persisted) {
+          logger.warn("durable.snapshot.persist.failed", { duration_ms: Date.now() - startedAt });
+        }
+      })
+      .catch((error) => {
+        logger.warn("durable.snapshot.persist.failed", {
+          duration_ms: 0,
+          error: String(error?.message || error).slice(0, 160),
+        });
+      });
+    return durablePersistChain;
+  }
+
+  function enqueueIngestJob(task) {
+    ingestQueue.push(task);
+    drainIngestQueue();
+  }
+
+  function drainIngestQueue() {
+    while (activeIngestJobs < ingestConcurrency && ingestQueue.length) {
+      const task = ingestQueue.shift();
+      activeIngestJobs += 1;
+      Promise.resolve()
+        .then(task)
+        .catch(() => {
+          // runIngest records source failures; this keeps the queue moving.
+        })
+        .finally(() => {
+          activeIngestJobs -= 1;
+          drainIngestQueue();
+        });
+    }
+  }
+
+  function recoverInterruptedArtifactJobs() {
+    let recovered = 0;
+    for (const job of state.artifactJobs) {
+      if (!["queued", "running"].includes(job.status)) continue;
+      job.status = "failed";
+      job.error = "Generation was interrupted by a server restart. Please start it again.";
+      job.updated_at = now();
+      recovered += 1;
+    }
+    if (recovered) {
+      logger.warn("artifact.jobs.recovered_interrupted", { count: recovered });
+    }
+    return recovered;
   }
 
   function now() {
@@ -106,10 +297,19 @@ export async function createSourceStudioEngine(options = {}) {
       openai: hasConfiguredValue(env.OPENAI_API_KEY),
       google: hasConfiguredValue(env.GOOGLE_API_KEY),
       elevenlabs: hasConfiguredValue(env.ELEVENLABS_API_KEY),
+      cohere: hasConfiguredValue(env.COHERE_API_KEY),
       database: hasConfiguredValue(env.DATABASE_URL),
       redis: hasConfiguredValue(env.REDIS_URL),
       storage: "local-json-filesystem",
       storage_dir: storageLabel(root, storageDir),
+      embeddings: {
+        provider: embedder.provider,
+        model: embedder.model,
+        semantic: embedder.isSemantic,
+        default_dimension: embedder.defaultDimension,
+      },
+      reranker: reranker.status(),
+      vector_database: pgStore.status(),
       available_reasoning_providers: routerStatus.available_reasoning_providers,
       active_grounded_answer_provider: groundedAnswer.provider,
       grounded_answer_model: groundedAnswer.model,
@@ -168,7 +368,7 @@ export async function createSourceStudioEngine(options = {}) {
       source_count: 0,
     };
     state.notebooks.push(notebook);
-    await persist();
+    await persist({ waitForDurable: false });
     logger.info("notebook.create.complete", {
       request_id: context.requestId,
       notebook_id: notebook.id,
@@ -211,14 +411,18 @@ export async function createSourceStudioEngine(options = {}) {
         mime_type: parsed.mime_type || "",
         parser: "pending",
         fallback: false,
+        ingest_stage: parsed.defer_indexing ? "upload_accepted" : "pending",
       },
       created_at: timestamp,
       updated_at: timestamp,
       version: 1,
       active: parsed.active,
     };
+    const shouldRunAsync = !context.sync && !shouldIndexSynchronously(parsed);
     state.sources.push(source);
-    await persist();
+    if (!shouldRunAsync) {
+      await persist({ durable: !shouldIndexSynchronously(parsed), waitForDurable: false });
+    }
     logger.info("source.ingest.start", {
       request_id: context.requestId,
       notebook_id: notebookId,
@@ -230,24 +434,32 @@ export async function createSourceStudioEngine(options = {}) {
       active: parsed.active,
     });
 
+    const markSourceStage = (stage) => {
+      source.metadata_json = {
+        ...source.metadata_json,
+        ingest_stage: stage,
+      };
+      source.updated_at = now();
+    };
+
     const runIngest = async () => {
      try {
       source.status = "parsing";
-      source.updated_at = now();
+      markSourceStage(parsed.base64 ? "saving_file" : "extracting_text");
       if (parsed.base64) {
         const safeName = sanitizeFileName(parsed.file_name || `${sourceId}.bin`);
         const filePath = join(fileDir, `${sourceId}-${safeName}`);
         await writeFile(filePath, Buffer.from(parsed.base64, "base64"));
         source.file_path = filePath;
+        markSourceStage("extracting_text");
       }
 
       const document = await parseSource(source, parsed, context);
+      markSourceStage("chunking");
       source.title = document.title || source.title;
       source.raw_text = document.raw_text;
       source.cleaned_text = document.cleaned_text;
-      source.metadata_json = { ...source.metadata_json, ...document.metadata };
-      source.status = "indexed";
-      source.updated_at = now();
+      source.metadata_json = { ...source.metadata_json, ...document.metadata, ingest_stage: "chunking" };
 
       removeSourceDerivedRows(sourceId);
       if (pgStore.enabled) {
@@ -258,6 +470,7 @@ export async function createSourceStudioEngine(options = {}) {
       state.blocks.push(...document.blocks);
       const chunks = chunkDocument(notebookId, source, document.blocks);
       state.chunks.push(...chunks);
+      markSourceStage("embedding");
       const chunkVectors = await embedder.embed(chunks.map((chunk) => chunk.normalized_text), "document");
       state.embeddings.push(
         ...chunks.map((chunk, index) => ({
@@ -270,6 +483,7 @@ export async function createSourceStudioEngine(options = {}) {
         })),
       );
       if (pgStore.enabled) {
+        markSourceStage("vector_indexing");
         try {
           await pgStore.upsertChunks(
             chunks.map((chunk, index) => ({
@@ -281,16 +495,22 @@ export async function createSourceStudioEngine(options = {}) {
               heading_path: (chunk.heading_path || []).join(" / "),
               metadata: { source_title: source.title },
               embedding: chunkVectors[index],
+              embedding_provider: embedder.provider,
+              embedding_model: embedder.model,
             })),
           );
         } catch (error) {
           logger.warn("pgvector.upsert.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) });
         }
       }
+      markSourceStage("knowledge");
       const sourceKnowledge = buildSourceKnowledgeObjects(source, document.blocks, chunks);
       state.knowledgeObjects.push(...sourceKnowledge);
+      source.status = "indexed";
+      source.metadata_json = { ...source.metadata_json, ingest_stage: "indexed" };
+      source.updated_at = now();
       rebuildNotebookKnowledge(notebookId);
-      await persist();
+      persistInBackground({ waitForDurable: false });
       logger.info("source.ingest.complete", {
         request_id: context.requestId,
         notebook_id: notebookId,
@@ -311,7 +531,7 @@ export async function createSourceStudioEngine(options = {}) {
         ...source.metadata_json,
         error: error.message,
       };
-      await persist();
+      persistInBackground({ waitForDurable: false });
       logger.error("source.ingest.failed", {
         request_id: context.requestId,
         notebook_id: notebookId,
@@ -325,21 +545,23 @@ export async function createSourceStudioEngine(options = {}) {
      }
     };
 
-    if (context.sync || shouldIndexSynchronously(parsed)) {
+    if (!shouldRunAsync) {
       return runIngest();
     }
     // Parse in the background so long parses (YouTube audio transcription, large
     // media) never hold the request past Firebase Hosting's ~60s proxy timeout.
     source.status = "parsing";
-    await persist();
-    runIngest().catch(() => {
-      // Failure is already recorded on the source (status + metadata error).
-    });
+    source.metadata_json = { ...source.metadata_json, ingest_stage: "upload_accepted" };
+    source.updated_at = now();
+    persistInBackground({ waitForDurable: false });
+    enqueueIngestJob(runIngest);
     return decorateSource(sourceId, { includeBlocks: false });
   }
 
   function shouldIndexSynchronously(parsed) {
+    if (parsed.defer_indexing) return false;
     if (parsed.base64) return false;
+    if (parsed.body?.trim()) return true;
     if (["markdown", "text", "note"].includes(parsed.type)) return true;
     if (parsed.body && parsed.type === "url" && parsed.crawl === false) return true;
     return false;
@@ -353,7 +575,7 @@ export async function createSourceStudioEngine(options = {}) {
     notebook.title = title;
     notebook.title_source = "manual";
     notebook.updated_at = now();
-    await persist();
+    await persist({ waitForDurable: false });
     logger.info("notebook.rename", { request_id: context.requestId, notebook_id: notebookId, title });
     return decorateNotebook(notebookId);
   }
@@ -367,7 +589,7 @@ export async function createSourceStudioEngine(options = {}) {
     if (!isDefaultNotebookTitle(notebook.title)) return;
     const sources = state.sources.filter(
       (source) => source.notebook_id === notebookId && source.status === "indexed",
-    );
+    ).filter((source) => !isLowQualityExtractionSource(source));
     if (!sources.length) return;
 
     notebook.auto_naming = true;
@@ -379,7 +601,7 @@ export async function createSourceStudioEngine(options = {}) {
         fresh.title = suggestion;
         fresh.title_source = "auto";
         fresh.updated_at = now();
-        await persist();
+        await persist({ waitForDurable: false });
         logger.info("notebook.autoname.complete", {
           request_id: context.requestId,
           notebook_id: notebookId,
@@ -438,7 +660,7 @@ export async function createSourceStudioEngine(options = {}) {
     source.active = parsed.active;
     source.updated_at = now();
     rebuildNotebookKnowledge(source.notebook_id);
-    await persist();
+    await persist({ waitForDurable: false });
     logger.info("source.active.updated", {
       request_id: context.requestId,
       notebook_id: source.notebook_id,
@@ -459,7 +681,7 @@ export async function createSourceStudioEngine(options = {}) {
       );
     }
     rebuildNotebookKnowledge(source.notebook_id);
-    await persist();
+    await persist({ waitForDurable: false });
     logger.warn("source.delete.complete", {
       request_id: context.requestId,
       notebook_id: source.notebook_id,
@@ -467,6 +689,22 @@ export async function createSourceStudioEngine(options = {}) {
       title: source.title,
     });
     return { ok: true };
+  }
+
+  async function deleteArtifact(artifactId, context = {}) {
+    const artifact = getArtifact(artifactId, context);
+    const removed = await removeArtifacts([artifact], context);
+    return { ok: true, deleted: removed.length };
+  }
+
+  async function deleteNotebookArtifacts(notebookId, context = {}) {
+    assertNotebookAccess(notebookId, context);
+    const artifacts = state.artifacts.filter((artifact) => artifact.notebook_id === notebookId);
+    const removed = await removeArtifacts(artifacts, context);
+    const jobCountBefore = state.artifactJobs.length;
+    state.artifactJobs = state.artifactJobs.filter((job) => job.notebook_id !== notebookId);
+    if (state.artifactJobs.length !== jobCountBefore) await persist({ waitForDurable: false });
+    return { ok: true, deleted: removed.length };
   }
 
   async function askChat(input = {}, context = {}) {
@@ -502,13 +740,21 @@ export async function createSourceStudioEngine(options = {}) {
       const retrievalQuery = [...recentUserQuestions, parsed.question].join("\n");
       const history = priorMessages.map((message) => ({ role: message.role, content: message.content }));
 
-      const evidencePack = await buildEvidencePack({
-        notebook_id: notebook.id,
-        question: parsed.question,
-        retrieval_query: retrievalQuery,
-        source_mode: parsed.source_mode,
-        selected_source_ids: parsed.selected_source_ids,
-      });
+      const directSourceText = isFullSourceTextRequest(parsed.question);
+      const evidencePack = directSourceText
+        ? buildFullSourceTextEvidencePack({
+          notebook_id: notebook.id,
+          question: parsed.question,
+          source_mode: parsed.source_mode,
+          selected_source_ids: parsed.selected_source_ids,
+        })
+        : await buildEvidencePack({
+          notebook_id: notebook.id,
+          question: parsed.question,
+          retrieval_query: retrievalQuery,
+          source_mode: parsed.source_mode,
+          selected_source_ids: parsed.selected_source_ids,
+        });
       logger.info("retrieval.pack.created", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -518,17 +764,21 @@ export async function createSourceStudioEngine(options = {}) {
         evidence_items: evidencePack.evidence_items.length,
         retrieved_items: evidencePack.retrieved_items.length,
       });
-      const generation = await modelRouter.generateGroundedAnswer({
-        question: parsed.question,
-        evidencePack,
-        answerStyle: parsed.answer_style,
-        history,
-        startRun: startModelRun,
-      });
+      const generation = directSourceText
+        ? generateFullSourceTextAnswer(parsed.question, evidencePack)
+        : await modelRouter.generateGroundedAnswer({
+          question: parsed.question,
+          evidencePack,
+          answerStyle: parsed.answer_style,
+          history,
+          startRun: startModelRun,
+        });
       const answer = generation.answer;
       const activeModelRun = generation.active_run;
 
-      const verification = verifyAnswer(answer, evidencePack);
+      const verification = answer.verbatim_source_text
+        ? verifyVerbatimSourceAnswer(answer, evidencePack)
+        : verifyAnswer(answer, evidencePack);
       const finalAnswer = verification.final_answer;
       const messageId = id("message");
       const timestamp = now();
@@ -561,7 +811,7 @@ export async function createSourceStudioEngine(options = {}) {
       state.evidencePacks.push(evidencePack);
       state.citationLedgers.push(verification.ledger);
       state.modelRuns.push(...generation.model_runs);
-      await persist();
+      await persist({ waitForDurable: false });
       logger.info("chat.ask.complete", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -621,7 +871,7 @@ export async function createSourceStudioEngine(options = {}) {
       updated_at: timestamp,
     };
     state.artifactJobs.push(job);
-    await persist();
+    await persist({ durable: false });
     logger.info("artifact.job.queued", {
       request_id: context.requestId,
       notebook_id: notebook.id,
@@ -635,6 +885,7 @@ export async function createSourceStudioEngine(options = {}) {
       job.status = "running";
       job.progress = 35;
       job.updated_at = now();
+      await persist({ durable: false });
       logger.info("artifact.job.running", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -652,6 +903,9 @@ export async function createSourceStudioEngine(options = {}) {
       });
       state.retrievalRuns.push(evidencePack.retrieval_run);
       state.evidencePacks.push(evidencePack);
+      job.progress = 50;
+      job.updated_at = now();
+      await persist({ durable: false });
       logger.info("artifact.evidence_pack.created", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -688,6 +942,9 @@ export async function createSourceStudioEngine(options = {}) {
           startRun: startModelRun,
         });
         artifactPayload = generation.payload;
+        if (parsed.type === "mindmap") {
+          artifactPayload = finalizeMindMapPayload(artifactPayload, localPayload);
+        }
         if (parsed.type === "infographic") {
           artifactPayload = finalizeInfographicPayload(artifactPayload, localPayload);
         }
@@ -711,6 +968,9 @@ export async function createSourceStudioEngine(options = {}) {
         state.modelRuns.push(...generation.model_runs, ...artifactModelRuns);
         modelRunIds = [...generation.model_runs.map((run) => run.id), ...artifactModelRuns.map((run) => run.id)];
       }
+      job.progress = parsed.type === "audio" || parsed.type === "video" ? 70 : 85;
+      job.updated_at = now();
+      await persist({ durable: false });
       if (parsed.type === "audio") {
         const audioRun = await renderAudioArtifact({
           artifactDir,
@@ -723,11 +983,17 @@ export async function createSourceStudioEngine(options = {}) {
         }
       }
       if (parsed.type === "video") {
+        job.progress = 75;
+        job.updated_at = now();
+        await persist({ durable: false });
         await renderVideoArtifact({
           artifactDir,
           artifactId,
           payload: artifactPayload,
         });
+        job.progress = 90;
+        job.updated_at = now();
+        await persist({ durable: false });
       }
       if (artifactPayload && typeof artifactPayload === "object" && !Array.isArray(artifactPayload)) {
         artifactPayload.evidence_audit ||= buildArtifactEvidenceAudit(evidencePack, artifactPayload);
@@ -755,12 +1021,23 @@ export async function createSourceStudioEngine(options = {}) {
         artifact.content_json.progress = deck.progress;
       }
       artifact.file_path = await writeArtifactFile(artifactDir, artifact);
+      if (!state.artifactJobs.some((item) => item.id === job.id)) {
+        await Promise.all(artifactFilePaths(artifact).map((filePath) => rm(filePath, { force: true }).catch(() => undefined)));
+        logger.warn("artifact.job.discarded_after_delete", {
+          request_id: context.requestId,
+          notebook_id: notebook.id,
+          job_id: job.id,
+          artifact_id: artifact.id,
+          type: parsed.type,
+        });
+        return { job, artifact: null, evidence_pack: evidencePack };
+      }
       state.artifacts.push(artifact);
       job.status = "completed";
       job.progress = 100;
       job.result_artifact_id = artifact.id;
       job.updated_at = now();
-      await persist();
+      await persist({ waitForDurable: false });
       logger.info("artifact.job.completed", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -779,7 +1056,7 @@ export async function createSourceStudioEngine(options = {}) {
       job.status = "failed";
       job.error = error.message;
       job.updated_at = now();
-      await persist();
+      await persist({ waitForDurable: false });
       logger.error("artifact.job.failed", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -904,7 +1181,10 @@ export async function createSourceStudioEngine(options = {}) {
       artifact.content_json.deck_id = deck.id;
       artifact.content_json.progress = deck.progress;
       artifact.file_path = await writeArtifactFile(artifactDir, artifact);
-      await persist();
+      await persist({ waitForDurable: false });
+    } else if (upgradeFlashcardDeckIfNeeded(deck, artifact, artifact.content_json?.options_json || {})) {
+      artifact.file_path = await writeArtifactFile(artifactDir, artifact);
+      await persist({ waitForDurable: false });
     }
     return decorateFlashcardDeck(deck.id, context);
   }
@@ -930,7 +1210,7 @@ export async function createSourceStudioEngine(options = {}) {
     deck.updated_at = now();
     const artifact = syncFlashcardArtifactProgress(deck.id);
     if (artifact) artifact.file_path = await writeArtifactFile(artifactDir, artifact);
-    await persist();
+    await persist({ waitForDurable: false });
     return decorateFlashcardDeck(deck.id, context);
   }
 
@@ -944,7 +1224,7 @@ export async function createSourceStudioEngine(options = {}) {
     deck.updated_at = now();
     const artifact = syncFlashcardArtifactProgress(deck.id);
     if (artifact) artifact.file_path = await writeArtifactFile(artifactDir, artifact);
-    await persist();
+    await persist({ waitForDurable: false });
     return decorateFlashcardDeck(deck.id, context);
   }
 
@@ -955,7 +1235,7 @@ export async function createSourceStudioEngine(options = {}) {
     deck.updated_at = now();
     const artifact = syncFlashcardArtifactProgress(deck.id);
     if (artifact) artifact.file_path = await writeArtifactFile(artifactDir, artifact);
-    await persist();
+    await persist({ waitForDurable: false });
     return decorateFlashcardDeck(deck.id, context);
   }
 
@@ -979,7 +1259,7 @@ export async function createSourceStudioEngine(options = {}) {
     deck.updated_at = now();
     const artifact = syncFlashcardArtifactProgress(deck.id);
     if (artifact) artifact.file_path = await writeArtifactFile(artifactDir, artifact);
-    await persist();
+    await persist({ waitForDurable: false });
     logger.info("flashcards.adaptive.created", {
       request_id: context.requestId,
       notebook_id: deck.notebook_id,
@@ -1073,6 +1353,8 @@ export async function createSourceStudioEngine(options = {}) {
     deleteSource,
     askChat,
     createArtifact,
+    deleteArtifact,
+    deleteNotebookArtifacts,
     seedDemo,
     getCitationLedger,
     getSourceBlocks,
@@ -1093,6 +1375,8 @@ export async function createSourceStudioEngine(options = {}) {
       verifyAnswer,
       embedText,
       tokenize,
+      extractPdfText,
+      isLikelyGarbledExtraction,
     },
   };
 
@@ -1172,6 +1456,61 @@ export async function createSourceStudioEngine(options = {}) {
     assertNotebookAccess(source.notebook_id, context);
   }
 
+  async function removeArtifacts(artifacts, context = {}) {
+    const removed = artifacts.filter(Boolean);
+    if (!removed.length) return [];
+    const artifactIds = new Set(removed.map((artifact) => artifact.id));
+    const jobIds = new Set(
+      state.artifactJobs
+        .filter((job) => artifactIds.has(job.result_artifact_id))
+        .map((job) => job.id),
+    );
+    const deckIds = new Set(
+      state.flashcardDecks
+        .filter((deck) => artifactIds.has(deck.artifact_id))
+        .map((deck) => deck.id),
+    );
+    const cardIds = new Set(
+      state.flashcards
+        .filter((card) => artifactIds.has(card.artifact_id) || deckIds.has(card.deck_id))
+        .map((card) => card.id),
+    );
+    const files = new Set();
+    for (const artifact of removed) {
+      for (const filePath of artifactFilePaths(artifact)) {
+        if (filePath) files.add(filePath);
+      }
+    }
+
+    state.artifacts = state.artifacts.filter((artifact) => !artifactIds.has(artifact.id));
+    state.artifactJobs = state.artifactJobs.filter(
+      (job) => !jobIds.has(job.id) && !artifactIds.has(job.result_artifact_id),
+    );
+    state.flashcardDecks = state.flashcardDecks.filter((deck) => !deckIds.has(deck.id) && !artifactIds.has(deck.artifact_id));
+    state.flashcards = state.flashcards.filter((card) => !cardIds.has(card.id) && !artifactIds.has(card.artifact_id));
+    state.flashcardReviews = state.flashcardReviews.filter((review) => !cardIds.has(review.card_id));
+
+    await Promise.all([...files].map((filePath) => rm(filePath, { force: true }).catch(() => undefined)));
+    await persist({ waitForDurable: false });
+    logger.warn("artifact.delete.complete", {
+      request_id: context.requestId,
+      artifact_count: removed.length,
+      artifact_ids: removed.map((artifact) => artifact.id).slice(0, 20),
+      notebook_ids: [...new Set(removed.map((artifact) => artifact.notebook_id))],
+    });
+    return removed;
+  }
+
+  function artifactFilePaths(artifact) {
+    const payload = artifact?.content_json || {};
+    return [
+      artifact?.file_path,
+      payload.audio_file_path,
+      payload.video_file_path,
+      payload.pptx_file_path,
+    ].filter((filePath) => typeof filePath === "string" && filePath.trim());
+  }
+
   function resetOwnerData(ownerUserId) {
     const notebookIds = new Set(
       state.notebooks.filter((notebook) => notebook.owner_user_id === ownerUserId).map((notebook) => notebook.id),
@@ -1229,6 +1568,32 @@ export async function createSourceStudioEngine(options = {}) {
     return source;
   }
 
+  function isLowQualityExtractionSource(source) {
+    if (!source) return false;
+    const parser = String(source.metadata_json?.parser || "");
+    if (parser === "pdf-unreadable") return true;
+    if (parser !== "pdf-string-fallback") return false;
+    return isLikelyGarbledExtraction(source.cleaned_text || source.raw_text || "");
+  }
+
+  function isRetrievableChunk(chunk) {
+    if (!chunk) return false;
+    const source = state.sources.find((item) => item.id === chunk.source_id);
+    if (isLowQualityExtractionSource(source)) return false;
+    const text = String(chunk.text || chunk.normalized_text || "").trim();
+    return Boolean(text) && !isLikelyGarbledExtraction(text);
+  }
+
+  function sourceSummariesForIds(notebookId, sourceIds) {
+    return state.knowledgeObjects
+      .filter((object) => {
+        if (object.notebook_id !== notebookId || object.type !== "source_summary" || !sourceIds.includes(object.source_id)) return false;
+        const source = state.sources.find((item) => item.id === object.source_id);
+        return !isLowQualityExtractionSource(source) && !isLikelyGarbledExtraction(JSON.stringify(object.data || {}));
+      })
+      .map((object) => object.data);
+  }
+
   function decorateNotebook(notebookId) {
     const notebook = state.notebooks.find((item) => item.id === notebookId);
     if (!notebook) return null;
@@ -1245,7 +1610,12 @@ export async function createSourceStudioEngine(options = {}) {
     const messages = state.chatMessages
       .filter((message) => message.notebook_id === notebookId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
-    const notebookSummary = knowledge.find((object) => object.type === "notebook_summary")?.data?.summary || "";
+    const rawNotebookSummary = knowledge.find((object) => object.type === "notebook_summary")?.data?.summary || "";
+    const notebookSummary = isLikelyGarbledExtraction(rawNotebookSummary) ? "" : rawNotebookSummary;
+    const storedSuggestedQuestions = knowledge.find((object) => object.type === "suggested_questions")?.data?.questions || [];
+    const suggestedQuestions = isLegacyDemoSuggestedQuestions(storedSuggestedQuestions)
+      ? buildNotebookSuggestedQuestions(sources)
+      : (storedSuggestedQuestions.length ? storedSuggestedQuestions : buildNotebookSuggestedQuestions(sources));
     return {
       ...notebook,
       source_count: sources.length,
@@ -1256,9 +1626,44 @@ export async function createSourceStudioEngine(options = {}) {
       jobs,
       knowledge,
       messages,
-      suggested_questions: knowledge.find((object) => object.type === "suggested_questions")?.data?.questions || [],
+      suggested_questions: suggestedQuestions,
       suggested_artifacts: knowledge.find((object) => object.type === "suggested_artifacts")?.data?.artifacts || [],
     };
+  }
+
+  function isLegacyDemoSuggestedQuestions(questions = []) {
+    return questions.some((question) =>
+      /Block Research AI appear|trading-bot|automation themes appear most often/i.test(String(question || "")),
+    );
+  }
+
+  function buildNotebookSuggestedQuestions(sources = []) {
+    const activeSources = sources.filter((source) => source?.active && source?.status !== "failed");
+    if (!activeSources.length) return [];
+    const focus = suggestedQuestionFocus(activeSources);
+    return [
+      `What are the key takeaways from ${focus}?`,
+      "Which claims are directly supported by the active sources?",
+      "Where do the active sources agree, conflict, or leave open questions?",
+      "What should I verify before acting on this material?",
+    ];
+  }
+
+  function suggestedQuestionFocus(sources = []) {
+    const titles = sources
+      .map((source) => stripFileExtension(String(source.title || "").trim()))
+      .filter((title) => title.length > 2 && !/^untitled|source$/i.test(title));
+    if (titles.length === 1) return truncate(titles[0], 72);
+    if (titles.length === 2) return truncate(`${titles[0]} and ${titles[1]}`, 80);
+    if (titles.length > 2) return truncate(`${titles[0]} and ${titles.length - 1} other active sources`, 80);
+    const terms = topTerms(sources.map((source) => `${source.summary || ""} ${source.cleaned_text || ""}`).join("\n"), 3)
+      .map((item) => item.term)
+      .filter(Boolean);
+    return terms.length ? titleCase(terms.join(" ")) : "the active sources";
+  }
+
+  function stripFileExtension(value) {
+    return value.replace(/\.[a-z0-9]{2,8}$/i, "").replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
   }
 
   function decorateSource(sourceId, options = {}) {
@@ -1269,12 +1674,14 @@ export async function createSourceStudioEngine(options = {}) {
     const knowledge = state.knowledgeObjects.filter(
       (object) => object.source_id === sourceId && object.type !== "notebook_summary",
     );
+    const lowQualityExtraction = isLowQualityExtractionSource(source);
+    const rawSummary = knowledge.find((object) => object.type === "source_summary")?.data?.summary || "";
     const base = {
       ...source,
       block_count: blocks.length,
       chunk_count: chunks.length,
-      word_count: source.cleaned_text ? tokenize(source.cleaned_text).length : 0,
-      summary: knowledge.find((object) => object.type === "source_summary")?.data?.summary || "",
+      word_count: lowQualityExtraction || !source.cleaned_text ? 0 : tokenize(source.cleaned_text).length,
+      summary: lowQualityExtraction || isLikelyGarbledExtraction(rawSummary) ? "" : rawSummary,
       knowledge,
     };
     if (options.includeBlocks) base.blocks = blocks;
@@ -1289,7 +1696,10 @@ export async function createSourceStudioEngine(options = {}) {
 
   function createFlashcardDeckFromArtifact({ notebook, artifact, options = {}, evidencePack = null }) {
     const existing = state.flashcardDecks.find((deck) => deck.artifact_id === artifact.id);
-    if (existing) return decorateFlashcardDeck(existing.id);
+    if (existing) {
+      upgradeFlashcardDeckIfNeeded(existing, artifact, options);
+      return decorateFlashcardDeck(existing.id);
+    }
     const timestamp = now();
     const payloadOptions = artifact.content_json?.options_json || {};
     const plan = buildFlashcardPlan({ ...payloadOptions, ...options });
@@ -1308,6 +1718,7 @@ export async function createSourceStudioEngine(options = {}) {
         card_types: plan.cardTypes,
         source_mode: options.source_mode || "active",
         selected_source_ids: options.selected_source_ids || [],
+        content_version: FLASHCARD_CONTENT_VERSION,
       },
       evidence_pack_id: evidencePack?.id || artifact.content_json?.evidence_audit?.evidence_pack_id || "",
       created_at: timestamp,
@@ -1323,6 +1734,76 @@ export async function createSourceStudioEngine(options = {}) {
     artifact.content_json.cards = decorated.cards.map((card) => flashcardCardForPayload(card));
     artifact.text_content = renderArtifactText(artifact.type, artifact.content_json);
     return decorated;
+  }
+
+  function upgradeFlashcardDeckIfNeeded(deck, artifact, options = {}) {
+    if (Number(deck.options_json?.content_version || 0) >= FLASHCARD_CONTENT_VERSION) return false;
+    const payloadOptions = artifact.content_json?.options_json || {};
+    const plan = buildFlashcardPlan({ ...payloadOptions, ...deck.options_json, ...options });
+    const citations = flashcardCitationsFromArtifact(artifact);
+    if (!citations.length) {
+      deck.options_json = { ...deck.options_json, content_version: FLASHCARD_CONTENT_VERSION };
+      deck.updated_at = now();
+      return false;
+    }
+    const keyPointLimit = Math.max(6, Math.min(plan.count, citations.length || 1));
+    const keyPoints = citations.slice(0, keyPointLimit).map((item) => ({
+      text: bestSentenceForQuestion(item.quote, plan.topic || artifact.title || ""),
+      citation: item.citation,
+      source_refs: sourceRefsFromEvidence(item),
+    }));
+    const rebuiltCards = buildFlashcardCards(citations, keyPoints, plan, {
+      user_question: plan.topic || artifact.title || "",
+    });
+    if (!rebuiltCards.length) return false;
+    const timestamp = now();
+    state.flashcards = state.flashcards.filter((card) => card.deck_id !== deck.id);
+    state.flashcardReviews = state.flashcardReviews.filter((review) => review.deck_id !== deck.id);
+    state.flashcards.push(...rebuiltCards.map((card, index) => normalizeFlashcardCard(card, deck, artifact, index)));
+    deck.options_json = {
+      ...deck.options_json,
+      topic: plan.topic,
+      language: plan.language,
+      audience: plan.audience,
+      count_preset: plan.countPreset,
+      count: plan.count,
+      difficulty: plan.difficulty,
+      card_types: plan.cardTypes,
+      content_version: FLASHCARD_CONTENT_VERSION,
+    };
+    deck.updated_at = timestamp;
+    syncFlashcardArtifactProgress(deck.id);
+    return true;
+  }
+
+  function flashcardCitationsFromArtifact(artifact) {
+    const payload = artifact.content_json || {};
+    const canonical = Array.isArray(payload.citations) ? payload.citations : [];
+    const fromCitations = canonical
+      .map((item, index) => ({
+        ...item,
+        citation: item.citation || `[${index + 1}]`,
+        quote: item.quote || item.evidence_quote || item.text || "",
+        source_id: item.source_id || item.sourceId || "",
+        source_title: item.source_title || item.sourceTitle || "",
+        evidence_id: item.evidence_id || item.id || "",
+      }))
+      .filter((item) => item.quote);
+    if (fromCitations.length) return fromCitations;
+    return (Array.isArray(payload.cards) ? payload.cards : [])
+      .map((card, index) => {
+        const ref = Array.isArray(card.source_refs) ? card.source_refs[0] : null;
+        return {
+          citation: card.citation || `[${index + 1}]`,
+          quote: card.evidence_quote || ref?.quote || card.answer || "",
+          source_id: ref?.source_id || "",
+          source_title: card.source_title || "",
+          evidence_id: card.evidence_id || card.id || "",
+          block_ids: ref?.block_ids || [],
+          chunk_id: ref?.chunk_id || "",
+        };
+      })
+      .filter((item) => item.quote);
   }
 
   function normalizeFlashcardCard(card, deck, artifact, index) {
@@ -1684,6 +2165,36 @@ export async function createSourceStudioEngine(options = {}) {
         },
       });
     }
+    if (source.type === "pptx") {
+      const rawText = payload.body?.trim()
+        ? payload.body
+        : await parsePptxTextFallback(source.file_path);
+      return parseMarkdownLikeDocument(source, {
+        rawText,
+        cleanedText: normalizeWhitespace(rawText),
+        parser: payload.body?.trim() ? "pptx-pasted-text" : "pptx-xml-text-fallback",
+        fallback: !payload.body?.trim(),
+        metadata: {
+          file_name: payload.file_name || "",
+          mime_type: payload.mime_type || "",
+        },
+      });
+    }
+    if (source.type === "epub") {
+      const rawText = payload.body?.trim()
+        ? payload.body
+        : await parseEpubTextFallback(source.file_path);
+      return parseMarkdownLikeDocument(source, {
+        rawText,
+        cleanedText: normalizeWhitespace(rawText),
+        parser: payload.body?.trim() ? "epub-pasted-text" : "epub-html-text-fallback",
+        fallback: !payload.body?.trim(),
+        metadata: {
+          file_name: payload.file_name || "",
+          mime_type: payload.mime_type || "",
+        },
+      });
+    }
     if (source.type === "url") {
       if (payload.body?.trim() || payload.crawl === false) {
         const fetched = payload.body?.trim()
@@ -1727,7 +2238,7 @@ export async function createSourceStudioEngine(options = {}) {
         const extracted = await extractPdfText(Buffer.from(payload.base64, "base64"));
         rawText = extracted.text || rawText;
         parser = extracted.parser;
-        fallback = extracted.parser === "pdf-string-fallback";
+        fallback = extracted.parser !== "pdf-unpdf";
       }
       return parseMarkdownLikeDocument(source, {
         rawText,
@@ -1736,10 +2247,11 @@ export async function createSourceStudioEngine(options = {}) {
         fallback,
       });
     }
+    const rawText = payload.body || await parsePlainTextUploadFallback(source.file_path, payload);
     return parseMarkdownLikeDocument(source, {
-      rawText: payload.body || "",
-      cleanedText: normalizeWhitespace(payload.body || ""),
-      parser: source.type === "note" ? "note-parser" : "markdown-parser",
+      rawText,
+      cleanedText: normalizeWhitespace(rawText),
+      parser: source.type === "note" ? "note-parser" : uploadedTextParser(payload),
       fallback: false,
     });
   }
@@ -1939,6 +2451,17 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   function chunkDocument(notebookId, source, blocks) {
+    return useHybridSemanticChunking()
+      ? chunkDocumentHybridSemantic(notebookId, source, blocks)
+      : chunkDocumentStructured(notebookId, source, blocks);
+  }
+
+  function useHybridSemanticChunking() {
+    const strategy = String(env.CHUNKING_STRATEGY || env.SOURCESTUDIO_CHUNKING_STRATEGY || "").trim().toLowerCase();
+    return ["semantic", "hybrid", "hybrid-semantic", "semantic-hybrid"].includes(strategy);
+  }
+
+  function chunkDocumentStructured(notebookId, source, blocks) {
     const chunks = [];
     let current = [];
     let tokenCount = 0;
@@ -1976,6 +2499,7 @@ export async function createSourceStudioEngine(options = {}) {
           source_title: source.title,
           surrounding_section_title: (currentHeading || []).at(-1) || "",
           overlap_tokens: CHUNK_TOKEN_OVERLAP,
+          chunking_strategy: "structured",
         },
         created_at: now(),
       });
@@ -2021,6 +2545,122 @@ export async function createSourceStudioEngine(options = {}) {
       previous.char_end = last.char_end;
     }
     return chunks;
+  }
+
+  function chunkDocumentHybridSemantic(notebookId, source, blocks) {
+    const chunks = [];
+    let current = [];
+    let tokenCount = 0;
+    let currentHeading = [];
+    let carriedOverlap = 0;
+
+    const pushChunk = (reason = "target_tokens") => {
+      const text = current.map((block) => block.text).join("\n\n").trim();
+      if (!text) {
+        current = [];
+        tokenCount = 0;
+        carriedOverlap = 0;
+        return;
+      }
+      const blockIds = [...new Set(current.map((block) => block.block_id))];
+      const first = current[0];
+      const last = current[current.length - 1];
+      chunks.push({
+        id: id("chunk"),
+        source_id: source.id,
+        notebook_id: notebookId,
+        text,
+        normalized_text: normalizeForSearch(text),
+        heading_path: currentHeading.length ? [...currentHeading] : first.heading_path,
+        block_ids: blockIds,
+        token_count: estimateTokens(text),
+        char_start: first.char_start,
+        char_end: last.char_end,
+        page_start: first.page_number,
+        page_end: last.page_number,
+        timestamp_start: first.timestamp_start,
+        timestamp_end: last.timestamp_end,
+        metadata_json: {
+          source_title: source.title,
+          surrounding_section_title: (currentHeading || []).at(-1) || "",
+          overlap_tokens: CHUNK_TOKEN_OVERLAP,
+          chunking_strategy: "hybrid_semantic",
+          semantic_boundary_reason: reason,
+          semantic_min_tokens: CHUNK_SEMANTIC_MIN,
+          semantic_max_tokens: CHUNK_SEMANTIC_MAX,
+        },
+        created_at: now(),
+      });
+      const overlap = [];
+      let overlapTokens = 0;
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        const blockTokens = estimateTokens(current[i].text);
+        if (blockTokens > CHUNK_TOKEN_OVERLAP || overlapTokens + blockTokens > CHUNK_TOKEN_OVERLAP) break;
+        overlap.unshift(current[i]);
+        overlapTokens += blockTokens;
+      }
+      current = overlap;
+      tokenCount = overlapTokens;
+      carriedOverlap = overlap.length;
+    };
+
+    for (const block of splitOversizedBlocks(blocks)) {
+      if (block.type === "heading") {
+        if (current.length > carriedOverlap) pushChunk("heading");
+        currentHeading = block.heading_path;
+      }
+
+      const blockTokens = estimateTokens(block.text);
+      const semanticBoundary = current.length > carriedOverlap
+        ? semanticBoundaryBetween(current.slice(carriedOverlap), block, tokenCount)
+        : null;
+      if (semanticBoundary?.break) {
+        pushChunk("semantic_shift");
+      } else if (current.length > carriedOverlap && tokenCount + blockTokens > CHUNK_SEMANTIC_MAX) {
+        pushChunk("max_tokens");
+      } else if (
+        current.length > carriedOverlap &&
+        tokenCount + blockTokens > CHUNK_TOKEN_TARGET &&
+        semanticBoundary?.weak
+      ) {
+        pushChunk("weak_boundary");
+      }
+
+      current.push(block);
+      tokenCount += blockTokens;
+    }
+    if (current.length > carriedOverlap) pushChunk("end");
+
+    if (chunks.length > 1 && chunks.at(-1).block_ids.length <= 1 && estimateTokens(chunks.at(-1).text) < CHUNK_TOKEN_OVERLAP) {
+      const last = chunks.pop();
+      const previous = chunks.at(-1);
+      previous.text = `${previous.text}\n\n${last.text}`;
+      previous.normalized_text = normalizeForSearch(previous.text);
+      previous.block_ids = [...new Set([...previous.block_ids, ...last.block_ids])];
+      previous.token_count = estimateTokens(previous.text);
+      previous.char_end = last.char_end;
+    }
+    return chunks;
+  }
+
+  function semanticBoundaryBetween(currentBlocks, nextBlock, tokenCount) {
+    if (tokenCount < CHUNK_SEMANTIC_MIN || nextBlock.type === "heading") return { break: false, weak: false };
+    const currentText = currentBlocks.map((block) => block.text).join("\n\n");
+    const nextText = nextBlock.text || "";
+    const currentTokens = tokenize(currentText);
+    const nextTokens = tokenize(nextText);
+    if (currentTokens.length < 20 || nextTokens.length < 8) return { break: false, weak: false };
+    const lexicalOverlap = overlapScore(nextTokens, currentTokens);
+    const vectorSimilarity = cosineSimilarity(embedText(currentText), embedText(nextText));
+    const breakOnSemanticShift =
+      vectorSimilarity < CHUNK_SEMANTIC_BREAK_SIMILARITY &&
+      lexicalOverlap < CHUNK_SEMANTIC_BREAK_OVERLAP;
+    return {
+      break: breakOnSemanticShift,
+      weak: vectorSimilarity < CHUNK_SEMANTIC_BREAK_SIMILARITY * 1.8 && lexicalOverlap < CHUNK_SEMANTIC_BREAK_OVERLAP * 1.8,
+      lexical_overlap: lexicalOverlap,
+      vector_similarity: vectorSimilarity,
+    };
   }
 
   function buildSourceKnowledgeObjects(source, blocks, chunks) {
@@ -2095,13 +2735,20 @@ export async function createSourceStudioEngine(options = {}) {
         object.notebook_id !== notebookId ||
         !["notebook_summary", "topic_map", "entity_index", "connections", "contradiction", "suggested_questions", "suggested_artifacts"].includes(object.type),
     );
-    const activeSources = state.sources.filter((source) => source.notebook_id === notebookId && source.active && source.status === "indexed");
+    const activeSources = state.sources
+      .filter((source) => source.notebook_id === notebookId && source.active && source.status === "indexed")
+      .filter((source) => !isLowQualityExtractionSource(source));
     if (!activeSources.length) return;
+    const activeSourceIds = new Set(activeSources.map((source) => source.id));
     const sourceSummaries = activeSources
       .map((source) => state.knowledgeObjects.find((object) => object.source_id === source.id && object.type === "source_summary"))
       .filter(Boolean);
-    const allEntities = state.knowledgeObjects.filter((object) => object.notebook_id === notebookId && object.type === "entity");
-    const allClaims = state.knowledgeObjects.filter((object) => object.notebook_id === notebookId && object.type === "claim");
+    const allEntities = state.knowledgeObjects.filter(
+      (object) => object.notebook_id === notebookId && object.type === "entity" && activeSourceIds.has(object.source_id),
+    );
+    const allClaims = state.knowledgeObjects.filter(
+      (object) => object.notebook_id === notebookId && object.type === "claim" && activeSourceIds.has(object.source_id),
+    );
     const summary = sourceSummaries
       .map((object) => object.data.summary)
       .join(" ")
@@ -2163,12 +2810,7 @@ export async function createSourceStudioEngine(options = {}) {
         source_id: "",
         type: "suggested_questions",
         data: {
-          questions: [
-            "What does Block Research AI appear to offer across the website and blog sources?",
-            "Which trading-bot and automation themes appear most often in the sources?",
-            "Find contradictions or open questions in the sources.",
-            "Create an executive brief from all active sources.",
-          ],
+          questions: buildNotebookSuggestedQuestions(activeSources),
         },
         created_at: timestamp,
       },
@@ -2199,7 +2841,8 @@ export async function createSourceStudioEngine(options = {}) {
     const sourceIds = resolveSourceIds(notebook_id, source_mode, selected_source_ids);
     const queryTokens = tokenize(retrievalText);
     const rewrites = rewriteQuery(retrievalText, notebook_id, queryTokens);
-    const corpusStats = buildRetrievalCorpusStats(sourceIds);
+    const candidateChunks = state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id) && isRetrievableChunk(chunk));
+    const corpusStats = buildRetrievalCorpusStats(sourceIds, candidateChunks);
     const queryVector = (await embedder.embed([rewrites.join(" ") || retrievalText], "query"))[0] || [];
     const candidateLimit = Math.max(evidenceLimit * RETRIEVAL_CANDIDATE_MULTIPLIER, RETRIEVAL_MIN_CANDIDATES);
     let pgSimMap = null;
@@ -2210,16 +2853,15 @@ export async function createSourceStudioEngine(options = {}) {
         logger.warn("pgvector.nearest.failed", { error: String(error?.message || error).slice(0, 160) });
       }
     }
-    let scored = state.chunks
-      .filter((chunk) => sourceIds.includes(chunk.source_id))
+    let scored = candidateChunks
       .map((chunk) => scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector, pgSimMap))
       .filter((result) => result.include)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateLimit);
+    scored = await rerankScoredChunks(scored, retrievalText, candidateLimit);
     scored = diversifyScoredChunks(scored, evidenceLimit);
     if (!scored.length && ["summary", "compare", "artifact", "table", "audio", "video", "slides", "mindmap"].includes(intent)) {
-      scored = diversifyScoredChunks(state.chunks
-        .filter((chunk) => sourceIds.includes(chunk.source_id))
+      scored = diversifyScoredChunks(candidateChunks
         .slice(0, candidateLimit)
         .map((chunk) => ({
           chunk,
@@ -2253,10 +2895,8 @@ export async function createSourceStudioEngine(options = {}) {
         ranking_signals: result.ranking_signals || {},
       };
     });
-    const relevantKnowledge = getRelevantKnowledgeObjects(notebook_id, queryTokens);
-    const sourceSummaries = state.knowledgeObjects
-      .filter((object) => object.notebook_id === notebook_id && object.type === "source_summary" && sourceIds.includes(object.source_id))
-      .map((object) => object.data);
+    const relevantKnowledge = getRelevantKnowledgeObjects(notebook_id, queryTokens, sourceIds);
+    const sourceSummaries = sourceSummariesForIds(notebook_id, sourceIds);
     const retrievalRun = {
       id: id("retrieval"),
       notebook_id,
@@ -2294,6 +2934,128 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
+  function buildFullSourceTextEvidencePack({ notebook_id, question, source_mode = "active", selected_source_ids = [] }) {
+    const notebook = state.notebooks.find((item) => item.id === notebook_id);
+    if (!notebook) throw statusError(404, "Notebook not found.");
+    const sourceIds = resolveSourceIds(notebook_id, source_mode, selected_source_ids);
+    const sourcesById = new Map(state.sources.map((source) => [source.id, source]));
+    const sources = preferredFullTextSources(
+      question,
+      sourceIds
+        .map((sourceId) => sourcesById.get(sourceId))
+        .filter((source) => source && !isLowQualityExtractionSource(source) && !isLikelyGarbledExtraction(source.cleaned_text || "")),
+    );
+    let remainingChars = MAX_DIRECT_SOURCE_TEXT_CHARS;
+    const evidenceItems = sources
+      .map((source, index) => {
+        if (remainingChars <= 0) return null;
+        const blocks = state.blocks
+          .filter((block) => block.source_id === source.id)
+          .sort((a, b) => a.order_index - b.order_index);
+        const chunks = state.chunks.filter((chunk) => chunk.source_id === source.id);
+        const fullText = cleanVerbatimSourceText(source.cleaned_text || blocks.map((block) => block.text).join("\n\n"));
+        if (!fullText) return null;
+        const quote = fullText.length > remainingChars
+          ? `${fullText.slice(0, Math.max(0, remainingChars - 120)).trim()}\n\n[Source text truncated in this chat response because it exceeds ${MAX_DIRECT_SOURCE_TEXT_CHARS} characters.]`
+          : fullText;
+        remainingChars -= quote.length;
+        return {
+          evidence_id: `E${index + 1}`,
+          source_id: source.id,
+          source_title: source.title,
+          block_ids: blocks.map((block) => block.block_id),
+          chunk_id: chunks[0]?.id || "",
+          quote,
+          heading_path: [],
+          page_number: null,
+          timestamp_start: blocks[0]?.timestamp_start || null,
+          timestamp_end: blocks.at(-1)?.timestamp_end || null,
+          relevance_score: 1,
+          rerank_score: 1,
+          support_type: "full_source_text",
+          ranking_signals: { full_source_text: 1 },
+        };
+      })
+      .filter(Boolean);
+    const sourceSummaries = sourceSummariesForIds(notebook_id, sourceIds);
+    const retrievalRun = {
+      id: id("retrieval"),
+      notebook_id,
+      query: question,
+      rewritten_queries: [question],
+      retrieved_chunks: evidenceItems.map((item) => ({
+        chunk_id: item.chunk_id,
+        source_id: item.source_id,
+        score: item.relevance_score,
+        rerank_score: item.rerank_score,
+        support_type: item.support_type,
+        ranking_signals: item.ranking_signals,
+      })),
+      final_evidence_ids: evidenceItems.map((item) => item.evidence_id),
+      created_at: now(),
+    };
+    return {
+      id: id("evidence"),
+      user_question: question,
+      notebook_id,
+      active_source_ids: sourceIds,
+      intent: "source_text",
+      retrieved_items: retrievalRun.retrieved_chunks,
+      source_summaries: sourceSummaries,
+      relevant_knowledge_objects: [],
+      citations_available: evidenceItems.length > 0,
+      evidence_items: evidenceItems,
+      constraints: {
+        answer_only_from_evidence: true,
+        abstain_if_insufficient_evidence: true,
+        cite_every_factual_claim: true,
+      },
+      retrieval_run: retrievalRun,
+      created_at: now(),
+    };
+  }
+
+  function generateFullSourceTextAnswer(question, evidencePack) {
+    const run = startModelRun("grounded_answer", "local", "local-source-text-v1", question);
+    const citations = evidencePack.evidence_items.map((item, index) => ({
+      index: index + 1,
+      evidence_id: item.evidence_id,
+      sourceId: item.source_id,
+      source_id: item.source_id,
+      sourceTitle: item.source_title,
+      source_title: item.source_title,
+      block_ids: item.block_ids,
+      chunk_id: item.chunk_id,
+      quote: item.quote,
+      heading_path: item.heading_path,
+      page_number: item.page_number,
+    }));
+    const answer = evidencePack.evidence_items.length
+      ? {
+        content: evidencePack.evidence_items
+          .map((item, index) => `## ${item.source_title} [${index + 1}]\n\n${item.quote}`)
+          .join("\n\n---\n\n"),
+        citations,
+        abstained: false,
+        verbatim_source_text: true,
+      }
+      : {
+        content: "I cannot print source text because no active indexed sources are available.",
+        citations: [],
+        abstained: true,
+        verbatim_source_text: true,
+      };
+    run.status = "completed";
+    run.output_tokens_estimate = estimateTokens(answer.content);
+    run.latency_ms = Date.now() - run.started_at_ms;
+    return {
+      answer,
+      active_run: run,
+      model_runs: [run],
+      fallback_reason: "direct_source_text",
+    };
+  }
+
   function resolveSourceIds(notebookId, sourceMode, selectedSourceIds) {
     const sources = state.sources.filter((source) => source.notebook_id === notebookId && source.status === "indexed");
     if (sourceMode === "all") return sources.map((source) => source.id);
@@ -2303,8 +3065,8 @@ export async function createSourceStudioEngine(options = {}) {
     return sources.filter((source) => source.active).map((source) => source.id);
   }
 
-  function buildRetrievalCorpusStats(sourceIds) {
-    const chunks = state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id));
+  function buildRetrievalCorpusStats(sourceIds, candidateChunks = null) {
+    const chunks = candidateChunks || state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id));
     const documentFrequency = new Map();
     let totalTokenCount = 0;
     for (const chunk of chunks) {
@@ -2375,6 +3137,78 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
+  async function rerankScoredChunks(scored, retrievalText, candidateLimit) {
+    if (!scored.length) return scored;
+    const rerankLimit = Math.max(
+      1,
+      Math.min(scored.length, candidateLimit, Number(env.RERANK_CANDIDATE_LIMIT || RERANK_CANDIDATE_LIMIT)),
+    );
+    const pool = scored.slice(0, rerankLimit);
+    const tail = scored.slice(rerankLimit).map((item) => withLocalRerankSignal(item));
+    if (!reranker.enabled) return [...pool.map((item) => withLocalRerankSignal(item)), ...tail];
+
+    try {
+      const result = await reranker.rerank({
+        query: retrievalText,
+        documents: pool.map(formatChunkForReranker),
+        topN: pool.length,
+      });
+      if (!result.applied || !result.results.length) return [...pool.map((item) => withLocalRerankSignal(item)), ...tail];
+      const weight = clampNumber(Number(env.RERANK_WEIGHT || RERANK_WEIGHT), 0, 1);
+      const returnedIndexes = new Set(result.results.map((item) => item.index));
+      const ranked = result.results
+        .map((item) => {
+          const original = pool[item.index];
+          if (!original) return null;
+          const rerankScore = clampNumber(Number(item.relevance_score || 0), 0, 1);
+          return {
+            ...original,
+            score: original.score * (1 - weight) + rerankScore * weight,
+            rerank_score: rerankScore,
+            ranking_signals: {
+              ...original.ranking_signals,
+              rerank: Number(rerankScore.toFixed(4)),
+              reranker_provider: result.provider,
+              reranker_model: result.model,
+            },
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
+      const unranked = pool
+        .filter((_, index) => !returnedIndexes.has(index))
+        .map((item) => withLocalRerankSignal(item));
+      return [...ranked, ...unranked, ...tail];
+    } catch (error) {
+      logger.warn("rerank.failed", { provider: reranker.provider, error: String(error?.message || error).slice(0, 160) });
+      return [...pool.map((item) => withLocalRerankSignal(item)), ...tail];
+    }
+  }
+
+  function withLocalRerankSignal(item) {
+    return {
+      ...item,
+      rerank_score: item.rerank_score ?? item.score,
+      ranking_signals: {
+        ...item.ranking_signals,
+        rerank: Number((item.rerank_score ?? item.score).toFixed(4)),
+        reranker_provider: "local-hybrid",
+      },
+    };
+  }
+
+  function formatChunkForReranker(item) {
+    const source = state.sources.find((candidateSource) => candidateSource.id === item.chunk.source_id);
+    const heading = (item.chunk.heading_path || []).join(" / ");
+    return [
+      `source_title: ${source?.title || "Untitled source"}`,
+      heading ? `heading: ${heading}` : "",
+      `support_type: ${item.support_type}`,
+      "content: |",
+      indentBlock(truncate(item.chunk.text || item.chunk.normalized_text || "", 3600), "  "),
+    ].filter(Boolean).join("\n");
+  }
+
   function bm25QueryScore(queryTokens, chunkTokens, corpusStats) {
     if (!queryTokens.length || !chunkTokens.length) return 0;
     const termCounts = new Map();
@@ -2427,9 +3261,17 @@ export async function createSourceStudioEngine(options = {}) {
     return selected;
   }
 
-  function getRelevantKnowledgeObjects(notebookId, queryTokens) {
+  function getRelevantKnowledgeObjects(notebookId, queryTokens, sourceIds = []) {
+    const usableSourceIds = new Set(
+      sourceIds.filter((sourceId) => {
+        const source = state.sources.find((item) => item.id === sourceId);
+        return source && !isLowQualityExtractionSource(source);
+      }),
+    );
     return state.knowledgeObjects
       .filter((object) => object.notebook_id === notebookId)
+      .filter((object) => !object.source_id || usableSourceIds.has(object.source_id))
+      .filter((object) => !isLikelyGarbledExtraction(JSON.stringify(object.data || {})))
       .map((object) => ({
         object,
         score: overlapScore(queryTokens, tokenize(JSON.stringify(object.data))),
@@ -2488,6 +3330,45 @@ export async function createSourceStudioEngine(options = {}) {
       content: lines.join("\n"),
       citations,
       abstained: false,
+    };
+  }
+
+  function verifyVerbatimSourceAnswer(answer, evidencePack) {
+    const ledgerId = id("ledger");
+    const entries = (answer.citations || []).map((citation, index) => {
+      const evidence = evidencePack.evidence_items.find((item) => item.evidence_id === citation.evidence_id);
+      return {
+        claim_id: id("claim"),
+        answer_message_id: "",
+        claim_text: `Verbatim source text returned from ${citation.sourceTitle || citation.source_title || "source"}.`,
+        support_level: "supported",
+        source_id: evidence?.source_id || citation.source_id || citation.sourceId || "",
+        block_ids: evidence?.block_ids || citation.block_ids || [],
+        evidence_quote: truncate(evidence?.quote || citation.quote || "", 1200),
+        verifier_notes: "The response is a direct source-text extract, not a generated factual synthesis.",
+        confidence: 0.98,
+        order_index: index + 1,
+      };
+    });
+    const ledger = {
+      id: ledgerId,
+      evidence_pack_id: evidencePack.id,
+      entries,
+      created_at: now(),
+    };
+    return {
+      ledger_id: ledgerId,
+      ledger,
+      final_answer: answer,
+      stats: {
+        claims_checked: entries.length,
+        supported: entries.length,
+        partially_supported: 0,
+        unsupported: 0,
+        not_checkable: answer.abstained ? 1 : 0,
+        citation_coverage: entries.length ? 1 : 0,
+        support_score: answer.abstained ? 0 : 1,
+      },
     };
   }
 
@@ -2586,32 +3467,28 @@ export async function createSourceStudioEngine(options = {}) {
         citations: [],
       };
     }
-    const keyPointLimit = flashcardPlan ? Math.max(6, Math.min(flashcardPlan.count, citations.length || 1)) : 6;
+    const keyPointLimit = type === "report"
+      ? Math.max(8, Math.min(12, citations.length || 1))
+      : flashcardPlan
+        ? Math.max(6, Math.min(flashcardPlan.count, citations.length || 1))
+        : 6;
     const keyPoints = citations.slice(0, keyPointLimit).map((item) => ({
       text: bestSentenceForQuestion(item.quote, evidencePack.user_question),
       citation: item.citation,
       source_refs: sourceRefsFromEvidence(item),
     }));
     if (type === "report") {
-      return {
-        title: options.report_type || "Executive Brief",
-        tldr: keyPoints.slice(0, 3).map((point) => `${point.text} ${point.citation}`),
-        key_points: keyPoints,
-        detailed_sections: buildReportSections(keyPoints, citations),
-        open_questions: openQuestionsForNotebook(notebook.id).slice(0, 5),
-        risks_limitations: risksForNotebook(notebook.id).slice(0, 5),
-        bibliography: bibliography(citations),
+      return buildReportPayload({
+        notebook,
+        evidencePack,
+        options,
+        keyPoints,
         citations,
-      };
+      });
     }
     if (type === "mindmap") {
       const topics = state.knowledgeObjects.find((object) => object.notebook_id === notebook.id && object.type === "topic_map")?.data?.topics || [];
-      // The interactive tree wants more leaves than the 6 shared key points, so
-      // synthesize a wider claim set straight from the deduped evidence.
-      const mindMapPoints = citations.slice(0, 16).map((item) => ({
-        text: bestSentenceForQuestion(item.quote, evidencePack.user_question),
-        source_refs: sourceRefsFromEvidence(item),
-      }));
+      const mindMapPoints = buildMindMapEvidencePoints(citations, evidencePack.user_question);
       return buildMindMapPayload({ notebook, titleBase, topics, keyPoints: mindMapPoints, citations });
     }
     if (type === "flashcards") {
@@ -2651,20 +3528,7 @@ export async function createSourceStudioEngine(options = {}) {
       };
     }
     if (type === "data-table") {
-      return {
-        title: titleBase,
-        columns: ["Item", "Evidence", "Support", "Source"],
-        rows: keyPoints.map((point, index) => ({
-          cells: {
-            Item: topicFromSentence(point.text),
-            Evidence: stripCitations(point.text),
-            Support: "directly_supported",
-            Source: citations[index]?.source_title || "Active source",
-          },
-          source_refs: point.source_refs,
-        })),
-        citations,
-      };
+      return buildDataTablePayload({ notebook, titleBase, citations, evidencePack, options });
     }
     if (type === "slide-deck") {
       const slideTopics = keyPoints.slice(0, 5).map((point) => titleCase(topicFromSentence(point.text)));
@@ -2808,6 +3672,55 @@ export async function createSourceStudioEngine(options = {}) {
     return chapters.slice(0, 12);
   }
 
+  function buildFallbackYouTubeKit(notebook, evidencePack, result = {}, warning = "") {
+    const evidenceText = (evidencePack.evidence_items || [])
+      .slice(0, 4)
+      .map((item) => stripCitations((item.quote || "").replace(/\[\d+:\d+\]/g, "")))
+      .filter(Boolean)
+      .join(" ");
+    const topic = truncate(stripCitations(notebook.title || "Source-grounded video"), 58);
+    const summary = truncate(evidenceText || `This video covers ${topic}.`, 420);
+    return {
+      title: "YouTube title & description",
+      titles: [
+        truncate(topic, 70),
+        truncate(`${topic}: key takeaways`, 70),
+        truncate(`What to know about ${topic}`, 70),
+        truncate(`${topic} explained from the sources`, 70),
+        truncate(`The evidence behind ${topic}`, 70),
+      ],
+      description: [
+        `This video breaks down ${topic} using the active notebook sources.`,
+        summary,
+        "Subscribe for more source-grounded research workflows and practical analysis.",
+      ].filter(Boolean).join("\n\n"),
+      chapters: buildLocalChapters(evidencePack),
+      tags: topTerms(`${topic} ${summary}`, 10).map((entry) => String(entry.term || "").toLowerCase()).filter(Boolean),
+      language: "English",
+      generation_provider: result.provider || "local",
+      generation_model: result.model || "local-grounded-v1",
+      warning: warning || (result.error ? `LLM generation failed: ${result.error}` : "Configure an LLM provider for higher-quality titles."),
+    };
+  }
+
+  function youtubeKitOutputText(payload) {
+    return [
+      ...(Array.isArray(payload?.titles) ? payload.titles : []),
+      payload?.description || "",
+      ...(Array.isArray(payload?.chapters) ? payload.chapters.map((chapter) => chapter?.label || "") : []),
+      ...(Array.isArray(payload?.tags) ? payload.tags : []),
+    ].join(" ");
+  }
+
+  function youtubeKitLooksOffTopic(payload, transcript, notebookTitle) {
+    const outputTokens = tokenize(youtubeKitOutputText(payload)).filter((token) => token.length > 3);
+    const sourceTokens = tokenize(`${notebookTitle || ""} ${String(transcript || "").slice(0, 60000)}`).filter((token) => token.length > 3);
+    if (outputTokens.length < 10 || sourceTokens.length < 8) return false;
+    const sourceSet = new Set(sourceTokens);
+    const matches = outputTokens.filter((token) => sourceSet.has(token)).length;
+    return matches / Math.max(outputTokens.length, 1) < 0.02;
+  }
+
   async function buildYouTubeKit(notebook, evidencePack, options = {}) {
     const activeIds = evidencePack.active_source_ids || [];
     const activeSources = state.sources.filter(
@@ -2817,10 +3730,13 @@ export async function createSourceStudioEngine(options = {}) {
     if (!transcript.trim()) {
       return { title: "YouTube title & description", titles: [], description: "", chapters: [], tags: [], warning: "No active source transcript available." };
     }
-    const language = options.language || "the language of the transcript";
+    const language = truncate(String(options.language || "English").trim() || "English", 48);
     const prompt = [
       "You are a top YouTube growth strategist. From the timestamped transcript below, produce a complete publish kit.",
-      `Write everything in ${language}. Return STRICT JSON only (no markdown fences) with this exact shape:`,
+      `Write every title, description paragraph, chapter label, and tag in ${language}.`,
+      "If a source is not in English, translate the meaning into fluent English unless the requested language explicitly says otherwise.",
+      "Stay on the transcript topic. Never switch to unrelated topics, languages, or generic examples.",
+      "Return STRICT JSON only (no markdown fences) with this exact shape:",
       '{"titles": ["..."], "description": "...", "chapters": [{"time": "M:SS", "label": "..."}], "tags": ["..."]}',
       "Rules:",
       "- titles: exactly 5 click-worthy but accurate options, each <= 70 characters, varied angles.",
@@ -2847,16 +3763,15 @@ export async function createSourceStudioEngine(options = {}) {
       parsed = null;
     }
     if (!parsed) {
-      return {
-        title: "YouTube title & description",
-        titles: [truncate(notebook.title, 70)],
-        description: (evidencePack.evidence_items || []).slice(0, 3).map((item) => stripCitations((item.quote || "").replace(/\[\d+:\d+\]/g, ""))).join(" "),
-        chapters: buildLocalChapters(evidencePack),
-        tags: [],
-        generation_provider: result.provider || "local",
-        generation_model: result.model || "local-grounded-v1",
-        warning: result.error ? `LLM generation failed: ${result.error}` : "Configure an LLM provider for higher-quality titles.",
-      };
+      return buildFallbackYouTubeKit(notebook, evidencePack, result);
+    }
+    if (youtubeKitLooksOffTopic(parsed, transcript, notebook.title)) {
+      return buildFallbackYouTubeKit(
+        notebook,
+        evidencePack,
+        result,
+        "Provider output was rejected because it did not match the active sources.",
+      );
     }
     return {
       title: "YouTube title & description",
@@ -2864,6 +3779,7 @@ export async function createSourceStudioEngine(options = {}) {
       description: String(parsed.description || ""),
       chapters: Array.isArray(parsed.chapters) ? parsed.chapters.slice(0, 12) : buildLocalChapters(evidencePack),
       tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 12) : [],
+      language,
       generation_provider: result.provider,
       generation_model: result.model,
     };
@@ -2982,26 +3898,23 @@ export async function createSourceStudioEngine(options = {}) {
   function buildFlashcardCards(citations, keyPoints, plan, evidencePack) {
     const cards = [];
     const seen = new Set();
-    const pool = citations.length ? citations : [];
-    if (!pool.length) return cards;
-    for (let index = 0; index < plan.count; index += 1) {
-      const citation = pool[index % pool.length];
-      const point = keyPoints[index % Math.max(1, keyPoints.length)] || {
-        text: bestSentenceForQuestion(citation.quote, evidencePack.user_question),
-        citation: citation.citation,
-      };
-      const sentence = stripCitations(bestSentenceForQuestion(citation.quote, plan.topic || evidencePack.user_question || point.text));
+    const evidenceCards = flashcardEvidenceCandidates(citations, keyPoints, plan, evidencePack);
+    if (!evidenceCards.length) return cards;
+    const maxAttempts = Math.max(plan.count * 4, evidenceCards.length);
+    for (let index = 0; cards.length < plan.count && index < maxAttempts; index += 1) {
+      const { citation, sentence } = evidenceCards[index % evidenceCards.length];
       const cardType = plan.cardTypes[index % plan.cardTypes.length];
-      const topic = titleCase(plan.topic || topicFromSentence(sentence));
+      const topic = flashcardTopic(plan, sentence, citation);
+      const insight = flashcardInsightFromEvidence({ sentence, citation, topic });
       const question = flashcardQuestionForType({
         type: cardType,
         topic,
-        sentence,
+        insight,
         citation,
         index,
         audience: plan.audience,
       });
-      const answer = `${sentence} ${citation.citation}`;
+      const answer = flashcardAnswerForType({ cardType, topic, insight, citation });
       const dedupeKey = evidenceDedupeKey(`${cardType} ${question} ${answer}`);
       if (dedupeKey && seen.has(dedupeKey)) continue;
       if (dedupeKey) seen.add(dedupeKey);
@@ -3009,13 +3922,13 @@ export async function createSourceStudioEngine(options = {}) {
       cards.push({
         id: id("card"),
         card_type: cardType,
-        learning_goal: flashcardLearningGoal(cardType, topic),
+        learning_goal: flashcardLearningGoal(cardType, topic, insight),
         question,
         answer,
-        explanation: flashcardExplanation({ cardType, topic, citation }),
-        hint: flashcardHint(sentence, topic),
+        explanation: flashcardExplanation({ cardType, topic, citation, insight }),
+        hint: flashcardHint(insight, topic),
         difficulty: flashcardDifficultyForIndex(plan.difficulty, index),
-        tags: [...new Set([...inferTags(sentence), cardType, plan.difficulty].filter(Boolean))].slice(0, 8),
+        tags: [...new Set([...inferTags(`${topic} ${insight.principle}`), cardType, plan.difficulty].filter(Boolean))].slice(0, 8),
         citation: citation.citation,
         evidence_id: citation.evidence_id,
         evidence_quote: truncate(citation.quote, 520),
@@ -3029,56 +3942,203 @@ export async function createSourceStudioEngine(options = {}) {
     return cards;
   }
 
-  function flashcardQuestionForType({ type, topic, sentence, citation, index, audience }) {
-    const sourceTitle = citation.source_title || "the active source";
-    const audienceHint = audience && audience !== "general" ? ` for ${audience}` : "";
-    const cloze = clozePrompt(sentence);
-    return (
-      {
-        concept: `What is the key source-grounded takeaway about ${topic}${audienceHint}?`,
-        application: `How should someone apply the cited point about ${topic}${audienceHint}?`,
-        cloze: `Fill the gap from ${sourceTitle}: ${cloze}`,
-        caveat: `What limitation or careful framing should you remember about ${topic}?`,
-        "source-check": `Which claim about ${topic} is directly supported by ${sourceTitle}?`,
-        compare: `How does the evidence position ${topic} relative to the rest of the notebook?`,
-      }[type] || `What should you remember about ${topic}?`
-    ).replace(/\s+/g, " ").trim() || `What does card ${index + 1} test?`;
+  function flashcardEvidenceCandidates(citations, keyPoints, plan, evidencePack) {
+    const query = [plan.topic, evidencePack?.user_question, ...keyPoints.map((point) => point.text)].filter(Boolean).join(" ");
+    const candidates = citations.flatMap((citation) => {
+      const sentences = extractSentences(citation.quote)
+        .map(cleanFlashcardSentence)
+        .filter(isLearnableFlashcardSentence);
+      const selected = sentences.length
+        ? sentences
+        : [cleanFlashcardSentence(bestSentenceForQuestion(citation.quote, query))].filter(isLearnableFlashcardSentence);
+      return selected.slice(0, 5).map((sentence) => ({
+        sentence,
+        citation,
+        score: flashcardSentenceScore(sentence, query),
+      }));
+    });
+    const deduped = [];
+    const seen = new Set();
+    for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+      const key = evidenceDedupeKey(candidate.sentence);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(candidate);
+    }
+    return deduped.length
+      ? deduped
+      : citations.map((citation) => ({
+          citation,
+          sentence: cleanFlashcardSentence(bestSentenceForQuestion(citation.quote, query)),
+          score: 0,
+        })).filter((candidate) => candidate.sentence);
   }
 
-  function flashcardLearningGoal(cardType, topic) {
+  function cleanFlashcardSentence(sentence) {
+    return stripCitations(sentence)
+      .replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]/g, "")
+      .replace(/\b(uh|um|yeah)\b/gi, "")
+      .replace(/\s+/g, " ")
+      .replace(/\s+([.,!?;:])/g, "$1")
+      .trim();
+  }
+
+  function isLearnableFlashcardSentence(sentence) {
+    const text = String(sentence || "").trim();
+    if (text.length < 36) return false;
+    if (/\b(thank you|thanks for watching|see you|drop (it )?in the comments|subscribe)\b/i.test(text)) return false;
+    return /\b(need|needs|should|must|cannot|can't|can not|requires?|use|uses|using|create|creates|connect|copy|paste|set|switch|replace|avoid|instead|because|therefore|important|risk|limitation|evidence|preserve|check|test)\b/i.test(text);
+  }
+
+  function flashcardSentenceScore(sentence, query) {
+    const learnableBoost = /\b(need|should|must|cannot|requires?|instead|avoid|because|therefore|important)\b/i.test(sentence) ? 0.35 : 0;
+    const workflowBoost = /\b(create|copy|paste|connect|set|switch|replace|use)\b/i.test(sentence) ? 0.2 : 0;
+    return overlapScore(tokenize(sentence), tokenize(query)) + learnableBoost + workflowBoost;
+  }
+
+  function flashcardTopic(plan, sentence, citation = {}) {
+    const explicit = String(plan.topic || "").trim();
+    if (explicit) return titleCase(explicit).trim();
+    const text = String(sentence || "");
+    if (/\b(api key|permissions?|trusted ip|ip restriction)\b/i.test(text)) return "Exchange API Setup";
+    if (/\b(webhook|web hook|alert body|message)\b/i.test(text)) return "TradingView Alert Setup";
+    if (/\b(watch list alert|single alert|1 second time frame)\b/i.test(text)) return "Single Alert Testing";
+    if (/\b(back ?test|actual amount|base order|live trading)\b/i.test(text)) return "Live Order Sizing";
+    if (/\b(signal pipe|three commas|intermediate|forwarder)\b/i.test(text)) return "Signal Forwarding";
+    if (/\b(logs?|debug|payload)\b/i.test(text)) return "Trade Debugging";
+    const filler = new Set(["all", "but", "same", "thing", "just", "here", "from", "into", "there", "right", "actually"]);
+    const terms = topTerms(text, 6).map((item) => item.term).filter((term) => !filler.has(term)).slice(0, 3);
+    const fallback = terms.length ? terms.join(" ") : citation.source_title || "Source Concept";
+    return titleCase(fallback).replace(/\bUm\b/g, "").trim() || "Source Concept";
+  }
+
+  function flashcardInsightFromEvidence({ sentence, citation }) {
+    const clean = cleanFlashcardSentence(sentence);
+    const contrast = flashcardContrast(clean);
+    const citationLabel = citation.citation || "";
+    let principle = "";
+    let avoid = "";
+    let action = "";
+    if (/\bwatch list alert\b/i.test(clean) && /\bsingle alert\b/i.test(clean)) {
+      avoid = "a watch-list alert for a broad list";
+      action = "create one alert for the exact live-trading setup";
+      principle = `Create a single alert for the actual live setup instead of a watch-list alert.`;
+    } else if (/\bapi key\b/i.test(clean) && /\b(permission|paste|connect|account)\b/i.test(clean)) {
+      action = "create an exchange API key with the required permissions and paste it into Signal Pipe";
+      principle = `The broker or exchange connection starts with an API key that has the required permissions and is added to Signal Pipe.`;
+    } else if (/\btrusted ip|ip restriction\b/i.test(clean)) {
+      action = "restrict exchange API access to the trusted Block Research server IP";
+      principle = `The API key should be protected with an IP restriction so only the trusted server can send trades.`;
+    } else if (/\btrading\s*view\b/i.test(clean) && /\b(cannot|can't|can not)\b/i.test(clean) && /\b(broker|automated trading|strategy)\b/i.test(clean)) {
+      action = "use an intermediate signal-forwarding layer";
+      principle = `TradingView strategy signals need an intermediate forwarder before they can drive automated broker trades.`;
+    } else if (/\bsignal pipe\b/i.test(clean) && /\bthree commas\b/i.test(clean)) {
+      action = "replace the old forwarding service with Signal Pipe";
+      principle = `Signal Pipe is presented as the replacement forwarding layer when Three Commas is no longer available.`;
+    } else if (/\b(webhook|web hook|URL|message)\b/i.test(clean) && /\b(paste|copy|alert)\b/i.test(clean)) {
+      action = "copy the Signal Pipe webhook details into the TradingView alert";
+      principle = `The setup depends on pasting the Signal Pipe webhook URL and alert message into TradingView.`;
+    } else if (/\bback ?test|live trading|actual amount\b/i.test(clean)) {
+      action = "separate backtest sizing from the amount used in live trading";
+      principle = `Backtests can use simulated sizing, but live trading should send the actual amount intended for the order.`;
+    } else if (contrast) {
+      avoid = contrast.avoid;
+      action = contrast.recommended;
+      principle = `Prefer ${contrast.recommended} instead of ${contrast.avoid}.`;
+    } else {
+      action = lowerFirst(clean.replace(/\.$/, ""));
+      principle = `Remember the source-backed rule: ${lowerFirst(clean.replace(/\.$/, ""))}.`;
+    }
+    return {
+      principle: `${principle} ${citationLabel}`.replace(/\s+/g, " ").trim(),
+      action,
+      avoid,
+      sourceSentence: clean,
+    };
+  }
+
+  function flashcardContrast(sentence) {
+    const match = /\bnot\s+(?:an?|the)?\s*([^,.]+?),?\s+but\s+(?:an?|the)?\s*([^.;]+)/i.exec(sentence);
+    if (!match) return null;
+    return {
+      avoid: match[1].trim(),
+      recommended: match[2].trim(),
+    };
+  }
+
+  function flashcardQuestionForType({ type, topic, insight, citation, index, audience }) {
+    const sourceTitle = citation.source_title || "the active source";
+    const audienceHint = audience && audience !== "general" ? ` for ${audience}` : "";
     return (
       {
-        concept: `Recall the core cited claim about ${topic}.`,
-        application: `Use the cited claim about ${topic} in a practical explanation.`,
-        cloze: `Remember the missing source phrase for ${topic}.`,
-        caveat: `Keep the source-grounded caveat for ${topic} narrow.`,
+        concept: `What is the main lesson about ${topic}${audienceHint}?`,
+        application: `How would you apply the lesson about ${topic}${audienceHint} in the workflow?`,
+        cloze: `Which setup choice completes the source-backed workflow for ${topic}?`,
+        caveat: `What mistake should you avoid when working with ${topic}?`,
+        "source-check": `Which claim about ${topic} is directly supported by ${sourceTitle}?`,
+        compare: `How does ${topic} change the workflow described by the source?`,
+      }[type] || `What should you remember about ${topic}?`
+    ).replace(/\s+/g, " ").trim() || `What does card ${index + 1} test about ${insight.action || topic}?`;
+  }
+
+  function flashcardAnswerForType({ cardType, topic, insight, citation }) {
+    if (cardType === "application" && insight.action) {
+      return `Apply it by ${lowerFirst(insight.action).replace(/\.$/, "")}. ${citation.citation}`.replace(/\s+/g, " ").trim();
+    }
+    if (cardType === "caveat" && insight.avoid) {
+      return `Avoid ${insight.avoid}; the source points to ${insight.action || topic} instead. ${citation.citation}`.replace(/\s+/g, " ").trim();
+    }
+    if (cardType === "compare" && insight.action) {
+      return `It shifts the workflow toward ${lowerFirst(insight.action).replace(/\.$/, "")}. ${citation.citation}`.replace(/\s+/g, " ").trim();
+    }
+    return insight.principle;
+  }
+
+  function flashcardLearningGoal(cardType, topic, insight) {
+    return (
+      {
+        concept: `Recall the source-backed lesson about ${topic}.`,
+        application: `Apply ${topic} as a practical workflow step.`,
+        cloze: `Recover the correct setup choice for ${topic}.`,
+        caveat: `Avoid the wrong move when explaining ${topic}.`,
         "source-check": `Separate supported evidence from unsupported claims about ${topic}.`,
         compare: `Connect ${topic} to adjacent notebook evidence without leaving the sources.`,
       }[cardType] || `Study ${topic} from cited evidence.`
-    );
+    ).replace("workflow step.", `${insight.action ? `workflow step: ${insight.action}.` : "workflow step."}`);
   }
 
-  function flashcardExplanation({ cardType, topic, citation }) {
+  function flashcardExplanation({ cardType, topic, citation, insight }) {
     const sourceTitle = citation.source_title || "the cited source";
+    if (insight.action && insight.avoid) {
+      return `This checks the decision boundary: do not use ${insight.avoid}; use ${insight.action} instead.`;
+    }
+    if (insight.action) {
+      return `This checks the operational step from ${sourceTitle}: ${lowerFirst(insight.action).replace(/\.$/, "")}.`;
+    }
     if (cardType === "source-check") {
-      return `The accepted answer must stay inside ${sourceTitle}; the attached quote is the support boundary for ${topic}.`;
+      return `The source boundary is ${sourceTitle}; the answer should recall the supported lesson, not add outside assumptions.`;
     }
     if (cardType === "caveat") {
-      return `The card is asking for careful framing, so the answer repeats only what the cited passage supports about ${topic}.`;
+      return insight.avoid
+        ? `This card checks that you avoid ${insight.avoid} and keep the answer aligned with ${sourceTitle}.`
+        : `This card asks for careful framing, so keep the answer inside what ${sourceTitle} supports about ${topic}.`;
     }
-    return `This card is grounded in ${sourceTitle}; use the citation to inspect the exact source block before relying on the answer.`;
+    return `This is a learning card, not a quote recall card: answer the question in your own words, then use the citation to audit it.`;
   }
 
-  function flashcardHint(sentence, topic) {
-    const terms = topTerms(sentence, 2).map((item) => item.term);
-    return terms.length ? `Think about ${terms.join(" and ")} in relation to ${topic}.` : `Look for the cited claim about ${topic}.`;
+  function flashcardHint(insight, topic) {
+    if (insight.avoid && insight.action) return `Contrast what to avoid with the correct move for ${topic}.`;
+    if (/api/i.test(topic)) return "Think about the credential, permissions, and where it is configured.";
+    if (/alert/i.test(topic)) return "Think about the exact TradingView alert fields that route the signal.";
+    if (/forward|signal/i.test(topic)) return "Think about the layer between TradingView and the broker.";
+    if (/sizing|order/i.test(topic)) return "Think about what changes between a backtest and a live order.";
+    if (/debug/i.test(topic)) return "Think about the logs or payload you would inspect first.";
+    return `Look for the source-backed rule about ${topic}.`;
   }
 
-  function clozePrompt(sentence) {
-    const terms = topTerms(sentence, 1).map((item) => item.term);
-    const term = terms[0];
-    if (!term) return truncate(sentence, 120);
-    return truncate(sentence.replace(new RegExp(`\\b${escapeRegExp(term)}\\b`, "i"), "_____"), 150);
+  function lowerFirst(text) {
+    const value = String(text || "").trim();
+    return value ? value.charAt(0).toLowerCase() + value.slice(1) : value;
   }
 
   async function buildPodcastAudioPayload({ notebook, evidencePack, citations, options = {} }) {
@@ -3728,11 +4788,10 @@ export async function createSourceStudioEngine(options = {}) {
     const fileBase = sanitizeFileName(`video-${artifactId}`);
     const videoPath = join(artifactDir, `${fileBase}.mp4`);
     const ffmpegPath = env.FFMPEG_PATH || "ffmpeg";
-    const sipsPath = env.SIPS_PATH || "sips";
     logger.info("video.render.start", {
       artifact_id: artifactId,
       scenes: storyboard.length,
-      renderer: "local-ffmpeg-sips",
+      renderer: "cartoon-image-ffmpeg",
     });
 
     try {
@@ -3745,16 +4804,14 @@ export async function createSourceStudioEngine(options = {}) {
       const durations = videoSceneDurations(storyboard, narration?.duration_seconds || 0);
       const pngPaths = [];
       for (let index = 0; index < storyboard.length; index += 1) {
-        const svgPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.svg`);
         const pngPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.png`);
-        await writeFile(svgPath, renderVideoSceneSvg(payload, storyboard[index], {
+        await renderVideoSceneImage({
+          tempDir,
+          pngPath,
+          payload,
+          scene: storyboard[index],
           index,
           total: storyboard.length,
-          duration: durations[index],
-        }));
-        await execFile(sipsPath, ["-s", "format", "png", svgPath, "--out", pngPath], {
-          timeout: 60_000,
-          maxBuffer: 1024 * 1024,
         });
         pngPaths.push(pngPath);
       }
@@ -3785,7 +4842,7 @@ export async function createSourceStudioEngine(options = {}) {
         "-map",
         "1:a:0",
         "-vf",
-        "fps=30,format=yuv420p",
+        "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p",
         "-c:v",
         "libx264",
         "-preset",
@@ -3810,7 +4867,7 @@ export async function createSourceStudioEngine(options = {}) {
       payload.storyboard = storyboard;
       payload.video_status = "rendered";
       payload.render_status = "rendered_mp4";
-      payload.video_renderer = "local-ffmpeg-sips";
+      payload.video_renderer = "cartoon-image-ffmpeg";
       payload.video_content_type = "video/mp4";
       payload.video_file_name = `${fileBase}.mp4`;
       payload.video_file_path = videoPath;
@@ -3819,8 +4876,12 @@ export async function createSourceStudioEngine(options = {}) {
       payload.video_size_bytes = size;
       payload.video_resolution = "1280x720";
       payload.video_scene_count = storyboard.length;
-      payload.video_narration_status = narration?.path ? "rendered_macos_tts" : "silent_track";
+      payload.video_narration_status = narration?.status || "silent_track";
+      payload.video_tts_provider = narration?.provider || "";
       payload.video_tts_voice = narration?.voice || "";
+      payload.video_visual_status = storyboard.some((scene) => scene.visual_status === "rendered_openai_cartoon")
+        ? "rendered_openai_cartoon"
+        : "rendered_local_cartoon";
       logger.info("video.render.completed", {
         artifact_id: artifactId,
         scenes: storyboard.length,
@@ -3844,9 +4905,12 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   async function renderVideoNarrationAudio({ tempDir, artifactId, payload, storyboard }) {
-    if (env.SOURCESTUDIO_VIDEO_TTS === "false" || process.platform !== "darwin") return null;
+    if (env.SOURCESTUDIO_VIDEO_TTS === "false") return null;
     const script = videoNarrationScript(payload, storyboard);
     if (!script.trim()) return null;
+    const elevenLabs = await renderVideoElevenLabsNarration({ tempDir, artifactId, script });
+    if (elevenLabs) return elevenLabs;
+    if (process.platform !== "darwin") return null;
     const voice = env.SOURCESTUDIO_VIDEO_TTS_VOICE || env.SOURCESTUDIO_LOCAL_TTS_VOICE || "Alex";
     const textPath = join(tempDir, "narration.txt");
     const aiffPath = join(tempDir, "narration.aiff");
@@ -3871,6 +4935,8 @@ export async function createSourceStudioEngine(options = {}) {
       return {
         path: audioPath,
         voice,
+        provider: "macos-say-fallback",
+        status: "rendered_macos_tts",
         duration_seconds: duration,
       };
     } catch (error) {
@@ -3880,6 +4946,101 @@ export async function createSourceStudioEngine(options = {}) {
       });
       return null;
     }
+  }
+
+  async function renderVideoElevenLabsNarration({ tempDir, artifactId, script }) {
+    if (!hasConfiguredValue(env.ELEVENLABS_API_KEY)) return null;
+    const voiceId = env.ELEVENLABS_VOICE_ID_VIDEO || env.ELEVENLABS_VOICE_ID_HOST_A || env.ELEVENLABS_VOICE_ID || "";
+    if (!voiceId) {
+      logger.info("video.elevenlabs.skipped", {
+        artifact_id: artifactId,
+        reason: "voice_id_missing",
+      });
+      return null;
+    }
+    const model = env.ELEVENLABS_VIDEO_MODEL || env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
+    const outputFormat = env.ELEVENLABS_VIDEO_OUTPUT_FORMAT || env.ELEVENLABS_OUTPUT_FORMAT || "mp3_44100_128";
+    const audioPath = join(tempDir, "narration-elevenlabs.mp3");
+    logger.info("video.elevenlabs.start", {
+      artifact_id: artifactId,
+      model,
+      output_format: outputFormat,
+      input_chars: script.length,
+    });
+    try {
+      const response = await fetchImpl(
+        `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=${encodeURIComponent(outputFormat)}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "xi-api-key": env.ELEVENLABS_API_KEY,
+          },
+          body: JSON.stringify({
+            text: script,
+            model_id: model,
+            voice_settings: {
+              stability: Number(env.ELEVENLABS_VIDEO_STABILITY || 0.44),
+              similarity_boost: Number(env.ELEVENLABS_VIDEO_SIMILARITY_BOOST || 0.82),
+              style: Number(env.ELEVENLABS_VIDEO_STYLE || 0.2),
+              use_speaker_boost: env.ELEVENLABS_VIDEO_SPEAKER_BOOST !== "false",
+            },
+          }),
+        },
+      );
+      if (!response.ok) throw new Error(`ElevenLabs video narration failed with ${response.status}.`);
+      const audioBuffer = Buffer.from(await response.arrayBuffer());
+      if (!audioBuffer.length) throw new Error("ElevenLabs returned an empty video narration file.");
+      await writeFile(audioPath, audioBuffer);
+      const duration = await probeMediaDuration(audioPath, env.FFPROBE_PATH || "ffprobe").catch(() => 0);
+      logger.info("video.elevenlabs.completed", {
+        artifact_id: artifactId,
+        model,
+        duration_seconds: duration,
+        bytes: audioBuffer.length,
+      });
+      return {
+        path: audioPath,
+        voice: voiceId,
+        provider: "elevenlabs",
+        model,
+        status: "rendered_elevenlabs",
+        duration_seconds: duration,
+      };
+    } catch (error) {
+      logger.warn("video.elevenlabs.failed", {
+        artifact_id: artifactId,
+        error: safeProviderError(error),
+      });
+      return null;
+    }
+  }
+
+  async function renderVideoSceneImage({ tempDir, pngPath, payload, scene, index, total }) {
+    const prompt = videoSceneImagePrompt(payload, scene, { index, total });
+    const result = env.SOURCESTUDIO_VIDEO_IMAGE_PROVIDER === "local"
+      ? { error: "Local video image provider forced." }
+      : await generateThumbnailImage(prompt, [], "1536x1024");
+    if (result.image_data) {
+      await writeDataUriFile(result.image_data, pngPath);
+      scene.image_prompt = prompt;
+      scene.visual_status = "rendered_openai_cartoon";
+      return;
+    }
+    const svgPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.svg`);
+    await writeFile(svgPath, renderVideoCartoonFallbackSvg(scene, { index, total }));
+    await execFile(env.SIPS_PATH || "sips", ["-s", "format", "png", svgPath, "--out", pngPath], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+    scene.image_prompt = prompt;
+    scene.visual_status = "rendered_local_cartoon";
+    scene.visual_fallback_reason = result.error || "";
+  }
+
+  async function writeDataUriFile(dataUri, filePath) {
+    const base64 = String(dataUri || "").replace(/^data:[^,]+,/, "");
+    await writeFile(filePath, Buffer.from(base64, "base64"));
   }
 
   async function writeArtifactFile(directory, artifact) {
@@ -3903,21 +5064,42 @@ export async function createSourceStudioEngine(options = {}) {
 
   function renderArtifactText(type, payload) {
     if (type === "report") {
-      return [
+      const lines = [
         `# ${payload.title}`,
         "",
+        "## Executive Summary",
+        ...reportTextItems(payload.executive_summary).map((item) => `${item}`),
+        "",
         "## TL;DR",
-        ...(payload.tldr || []).map((item) => `- ${item}`),
+        ...reportTextItems(payload.tldr).map((item) => `- ${item}`),
         "",
-        "## Key Points",
-        ...(payload.key_points || []).map((item) => `- ${item.text} ${item.citation}`),
+        "## Key Findings",
+        ...reportTextItems(payload.key_findings || payload.key_points).map((item) => `- ${item}`),
         "",
+      ];
+      for (const section of Array.isArray(payload.detailed_sections) ? payload.detailed_sections : []) {
+        lines.push(`## ${section.heading || "Section"}`, "");
+        lines.push(...reportTextItems(section.body).map((item) => `${item}`), "");
+        const evidence = reportTextItems(section.evidence);
+        if (evidence.length) lines.push("Evidence:", ...evidence.map((item) => `- ${item}`), "");
+        const implications = reportTextItems(section.implications);
+        if (implications.length) lines.push("Implications:", ...implications.map((item) => `- ${item}`), "");
+      }
+      const recommendations = reportTextItems(payload.recommendations);
+      if (recommendations.length) {
+        lines.push("## Recommendations", "", ...recommendations.map((item) => `- ${item}`), "");
+      }
+      lines.push(
         "## Open Questions",
-        ...(payload.open_questions || []).map((item) => `- ${item}`),
+        ...reportTextItems(payload.open_questions).map((item) => `- ${item}`),
         "",
         "## Risks / Limitations",
-        ...(payload.risks_limitations || []).map((item) => `- ${item}`),
-      ].join("\n");
+        ...reportTextItems(payload.risks_limitations).map((item) => `- ${item}`),
+        "",
+        "## Bibliography",
+        ...reportTextItems(payload.bibliography).map((item) => `- ${item}`),
+      );
+      return lines.join("\n");
     }
     if (type === "data-table") {
       const columns = payload.columns || [];
@@ -3946,6 +5128,26 @@ export async function createSourceStudioEngine(options = {}) {
       return `# YouTube thumbnail\n\nPrompt: ${payload.image_prompt || ""}\nStatus: ${payload.image_status || ""}`;
     }
     return JSON.stringify(payload, null, 2);
+  }
+
+  function reportTextItems(value) {
+    if (!value) return [];
+    const values = Array.isArray(value) ? value : [value];
+    return values
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        if (!item || typeof item !== "object") return String(item || "").trim();
+        if (typeof item.text === "string") return item.text.trim();
+        if (typeof item.analysis === "string") return item.analysis.trim();
+        if (typeof item.body === "string") return item.body.trim();
+        if (typeof item.title === "string") return item.title.trim();
+        if (typeof item.action === "string" && typeof item.citation === "string") return `${item.action} ${item.citation}`.trim();
+        return Object.entries(item)
+          .filter(([, entryValue]) => typeof entryValue === "string" && entryValue.trim())
+          .map(([key, entryValue]) => `${titleCase(key.replace(/_/g, " "))}: ${entryValue}`)
+          .join("; ");
+      })
+      .filter(Boolean);
   }
 
   function startModelRun(role, provider, model, input) {
@@ -4050,6 +5252,20 @@ async function loadState(stateFile) {
   } catch {
     return createEmptyState();
   }
+}
+
+function stateFreshness(state) {
+  const dates = [
+    ...(state.notebooks || []).flatMap((item) => [item.created_at, item.updated_at]),
+    ...(state.sources || []).flatMap((item) => [item.created_at, item.updated_at]),
+    ...(state.artifacts || []).map((item) => item.created_at),
+    ...(state.artifactJobs || []).flatMap((item) => [item.created_at, item.updated_at]),
+    ...(state.messages || []).map((item) => item.created_at),
+  ];
+  return dates.reduce((freshest, value) => {
+    const time = Date.parse(value || "");
+    return Number.isFinite(time) && time > freshest ? time : freshest;
+  }, 0);
 }
 
 function createEmptyState() {
@@ -4282,17 +5498,23 @@ function cleanHtml(html) {
   ).trim();
 }
 
+const PDF_UNREADABLE_TEXT = "PDF uploaded. The local text-extraction fallback did not find reliable text in this file. OCR or layout-aware PDF extraction is required for scanned or image-only PDFs.";
+
 async function extractPdfText(buffer) {
   try {
     const { extractText, getDocumentProxy } = await import("unpdf");
     const pdf = await getDocumentProxy(new Uint8Array(buffer));
     const { text } = await extractText(pdf, { mergePages: true });
     const cleaned = normalizeWhitespace(Array.isArray(text) ? text.join("\n\n") : String(text || ""));
-    if (cleaned.length > 40) return { text: cleaned, parser: "pdf-unpdf" };
+    if (cleaned.length > 40 && !isLikelyGarbledExtraction(cleaned)) return { text: cleaned, parser: "pdf-unpdf" };
   } catch {
     // Fall through to the byte-scan fallback (e.g. scanned/encrypted PDFs).
   }
-  return { text: parsePdfFallback(buffer), parser: "pdf-string-fallback" };
+  const fallbackText = parsePdfFallback(buffer);
+  return {
+    text: fallbackText,
+    parser: fallbackText === PDF_UNREADABLE_TEXT ? "pdf-unreadable" : "pdf-string-fallback",
+  };
 }
 
 function parsePdfFallback(buffer) {
@@ -4303,8 +5525,48 @@ function parsePdfFallback(buffer) {
     ?.map((part) => part.replace(/^\(|\)$/g, ""))
     .join(" ") || "";
   const cleaned = normalizeWhitespace(text);
-  if (cleaned.length > 120) return cleaned;
-  return "PDF uploaded. The local text-extraction fallback did not find reliable text in this file. OCR or layout-aware PDF extraction is a production extension.";
+  if (cleaned.length > 120 && !isLikelyGarbledExtraction(cleaned)) return cleaned;
+  return PDF_UNREADABLE_TEXT;
+}
+
+function extractionQuality(text) {
+  const sample = String(text || "").slice(0, 6000);
+  const chars = Array.from(sample);
+  const length = chars.length || 1;
+  let alphaNumeric = 0;
+  let controls = 0;
+  let mojibake = 0;
+  for (const char of chars) {
+    if (/[\p{L}\p{N}]/u.test(char)) alphaNumeric += 1;
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(char)) controls += 1;
+    if (/[�ÂÃâ¤¼½¾¬¦¶]/u.test(char)) mojibake += 1;
+  }
+  const pdfSyntax = (sample.match(/%PDF|\bobj\b|endobj|\bstream\b|endstream|DCTDecode|FlateDecode|\bxref\b|trailer|\/(?:Type|Subtype|Length|Filter|ColorSpace)\b/g) || []).length;
+  const words = (sample.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]{2,}\b/gu) || []).length;
+  return {
+    length: chars.length,
+    alpha_numeric_ratio: alphaNumeric / length,
+    control_ratio: controls / length,
+    mojibake_ratio: mojibake / length,
+    pdf_syntax_hits: pdfSyntax,
+    words,
+  };
+}
+
+function isLikelyGarbledExtraction(text) {
+  const sample = String(text || "").trim();
+  if (!sample) return true;
+  if (sample === PDF_UNREADABLE_TEXT) return false;
+  const quality = extractionQuality(sample);
+  if (quality.length < 40) {
+    return quality.control_ratio > 0 || quality.pdf_syntax_hits > 0 || quality.mojibake_ratio > 0.2;
+  }
+  if (quality.control_ratio > 0.02) return true;
+  if (quality.pdf_syntax_hits >= 4 && quality.words < 120) return true;
+  if (quality.pdf_syntax_hits >= 2 && quality.mojibake_ratio > 0.05) return true;
+  if (quality.mojibake_ratio > 0.16 && quality.alpha_numeric_ratio < 0.62) return true;
+  if (quality.pdf_syntax_hits >= 1 && quality.alpha_numeric_ratio < 0.35) return true;
+  return false;
 }
 
 async function parseDocxTextFallback(filePath) {
@@ -4323,11 +5585,104 @@ async function parseDocxTextFallback(filePath) {
         .replace(/<[^>]+>/g, " "),
     );
     const cleaned = normalizeWhitespace(text);
-    if (cleaned.length > 80) return cleaned;
+    if (cleaned.length > 20) return cleaned;
   } catch {
     // The fallback depends on the local unzip binary and a standard DOCX XML layer.
   }
   return "DOCX uploaded. The local XML text fallback did not find reliable text. Paste document text or add a production DOCX parser for layout-aware extraction.";
+}
+
+async function parsePptxTextFallback(filePath) {
+  if (!filePath) {
+    return "PPTX source uploaded without readable text. Paste the slide text to index it, or configure a layout-aware PPTX parser.";
+  }
+  try {
+    const entries = (await listZipEntries(filePath))
+      .filter((entry) => /^ppt\/slides\/slide\d+\.xml$/i.test(entry))
+      .sort(compareNumberedZipEntries);
+    if (!entries.length) throw new Error("No slide XML entries found.");
+    const xml = await unzipEntries(filePath, entries.slice(0, 250), 16 * 1024 * 1024);
+    const text = decodeHtml(
+      xml
+        .replace(/<a:tab\/>/g, " ")
+        .replace(/<a:br\/>/g, "\n")
+        .replace(/<\/a:p>/g, "\n")
+        .replace(/<\/p:sp>/g, "\n\n")
+        .replace(/<[^>]+>/g, " "),
+    );
+    const cleaned = normalizeWhitespace(text);
+    if (cleaned.length > 20) return cleaned;
+  } catch {
+    // PPTX is an Open XML zip. The fallback extracts text from slide XML when unzip is available.
+  }
+  return "PPTX uploaded. The local XML text fallback did not find reliable slide text. Paste slide text or add a production presentation parser for layout-aware extraction.";
+}
+
+async function parseEpubTextFallback(filePath) {
+  if (!filePath) {
+    return "EPUB source uploaded without readable text. Paste the book text to index it, or configure an EPUB parser.";
+  }
+  try {
+    const entries = (await listZipEntries(filePath))
+      .filter((entry) => /\.(xhtml|html|htm)$/i.test(entry))
+      .filter((entry) => !/^META-INF\//i.test(entry))
+      .sort(compareNumberedZipEntries);
+    if (!entries.length) throw new Error("No HTML content entries found.");
+    const html = await unzipEntries(filePath, entries.slice(0, 400), 24 * 1024 * 1024);
+    const cleaned = normalizeWhitespace(cleanHtml(html));
+    if (cleaned.length > 20) return cleaned;
+  } catch {
+    // EPUB is a zip of HTML/XHTML content; this fallback intentionally ignores layout and media.
+  }
+  return "EPUB uploaded. The local HTML text fallback did not find reliable readable text. Paste book text or add a production EPUB parser for table-of-contents-aware extraction.";
+}
+
+async function parsePlainTextUploadFallback(filePath, payload = {}) {
+  if (!filePath || !isPlainTextUpload(payload)) return "";
+  try {
+    const text = await readFile(filePath, "utf8");
+    return normalizeWhitespace(text);
+  } catch {
+    return "";
+  }
+}
+
+function uploadedTextParser(payload = {}) {
+  const name = String(payload.file_name || "").toLowerCase();
+  if (name.endsWith(".csv")) return "csv-text-parser";
+  if (name.endsWith(".txt")) return "text-file-parser";
+  return "markdown-parser";
+}
+
+function isPlainTextUpload(payload = {}) {
+  const name = String(payload.file_name || "").toLowerCase();
+  const mime = String(payload.mime_type || "").toLowerCase();
+  return /\.(md|markdown|txt|csv)$/.test(name) || mime.startsWith("text/");
+}
+
+async function listZipEntries(filePath) {
+  const { stdout } = await execFile("unzip", ["-Z1", filePath], {
+    timeout: 12000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return stdout
+    .split(/\r?\n/)
+    .map((entry) => entry.trim().replace(/^\.\//, ""))
+    .filter(Boolean);
+}
+
+async function unzipEntries(filePath, entries, maxBuffer) {
+  const { stdout } = await execFile("unzip", ["-p", filePath, ...entries], {
+    timeout: 12000,
+    maxBuffer,
+  });
+  return stdout;
+}
+
+function compareNumberedZipEntries(a, b) {
+  const aNumber = Number(a.match(/(\d+)(?=\.[^.]+$)/)?.[1] || 0);
+  const bNumber = Number(b.match(/(\d+)(?=\.[^.]+$)/)?.[1] || 0);
+  return aNumber - bNumber || a.localeCompare(b);
 }
 
 async function fetchGoogleDocText(url, fetchImpl = globalThis.fetch) {
@@ -5002,6 +6357,13 @@ function createEmbedder({ env = process.env, fetchImpl = globalThis.fetch, logge
     provider = "openai";
     model = env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-large";
   }
+  const defaultDimension = Number(env.EMBEDDING_DIM || 0) || (
+    provider === "local"
+      ? VECTOR_SIZE
+      : provider === "local-model"
+        ? DEFAULT_LOCAL_MODEL_VECTOR_DIM
+        : null
+  );
 
   let localModelPipePromise = null;
   function getLocalModelPipe() {
@@ -5077,7 +6439,56 @@ function createEmbedder({ env = process.env, fetchImpl = globalThis.fetch, logge
     return out;
   }
 
-  return { embed, provider, model, isSemantic: provider !== "local" };
+  return { embed, provider, model, isSemantic: provider !== "local", defaultDimension };
+}
+
+function createReranker({ env = process.env, fetchImpl = globalThis.fetch } = {}) {
+  const key = realProviderKey(env.COHERE_API_KEY);
+  const preferred = String(env.RERANK_PROVIDER || env.SOURCESTUDIO_RERANK_PROVIDER || "auto").trim().toLowerCase();
+  const disabled = ["false", "off", "none", "local"].includes(preferred);
+  const enabled = Boolean(key) && !disabled && ["", "auto", "cohere"].includes(preferred);
+  const model = env.COHERE_RERANK_MODEL || DEFAULT_COHERE_RERANK_MODEL;
+
+  async function rerank({ query, documents, topN }) {
+    if (!enabled || !documents.length) return { applied: false, provider: "local-hybrid", model: "local-hybrid-rerank-v1", results: [] };
+    const response = await fetchImpl("https://api.cohere.com/v2/rerank", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key}`,
+        "x-client-name": PRODUCT_NAME,
+      },
+      body: JSON.stringify({
+        model,
+        query,
+        documents,
+        top_n: Math.min(documents.length, Math.max(1, Number(topN || documents.length))),
+        max_tokens_per_doc: Number(env.COHERE_RERANK_MAX_TOKENS_PER_DOC || 1200),
+      }),
+    });
+    if (!response.ok) throw new Error(`Cohere rerank failed with ${response.status}.`);
+    const body = await response.json();
+    return {
+      applied: true,
+      provider: "cohere",
+      model,
+      results: (body.results || []).map((item) => ({
+        index: Number(item.index),
+        relevance_score: Number(item.relevance_score || 0),
+      })).filter((item) => Number.isInteger(item.index)),
+    };
+  }
+
+  function status() {
+    return {
+      enabled,
+      provider: enabled ? "cohere" : "local-hybrid",
+      model: enabled ? model : "local-hybrid-rerank-v1",
+      external: enabled,
+    };
+  }
+
+  return { enabled, provider: enabled ? "cohere" : "local-hybrid", model: enabled ? model : "local-hybrid-rerank-v1", rerank, status };
 }
 
 // Optional Supabase/pgvector store for durable, scalable vector retrieval.
@@ -5085,7 +6496,14 @@ function createEmbedder({ env = process.env, fetchImpl = globalThis.fetch, logge
 const PGVECTOR_DIM = 384;
 function createPgStore({ env = process.env, logger } = {}) {
   const url = String(env.SUPABASE_DB_URL || "").trim();
-  if (!url) return { enabled: false };
+  const disabledStatus = {
+    enabled: false,
+    provider: "local-memory",
+    table: "",
+    dimension: PGVECTOR_DIM,
+    external: false,
+  };
+  if (!url) return { enabled: false, status: () => disabledStatus };
   let poolPromise = null;
   async function getPool() {
     if (!poolPromise) {
@@ -5134,7 +6552,16 @@ function createPgStore({ env = process.env, logger } = {}) {
     );
     return new Map(result.rows.map((row) => [row.chunk_id, Number(row.sim)]));
   }
-  return { enabled: true, upsertChunks, deleteBySource, nearest };
+  function status() {
+    return {
+      enabled: true,
+      provider: "supabase-pgvector",
+      table: "doc_chunks",
+      dimension: PGVECTOR_DIM,
+      external: true,
+    };
+  }
+  return { enabled: true, upsertChunks, deleteBySource, nearest, status };
 }
 
 function embedText(text) {
@@ -5324,6 +6751,36 @@ function bestSentenceForQuestion(text, question) {
     .sort((a, b) => b.score - a.score || b.sentence.length - a.sentence.length)[0].sentence;
 }
 
+function isFullSourceTextRequest(question) {
+  const text = normalizeIntentText(question);
+  const asksForFull = /\b(complete|full|entire|all|alles|komplett|komplette|kompletten|vollstandig|ganz|ganze|ganzen|gesamte|gesamten)\b/.test(text);
+  const asksForSourceText = /\b(transcript|transkript|script|skript|videoscript|videoskript|source text|quelltext|captions?|untertitel)\b/.test(text);
+  const asksToPrint = /\b(print|paste|post|poste|posten|reinposten|ausgeben|zeigen|abdrucken|drucken)\b/.test(text);
+  return (asksForFull && asksForSourceText) || (asksForSourceText && asksToPrint && /\b(all|alles|komplett|vollstandig|gesamte|gesamten)\b/.test(text));
+}
+
+function preferredFullTextSources(question, sources) {
+  const text = normalizeIntentText(question);
+  const asksForMediaText = /\b(video|youtube|transcript|transkript|script|skript|videoscript|videoskript|captions?|untertitel)\b/.test(text);
+  if (!asksForMediaText) return sources;
+  const mediaSources = sources.filter((source) =>
+    ["youtube", "audio"].includes(source.type) || /\b(youtube|video|transcript|transkript)\b/i.test(source.title || ""),
+  );
+  return mediaSources.length ? mediaSources : sources;
+}
+
+function cleanVerbatimSourceText(text) {
+  return String(text || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeIntentText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ß/g, "ss");
+}
+
 function splitClaims(answer) {
   return answer
     .split(/\n+/)
@@ -5497,7 +6954,9 @@ function collectArtifactEvidenceUsage(payload, citationItems = []) {
 
 function extractArtifactClaimItems(payload = {}) {
   const items = [];
+  collectClaimItems(items, payload.executive_summary);
   collectClaimItems(items, payload.key_points);
+  collectClaimItems(items, payload.key_findings);
   collectClaimItems(items, payload.cards);
   collectClaimItems(items, payload.questions);
   collectClaimItems(items, payload.rows);
@@ -5505,6 +6964,7 @@ function extractArtifactClaimItems(payload = {}) {
   collectClaimItems(items, sourceGroundedTranscriptTurns(payload.transcript));
   collectClaimItems(items, payload.storyboard);
   collectClaimItems(items, payload.panels);
+  collectClaimItems(items, payload.recommendations);
   if (Array.isArray(payload.tldr)) {
     items.push(...payload.tldr.map((text) => ({ text })));
   }
@@ -5524,7 +6984,14 @@ function sourceGroundedTranscriptTurns(transcript) {
 }
 
 function collectClaimItems(items, value) {
-  if (!Array.isArray(value)) return;
+  if (typeof value === "string") {
+    items.push({ text: value });
+    return;
+  }
+  if (!Array.isArray(value)) {
+    if (value && typeof value === "object") items.push(value);
+    return;
+  }
   for (const item of value) {
     if (typeof item === "string") items.push({ text: item });
     else if (item && typeof item === "object") items.push(item);
@@ -5578,6 +7045,14 @@ function artifactQuery(type, options) {
       focus,
     ].join(" ").trim();
   }
+  if (type === "data-table") {
+    return [
+      "Create a NotebookLM-style source-backed data table from active notebook sources.",
+      "Prefer evidence with arguments, risks, dates, numbers, legal basis, decisions, recommendations, or financial impact.",
+      "Infer useful columns from the source context and keep every row attached to a source citation.",
+      options.prompt || "",
+    ].join(" ").trim();
+  }
   return `Create a source-backed ${label}. Include citations, risks, and open questions where relevant. ${options.prompt || ""}`.trim();
 }
 
@@ -5599,21 +7074,594 @@ function artifactLabel(type) {
   );
 }
 
-function buildReportSections(keyPoints, citations) {
+function buildDataTablePayload({ notebook, titleBase, citations, evidencePack, options = {} }) {
+  const profile = dataTableProfile({ notebook, citations, evidencePack, options });
+  const sourceNotes = dataTableSourceNotes(citations);
+  const rowCards = dataTableRowCards(citations, profile);
+  const rows = rowCards.slice(0, profile.maxRows).map((citation, index) =>
+    profile.id === "legal_dispute"
+      ? legalDataTableRow(citation, index, profile, sourceNotes)
+      : generalDataTableRow(citation, index, profile, sourceNotes),
+  );
+  return {
+    title: options.title || dataTableTitle(notebook, evidencePack, profile, titleBase),
+    table_profile: profile.id,
+    columns: profile.columns,
+    rows,
+    source_notes: [...sourceNotes.values()],
+    citations,
+  };
+}
+
+function dataTableRowCards(citations, profile) {
+  const cards = [];
+  const seen = new Set();
+  for (const citation of citations) {
+    const sentences = dataTableSentences(citation.quote || "");
+    const usableSentences = sentences.length
+      ? sentences
+      : [bestSentenceForQuestion(citation.quote, citation.source_title || "")].filter(Boolean);
+    for (const sentence of usableSentences) {
+      const clean = cleanDataTableSentence(sentence);
+      if (!clean || clean.length < 24) continue;
+      if (profile.id === "legal_dispute" && !dataTableLegalSentenceUseful(clean, citation)) continue;
+      const key = tokenize(clean).slice(0, 16).join(" ");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cards.push({
+        ...citation,
+        quote: clean,
+        source_quote: citation.quote,
+      });
+    }
+  }
+  if (profile.id === "legal_dispute") return prioritizeLegalDataTableCards(cards);
+  return cards.length ? cards : citations;
+}
+
+function dataTableSentences(text) {
+  const sentences = normalizeWhitespace(text)
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+  const merged = [];
+  for (const sentence of sentences) {
+    if (
+      merged.length &&
+      (/^(?:\d|§|eur|€|minus|plus|and|or|und|oder)\b/i.test(sentence) ||
+        /(?:approx|ca|bzw|z\.b|e\.g|i\.e)\.?$/i.test(merged[merged.length - 1]) ||
+        /^\d[\d.,]*(?:\s*(?:EUR|€|euro|euros|hours?|stunden|%))/i.test(sentence))
+    ) {
+      merged[merged.length - 1] = `${merged[merged.length - 1]} ${sentence}`;
+    } else {
+      merged.push(sentence);
+    }
+  }
+  return merged;
+}
+
+function prioritizeLegalDataTableCards(cards) {
+  if (!cards.length) return [];
+  const selected = [];
+  const byFrame = new Map();
+  for (const card of cards) {
+    const frame = legalFrameLabel(card.quote || "", card, selected.length);
+    const candidate = byFrame.get(frame);
+    if (!candidate || legalCardScore(card) > legalCardScore(candidate)) byFrame.set(frame, card);
+  }
+  const seenFrames = new Set();
+  for (const card of cards) {
+    const frame = legalFrameLabel(card.quote || "", card, selected.length);
+    const preferred = byFrame.get(frame);
+    if (!knownLegalFrame(frame) || seenFrames.has(frame) || preferred !== card) continue;
+    seenFrames.add(frame);
+    selected.push(card);
+  }
+  return selected.length ? selected : cards;
+}
+
+function legalCardScore(card) {
+  const text = dataTableEvidenceText(card.quote, card);
+  let score = 0;
+  if (/§\s*\d+|bgb|zpo/i.test(text)) score += 4;
+  if (dataTableFinancialSignals(text).length) score += 4;
+  if (/opponent|gegner|argue|claim|frame|attack|attempt/i.test(text)) score += 3;
+  if (/defense|counter|avoid|request|file|build|reject|demand/i.test(text)) score += 3;
+  if (/termination|acceptance|git.?blame|mahnbescheid|default summons|summary proceedings|buffer|puffer|invoice/i.test(text)) score += 2;
+  if (/mahnbescheid|default summons|summary proceedings/i.test(text)) score += 2;
+  if (/relevant legal basis|may be relevant|source point|action item|court representation and expert costs|file a full objection/i.test(text)) score -= 3;
+  return score;
+}
+
+function knownLegalFrame(frame) {
+  return new Set([
+    "Unilateral termination vs. damage mitigation",
+    "Non-acceptance due to core defects",
+    "Valuation of performed services",
+    "Litigation and summary proceedings",
+    "Dispute over buffer hours",
+    "Payment and remuneration dispute",
+  ]).has(frame);
+}
+
+function dataTableLegalSentenceUseful(sentence, citation) {
+  return /werkvertrag|mängel?|mangel|vergütung|zahlung|honorar|rechnung|invoice|abnahme|acceptance|termination|kündigung|648|640|641|631|632|287|404|688|zpo|bgb|mahnbescheid|git.?blame|buffer|puffer|hours?|stunden|risk|risiko|defect|damage|settlement|court/i
+    .test(dataTableEvidenceText(sentence, citation));
+}
+
+function dataTableProfile({ notebook, citations, evidencePack, options = {} }) {
+  const context = [
+    notebook?.title || "",
+    evidencePack?.user_question || "",
+    options.prompt || "",
+    ...citations.map((citation) => `${citation.source_title || ""} ${citation.quote || ""}`),
+  ].join("\n");
+  if (/werkvertrag|mängel?|mangel|vergütung|abnahme|mahnbescheid|bgb|zpo|litigation|legal|court|contract|termination|damages?|remuneration|acceptance/i.test(context)) {
+    return {
+      id: "legal_dispute",
+      maxRows: 8,
+      columns: [
+        "Legal Frame or Argument",
+        "Opponent Strategy",
+        "Defense Counter-Argument",
+        "Relevant Legal Basis (Inferred)",
+        "Associated Risk Level",
+        "Recommended Action",
+        "Potential Financial Impact",
+        "Source",
+      ],
+    };
+  }
+  return {
+    id: "research_synthesis",
+    maxRows: 8,
+    columns: [
+      "Question or Theme",
+      "Source Finding",
+      "Implication",
+      "Risk / Gap",
+      "Recommended Action",
+      "Source",
+    ],
+  };
+}
+
+function dataTableTitle(notebook, evidencePack, profile, fallback) {
+  const title = String(notebook?.title || "").replace(/:\s*Data Table$/i, "").trim();
+  if (profile.id === "legal_dispute") {
+    if (/strategic defense and risk assessment/i.test(title)) return title;
+    return title ? `Strategic Defense and Risk Assessment for ${title}` : "Strategic Defense and Risk Assessment";
+  }
+  if (/create|source-backed|data table/i.test(evidencePack?.user_question || "")) {
+    return title ? `${title}: Data Table` : fallback;
+  }
+  return title ? `${title}: Data Table` : fallback;
+}
+
+function dataTableSourceNotes(citations) {
+  const notes = new Map();
+  for (const citation of citations) {
+    const key = citation.source_id || citation.source_title || citation.evidence_id;
+    if (notes.has(key)) continue;
+    const label = `[${notes.size + 1}]`;
+    notes.set(key, {
+      label,
+      source_id: citation.source_id,
+      source_title: citation.source_title || "Source",
+      evidence_id: citation.evidence_id,
+      block_ids: citation.block_ids || [],
+      chunk_id: citation.chunk_id || "",
+      quote: citation.quote || "",
+      heading_path: citation.heading_path || [],
+    });
+  }
+  return notes;
+}
+
+function dataTableSourceNoteForCitation(citation, sourceNotes) {
+  const key = citation.source_id || citation.source_title || citation.evidence_id;
+  return sourceNotes.get(key) || {
+    label: citation.citation || "[1]",
+    source_id: citation.source_id,
+    source_title: citation.source_title || "Source",
+  };
+}
+
+function dataTableSourceRef(citation, sourceNote) {
+  return {
+    label: sourceNote.label,
+    source_id: citation.source_id,
+    source_title: citation.source_title,
+    evidence_id: citation.evidence_id,
+    evidence_citation: citation.citation,
+    block_ids: citation.block_ids || [],
+    chunk_id: citation.chunk_id || "",
+    quote: citation.quote || "",
+    heading_path: citation.heading_path || [],
+  };
+}
+
+function legalDataTableRow(citation, index, profile, sourceNotes) {
+  const sentence = cleanDataTableSentence(bestSentenceForQuestion(citation.quote, "legal dispute defense risk action"));
+  const sourceNote = dataTableSourceNoteForCitation(citation, sourceNotes);
+  const cells = {
+    "Legal Frame or Argument": legalFrameLabel(sentence, citation, index),
+    "Opponent Strategy": legalOpponentStrategy(sentence, citation, index),
+    "Defense Counter-Argument": legalDefenseCounter(sentence, citation, index),
+    "Relevant Legal Basis (Inferred)": legalBasisForEvidence(sentence, citation),
+    "Associated Risk Level": legalRiskLevel(sentence, citation),
+    "Recommended Action": legalRecommendedAction(sentence, citation, index),
+    "Potential Financial Impact": legalFinancialImpact(sentence, citation),
+    Source: sourceNote.label,
+  };
+  return {
+    cells: orderCells(cells, profile.columns),
+    cell_support: {
+      "Legal Frame or Argument": "inferred",
+      "Opponent Strategy": "inferred",
+      "Defense Counter-Argument": "inferred",
+      "Relevant Legal Basis (Inferred)": "inferred",
+      "Associated Risk Level": "inferred",
+      "Recommended Action": "inferred",
+      "Potential Financial Impact": dataTableFinancialSignals(citation.quote).length ? "directly_supported" : "inferred",
+      Source: "directly_supported",
+    },
+    source_refs: [dataTableSourceRef(citation, sourceNote)],
+  };
+}
+
+function generalDataTableRow(citation, index, profile, sourceNotes) {
+  const sentence = cleanDataTableSentence(bestSentenceForQuestion(citation.quote, citation.source_title || ""));
+  const sourceNote = dataTableSourceNoteForCitation(citation, sourceNotes);
+  const cells = {
+    "Question or Theme": titleCase(topicFromSentence(sentence || citation.source_title || `Finding ${index + 1}`)),
+    "Source Finding": sentence,
+    Implication: generalImplication(sentence, citation),
+    "Risk / Gap": generalRiskGap(sentence, citation),
+    "Recommended Action": generalRecommendedAction(sentence, citation),
+    Source: sourceNote.label,
+  };
+  return {
+    cells: orderCells(cells, profile.columns),
+    cell_support: {
+      "Question or Theme": "inferred",
+      "Source Finding": "directly_supported",
+      Implication: "inferred",
+      "Risk / Gap": "inferred",
+      "Recommended Action": "inferred",
+      Source: "directly_supported",
+    },
+    source_refs: [dataTableSourceRef(citation, sourceNote)],
+  };
+}
+
+function orderCells(cells, columns) {
+  return Object.fromEntries(columns.map((column) => [column, cells[column] || ""]));
+}
+
+function cleanDataTableSentence(text) {
+  return stripCitations(String(text || ""))
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:)])/g, "$1")
+    .trim();
+}
+
+function legalFrameLabel(sentence, citation, index) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const rules = [
+    [/termination|kündigung|free termination|648/i, "Unilateral termination vs. damage mitigation"],
+    [/buffer|puffer|additional hours|56/i, "Dispute over buffer hours"],
+    [/non-accept|acceptance|abnahme|640|641|defect|mängel?|mangel/i, "Non-acceptance due to core defects"],
+    [/git.?blame|valuation|value|performed services|14\s*%|estimation|287/i, "Valuation of performed services"],
+    [/mahnbescheid|default summons|summary proceedings|688|payment order|full objection|two weeks|service period|court representation|expert costs|district court|landgericht/i, "Litigation and summary proceedings"],
+    [/invoice|rechnung|remuneration|vergütung|payment/i, "Payment and remuneration dispute"],
+  ];
+  return rules.find(([pattern]) => pattern.test(text))?.[1] || titleCase(topicFromSentence(sentence || `Argument ${index + 1}`));
+}
+
+function legalOpponentStrategy(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const rules = [
+    [/termination|kündigung|648/i, "Frame the takeover as a termination to claim broad remuneration minus saved expenses."],
+    [/buffer|puffer|additional hours|56/i, "Claim payment for additional or buffer hours as separate invoiceable work."],
+    [/non-accept|acceptance|abnahme|defect|mängel?|mangel/i, "Argue that acceptance was owed or that a grace period for rectification was not provided."],
+    [/git.?blame|valuation|14\s*%|performed services/i, "Attack the valuation metric and argue that the source evidence understates their contribution."],
+    [/mahnbescheid|default summons|summary proceedings|688|full objection|two weeks|service period|court representation|expert costs/i, "Use low-cost summary proceedings to create timing and settlement pressure."],
+    [/invoice|rechnung|payment|vergütung/i, "Maintain the invoice claim and shift the burden onto defect documentation."],
+  ];
+  return rules.find(([pattern]) => pattern.test(text))?.[1] || `Use the cited point as their argument line: ${truncate(sentence, 120)}`;
+}
+
+function legalDefenseCounter(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const rules = [
+    [/termination|kündigung|648/i, "Avoid the term termination; define the takeover as damage mitigation caused by non-acceptability."],
+    [/buffer|puffer|additional hours|56/i, "Demand proof of commissioning, activity, assignment to the milestone, and acceptance for extra hours."],
+    [/non-accept|acceptance|abnahme|defect|mängel?|mangel/i, "State that the milestone was not acceptable in its core area and acceptance could be refused for material defects."],
+    [/git.?blame|valuation|14\s*%|performed services/i, "Create a scope matrix: feature status, authorship, artifacts, meetings, tests, and production readiness."],
+    [/mahnbescheid|default summons|summary proceedings|688|full objection|two weeks|service period|court representation|expert costs/i, "File a full objection in time and force the claim into a regular evidentiary proceeding."],
+    [/invoice|rechnung|payment|vergütung/i, "Tie payment strictly to acceptance, defect status, and verifiable scope completion."],
+  ];
+  return rules.find(([pattern]) => pattern.test(text))?.[1] || `Keep the counter-argument tied to the cited source: ${truncate(sentence, 120)}`;
+}
+
+function legalBasisForEvidence(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const explicit = [...new Set((text.match(/§+\s*\d+[a-z]?(?:\s*(?:Abs\.\s*\d+)?)?\s*(?:BGB|ZPO|HGB)?/gi) || []).map((item) => item.replace(/\s+/g, " ").trim()))];
+  if (/buffer|puffer|additional hours|56/i.test(text)) {
+    return [...new Set([...explicit, "§ 632 BGB (remuneration)"])].slice(0, 3).join(", ");
+  }
+  const inferred = [];
+  if (/termination|kündigung|648/i.test(text)) inferred.push("§ 648 BGB (termination by customer)");
+  if (/acceptance|abnahme|non-accept|defect|mängel?|mangel/i.test(text)) inferred.push("§ 640 BGB (acceptance)", "§ 641 BGB (remuneration due date)");
+  if (/contract for work|werkvertrag|performed services/i.test(text)) inferred.push("§ 631 BGB (contract for work)");
+  if (/estimation|valuation|damages|git.?blame|14\s*%/i.test(text)) inferred.push("§ 287 ZPO (estimation of damages/value)");
+  if (/mahnbescheid|payment order|default summons|summary proceedings/i.test(text)) inferred.push("§ 688 ZPO (order for payment)");
+  if (/experts?|expert|court/i.test(text)) inferred.push("§ 404 ZPO (appointment of experts)");
+  if (/remuneration|vergütung|payment|invoice|rechnung/i.test(text)) inferred.push("§ 632 BGB (remuneration)");
+  return [...new Set([...explicit, ...inferred])].slice(0, 3).join(", ") || "Legal basis not explicit in source; verify before use.";
+}
+
+function legalRiskLevel(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const money = dataTableFinancialSignals(text);
+  if (/termination|kündigung|full invoice|statutory|court|landgericht/i.test(text) && money.length) return "Very High";
+  if (/buffer|puffer|additional hours|56/i.test(text)) return "Low";
+  if (/risk|hoch|high|failure|lose|default|mahnbescheid|payment order|acceptance|abnahme/i.test(text)) return "High";
+  if (/medium|evidence|valuation|git.?blame|expert|technical|estimation/i.test(text)) return "Medium";
+  if (/low|minor|buffer|additional hours/i.test(text)) return "Low";
+  return money.length ? "Medium" : "Open";
+}
+
+function legalRecommendedAction(sentence, citation, index) {
+  const text = dataTableEvidenceText(sentence, citation);
+  const rules = [
+    [/termination|kündigung|648/i, "Never use the word termination in correspondence; emphasize the unusable nature of the milestone."],
+    [/buffer|puffer|additional hours|56/i, "Request verifiable assignment of hours to the milestone and reject unaccepted extras."],
+    [/non-accept|acceptance|abnahme|defect|mängel?|mangel/i, "Frame the takeover as damage mitigation due to non-acceptability, not as standard acceptance."],
+    [/git.?blame|valuation|14\s*%|performed services/i, "Build an evidence pack; do not disclose the full audit or technical screenshots too early."],
+    [/mahnbescheid|default summons|summary proceedings|688|full objection|two weeks|service period|court representation|expert costs/i, "File a full objection within the service period and force a regular lawsuit if needed."],
+    [/invoice|rechnung|payment|vergütung/i, "Separate accepted scope from disputed scope and quantify any settlement range from evidence."],
+  ];
+  return rules.find(([pattern]) => pattern.test(text))?.[1] || `Use this source point as action item ${index + 1}; keep the wording narrow and cited.`;
+}
+
+function legalFinancialImpact(sentence, citation) {
+  const signals = dataTableFinancialSignals(`${sentence} ${citation.quote || ""}`);
+  if (signals.length) return `Source mentions ${signals.slice(0, 4).join(", ")}.`;
+  if (/mahnbescheid|default summons|summary proceedings|688|payment order|full objection|court|expert costs/i.test(dataTableEvidenceText(sentence, citation))) {
+    const litigationContext = String(citation.source_quote || "").match(/(?:court|representation|expert|costs?|fees?)[^.]*?(?:EUR|€|euro|euros)|\d[\d.,]*\s*(?:EUR|€|euro|euros)[^.]*?(?:court|representation|expert|costs?|fees?)/gi) || [];
+    const litigationSignals = dataTableFinancialSignals(litigationContext.join(" ")).filter((signal) => /eur|€|euro/i.test(signal));
+    if (litigationSignals.length) return `Source mentions ${litigationSignals.slice(0, 3).join(", ")}.`;
+  }
+  if (/invoice|rechnung|payment|vergütung|remuneration|damages|settlement/i.test(dataTableEvidenceText(sentence, citation))) {
+    return "Financial exposure is source-linked but not quantified in the cited passage.";
+  }
+  return "No quantified financial impact in the cited passage.";
+}
+
+function dataTableFinancialSignals(text) {
+  return [...new Set((String(text || "").match(/(?:approx\.?\s*)?\d[\d.,]*(?:\s*(?:EUR|€|euro|euros|hours?|stunden|%))|\d[\d.,]*\s+additional\s+hours/gi) || []).map((item) => item.trim()))];
+}
+
+function dataTableEvidenceText(sentence, citation) {
+  return `${sentence || ""} ${citation?.quote || ""} ${citation?.source_title || ""}`;
+}
+
+function generalImplication(sentence, citation) {
+  if (/risk|limit|caveat|unknown|unclear|open question|challenge/i.test(dataTableEvidenceText(sentence, citation))) {
+    return "Treat this as a constraint before relying on the finding.";
+  }
+  return `This finding should shape the synthesis around ${topicFromSentence(sentence)}.`;
+}
+
+function generalRiskGap(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  if (/risk|limit|caveat|unknown|unclear|challenge|fail|contradiction|conflict/i.test(text)) {
+    return truncate(cleanDataTableSentence(sentence), 140);
+  }
+  return "No explicit risk statement in this passage; verify against adjacent source blocks.";
+}
+
+function generalRecommendedAction(sentence, citation) {
+  const text = dataTableEvidenceText(sentence, citation);
+  if (/should|must|requires?|need|recommend|action|next/i.test(text)) return truncate(cleanDataTableSentence(sentence), 150);
+  return "Use the source citation to inspect the exact passage before turning this row into a decision.";
+}
+
+function buildReportPayload({ notebook, evidencePack, options = {}, keyPoints, citations }) {
+  const title = options.report_type || reportTitleFromNotebook(notebook);
+  const findings = keyPoints.slice(0, 8).map((point, index) => {
+    const citation = citations[index] || citations[0] || {};
+    return {
+      heading: reportFindingHeading(point.text, citation, index),
+      text: `${stripCitations(point.text)} ${point.citation}`,
+      analysis: reportEvidenceParagraph(citation, index, evidencePack.user_question),
+      citation: point.citation,
+      evidence_id: citation.evidence_id || "",
+      source_title: citation.source_title || "",
+      source_refs: point.source_refs,
+    };
+  });
+  const executiveSummary = reportExecutiveSummary(findings, citations, evidencePack);
+  const sections = buildReportSections({ findings, citations, evidencePack });
+  const recommendations = reportRecommendations(findings, citations);
+  const risks = reportRiskParagraphs(findings, citations).slice(0, 5);
+  const openQuestions = findings
+    .filter((finding) => /risk|limit|caveat|unclear|open|unknown|missing|verify|validate/i.test(finding.text))
+    .map((finding) => `What source-level follow-up would resolve this constraint: ${truncate(stripCitations(finding.text), 120)}?`)
+    .slice(0, 5);
+
+  return {
+    title,
+    report_type: title,
+    executive_summary: executiveSummary,
+    tldr: findings.slice(0, 5).map((finding) => finding.text),
+    key_points: findings.map((finding) => ({
+      text: finding.text,
+      citation: finding.citation,
+      source_refs: finding.source_refs,
+    })),
+    key_findings: findings,
+    detailed_sections: sections,
+    recommendations,
+    open_questions: openQuestions,
+    risks_limitations: risks.length
+      ? risks
+      : ["No explicit risk statement was detected heuristically; validate the conclusion against the source set before using it externally."],
+    bibliography: [...new Map(citations.map((citation) => [citation.source_id || citation.source_title, citation])).values()]
+      .map((citation, index) => `[${index + 1}] ${citation.source_title || "Source"}`),
+    citations,
+    report_metadata: {
+      source_count: new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size,
+      evidence_items: citations.length,
+      retrieval_intent: evidencePack.intent,
+      generated_from: "evidence_pack",
+    },
+  };
+}
+
+function reportTitleFromNotebook(notebook) {
+  const title = String(notebook?.title || "").replace(/:\s*Report$/i, "").trim();
+  return title ? `${title}: Research Report` : "Research Report";
+}
+
+function reportExecutiveSummary(findings, citations, evidencePack) {
+  const sourceCount = new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size || citations.length;
+  const primary = findings[0]?.text || `The active sources provide the evidence base for this report. ${citations[0]?.citation || "[1]"}`;
+  const secondary = findings[1]?.text || findings[0]?.text || primary;
+  const caveat = findings.find((finding) => /risk|limit|caveat|unclear|open|failed|not yield|requires?/i.test(finding.text)) || findings.at(-1) || findings[0];
+  return [
+    `This report synthesizes ${sourceCount} retrieved source${sourceCount === 1 ? "" : "s"} from the active notebook into a source-grounded assessment of the request: "${truncate(evidencePack.user_question, 140)}". The strongest supported starting point is that ${sentenceLower(primary)}`,
+    `Across the evidence, the second-order implication is that ${sentenceLower(secondary)} The report therefore treats the source set as an evidence dossier rather than a generic summary, and keeps each conclusion tied to the cited passages.`,
+    caveat
+      ? `The main caveat is that ${sentenceLower(caveat.text)} This should be handled as a review constraint before the report is used for decisions or external communication.`
+      : `The main caveat is that the report can only cover facts present in the retrieved Evidence Pack, so missing or weakly parsed sources should be reviewed before use. ${citations[0]?.citation || "[1]"}`,
+  ];
+}
+
+function buildReportSections({ findings, citations, evidencePack }) {
+  const evidenceBody = findings.slice(0, 4).map((finding) =>
+    `${finding.analysis} In practical terms, this supports the finding: ${stripCitations(finding.text)} ${finding.citation}`,
+  );
+  const implicationBody = findings.slice(4, 8).map((finding, index) =>
+    reportImplicationParagraph(finding, citations[index + 4] || citations[index] || citations[0]),
+  );
+  const coverageBody = reportSourceCoverageParagraphs(citations);
+  const riskBody = reportRiskParagraphs(findings, citations);
+  const nextStepBody = reportRecommendations(findings, citations).map((item) => item.text || item);
+
   return [
     {
-      heading: "What the evidence says",
-      body: keyPoints.slice(0, 3).map((point) => `${point.text} ${point.citation}`),
+      heading: "Executive Analysis",
+      body: reportExecutiveSummary(findings, citations, evidencePack),
     },
     {
-      heading: "Implications",
-      body: keyPoints.slice(3, 6).map((point) => `${point.text} ${point.citation}`),
+      heading: "What the Evidence Establishes",
+      body: evidenceBody.length ? evidenceBody : ["The active Evidence Pack did not contain enough cited material for a substantive evidence section. [1]"],
     },
     {
-      heading: "Evidence audit",
-      body: citations.slice(0, 4).map((citation) => `${citation.source_title}: ${truncate(citation.quote, 160)} ${citation.citation}`),
+      heading: "Implications and Interpretation",
+      body: implicationBody.length ? implicationBody : ["The available source material supports a narrow synthesis, but does not support broader interpretation beyond the cited evidence. [1]"],
+    },
+    {
+      heading: "Risks, Gaps, and Constraints",
+      body: riskBody,
+    },
+    {
+      heading: "Recommended Next Steps",
+      body: nextStepBody,
+    },
+    {
+      heading: "Source Coverage",
+      body: coverageBody,
     },
   ];
+}
+
+function reportEvidenceParagraph(citation, index, question) {
+  const sentence = stripCitations(bestSentenceForQuestion(citation.quote || "", question || citation.source_title || ""));
+  const citationLabel = citation.citation || `[${index + 1}]`;
+  const sourceTitle = citation.source_title || "the cited source";
+  if (!sentence) {
+    return `${sourceTitle} is part of the retrieved Evidence Pack, but the extract is too thin to support a broader claim beyond the citation itself. ${citationLabel}`;
+  }
+  return `${sourceTitle} establishes that ${sentenceLower(sentence)} ${citationLabel}`;
+}
+
+function reportImplicationParagraph(finding, citation = {}) {
+  const text = stripCitations(finding.text || "");
+  const citationLabel = finding.citation || citation.citation || "[1]";
+  if (/risk|limit|caveat|unknown|unclear|failed|not yield|requires?/i.test(text)) {
+    return `This finding should be treated as a constraint, not background detail: ${sentenceLower(text)} The implication is that any operational or strategic conclusion needs a source-quality check before use. ${citationLabel}`;
+  }
+  return `This finding matters because it changes the weight of the report: ${sentenceLower(text)} The implication is that the cited source should anchor the relevant section of the analysis rather than sit in an appendix. ${citationLabel}`;
+}
+
+function reportRiskParagraphs(findings, citations) {
+  const riskFindings = findings.filter((finding) => /risk|limit|caveat|unknown|unclear|failed|not yield|requires?|concern/i.test(finding.text));
+  const usable = riskFindings.length ? riskFindings : findings.slice(-2);
+  const paragraphs = usable.map((finding) =>
+    `Risk or limitation: ${stripCitations(finding.text)} The safe handling is to keep the report narrow unless adjacent source passages confirm the broader interpretation. ${finding.citation}`,
+  );
+  if (!paragraphs.length && citations[0]) {
+    paragraphs.push(`The Evidence Pack supports a report, but the generated analysis should remain bounded to the retrieved passages and avoid unstated assumptions. ${citations[0].citation || "[1]"}`);
+  }
+  return paragraphs;
+}
+
+function reportRecommendations(findings, citations) {
+  const usable = findings.slice(0, 5);
+  const recommendations = usable.map((finding, index) => ({
+    action: reportActionLabel(finding.text, index),
+    text: `${reportActionLabel(finding.text, index)}: verify the exact cited passage, decide whether it belongs in the main narrative, and preserve the citation when the report is reused. ${finding.citation}`,
+    citation: finding.citation,
+  }));
+  if (!recommendations.length && citations[0]) {
+    recommendations.push({
+      action: "Validate source scope",
+      text: `Validate source scope: inspect the retrieved source passage before using the report externally. ${citations[0].citation || "[1]"}`,
+      citation: citations[0].citation || "[1]",
+    });
+  }
+  return recommendations;
+}
+
+function reportSourceCoverageParagraphs(citations) {
+  const grouped = new Map();
+  for (const citation of citations) {
+    const key = citation.source_id || citation.source_title || citation.evidence_id;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        title: citation.source_title || "Source",
+        labels: [],
+      });
+    }
+    grouped.get(key).labels.push(citation.citation);
+  }
+  return [...grouped.values()].slice(0, 8).map((source) =>
+    `${source.title} contributes ${source.labels.length} retrieved evidence item${source.labels.length === 1 ? "" : "s"} to this report: ${source.labels.join(", ")}.`,
+  );
+}
+
+function reportFindingHeading(text, citation, index) {
+  const sentence = stripCitations(text || citation?.quote || "");
+  const topic = titleCase(topicFromSentence(sentence || citation?.source_title || `Finding ${index + 1}`));
+  return truncate(topic, 72);
+}
+
+function reportActionLabel(text, index) {
+  if (/risk|limit|caveat|concern|unclear/i.test(text)) return "Resolve the caveat";
+  if (/approval|approved|order|rule|regulation|policy/i.test(text)) return "Document the regulatory basis";
+  if (/data|filing|source|report|evidence/i.test(text)) return "Preserve the evidence trail";
+  if (/company|exposure|market|stablecoin|bitcoin|crypto/i.test(text)) return "Separate market claim from exposure claim";
+  return `Review finding ${index + 1}`;
+}
+
+function sentenceLower(text) {
+  const cleaned = String(text || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  return `${cleaned.charAt(0).toLowerCase()}${cleaned.slice(1)}`;
 }
 
 function buildInfographicPayload({ notebook, evidencePack, citations, keyPoints, options = {} }) {
@@ -5910,65 +7958,76 @@ function normalizeVideoStoryboard(payload) {
   }).filter((scene) => scene.title || scene.narration);
 }
 
-function renderVideoSceneSvg(payload, scene, { index, total, duration }) {
-  const W = 1280, H = 720, M = 64;
+function videoSceneImagePrompt(payload, scene, { index, total }) {
+  const topic = stripCitations(`${scene.title || ""}. ${scene.narration || ""}`).replace(/\s+/g, " ").trim();
+  const source = scene.citations?.[0]?.source_title || scene.citations?.[0]?.sourceTitle || "the source material";
+  return [
+    "Create one 16:9 illustrated explainer-video frame.",
+    "Style: playful editorial cartoon, clean vector-like digital illustration, warm funny tone, simple characters, visual metaphor, subtle humor, premium NotebookLM-style explainer energy.",
+    "Composition: one clear visual idea, generous negative space, cinematic framing, no UI cards, no presentation slide layout, no text boxes.",
+    "STRICT TEXT RULE: no readable text, no labels, no captions, no paragraphs, no title, no source citation text, no typography. If any writing appears, it must be tiny illegible hand-drawn scribbles only.",
+    `Scene ${index + 1} of ${total}. Subject from evidence: ${truncate(topic, 500)}.`,
+    `Use ${truncate(source, 80)} only as conceptual inspiration, not as written text.`,
+    "Avoid logos, watermarks, brand marks, screenshots, photorealistic people, and dense dashboards.",
+  ].join("\n");
+}
+
+function renderVideoCartoonFallbackSvg(scene, { index, total }) {
+  const W = 1536, H = 1024;
   const c = infographicPalette(index % 2 ? "study-map" : "evidence-dashboard");
   const accent = c.accents[index % c.accents.length];
-  const title = infographicCleanText(scene.title || `Scene ${index + 1}`);
-  const narration = infographicCleanText(scene.narration || "");
-  const caption = infographicCleanText((scene.captions || [])[0] || narration);
-  const citation = scene.citations?.[0] || {};
-  const sourceTitle = truncate(citation.source_title || citation.sourceTitle || "Evidence Pack", 46);
-  const citationLabel = citation.citation || `[${index + 1}]`;
-  const progressW = Math.max(80, Math.round(((index + 1) / Math.max(1, total)) * 260));
-  const titleLines = wrapSvgText(title, 30, 2);
-  const narrationLines = wrapSvgText(narration, 58, 6);
-  const captionLines = wrapSvgText(caption, 82, 2);
+  const second = c.accents[(index + 2) % c.accents.length];
+  const third = c.accents[(index + 4) % c.accents.length];
+  const subjectSignal = tokenize(`${scene?.title || ""} ${scene?.narration || ""}`).length;
+  const pulseX = 360 + ((index + subjectSignal) % 3) * 36;
+  const pulseY = 520 + ((index + subjectSignal) % 2) * 42;
   const parts = [];
-
-  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(title)}">`);
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Cartoon explainer scene">`);
   parts.push(`<defs>`);
-  parts.push(`<linearGradient id="vo-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${c.bg0}"/><stop offset="0.62" stop-color="${c.bg1}"/><stop offset="1" stop-color="#10140f"/></linearGradient>`);
-  parts.push(`<linearGradient id="vo-accent" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${accent}" stop-opacity="0.28"/><stop offset="1" stop-color="${accent}" stop-opacity="0.02"/></linearGradient>`);
+  parts.push(`<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbf4dc"/><stop offset="0.55" stop-color="#f7e7c6"/><stop offset="1" stop-color="#d8f0df"/></linearGradient>`);
+  parts.push(`<filter id="rough"><feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="${index + 7}"/><feColorMatrix type="saturate" values="0"/><feComponentTransfer><feFuncA type="table" tableValues="0 0.06"/></feComponentTransfer></filter>`);
   parts.push(`</defs>`);
-  parts.push(`<rect width="${W}" height="${H}" fill="url(#vo-bg)"/>`);
-  for (let gx = M; gx <= W - M; gx += 54) parts.push(`<line x1="${gx}" y1="${M}" x2="${gx}" y2="${H - M}" stroke="${c.text}" stroke-opacity="0.018"/>`);
-  for (let gy = M; gy <= H - M; gy += 54) parts.push(`<line x1="${M}" y1="${gy}" x2="${W - M}" y2="${gy}" stroke="${c.text}" stroke-opacity="0.018"/>`);
-  parts.push(`<circle cx="${W - 168}" cy="118" r="160" fill="${accent}" fill-opacity="0.08"/>`);
-  parts.push(`<circle cx="${W - 168}" cy="118" r="82" fill="none" stroke="${accent}" stroke-opacity="0.18"/>`);
+  parts.push(`<rect width="${W}" height="${H}" fill="url(#bg)"/>`);
+  parts.push(`<rect width="${W}" height="${H}" filter="url(#rough)"/>`);
+  parts.push(`<path d="M117 209 C 322 58, 591 96, 728 246 S 1132 336, 1327 156" fill="none" stroke="${accent}" stroke-width="18" stroke-linecap="round" opacity="0.22"/>`);
+  parts.push(`<path d="M176 823 C 394 700, 518 840, 740 745 S 1106 605, 1330 746" fill="none" stroke="${second}" stroke-width="24" stroke-linecap="round" opacity="0.22"/>`);
+  parts.push(`<ellipse cx="1138" cy="358" rx="245" ry="188" fill="${third}" opacity="0.18"/>`);
+  parts.push(`<ellipse cx="424" cy="680" rx="292" ry="156" fill="${accent}" opacity="0.12"/>`);
 
-  parts.push(`<rect x="${M}" y="${M}" width="${W - M * 2}" height="${H - M * 2}" rx="28" fill="#111713" fill-opacity="0.76" stroke="${c.panelEdge}"/>`);
-  parts.push(`<rect x="${M}" y="${M}" width="9" height="${H - M * 2}" rx="4.5" fill="${accent}"/>`);
-  parts.push(svgText(M + 28, M + 36, `${PRODUCT_NAME.toUpperCase()} · VIDEO OVERVIEW`, { fill: accent, size: 12.5, weight: 800, spacing: 2.1 }));
-  parts.push(svgText(W - M - 28, M + 36, `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`, { fill: c.muted, size: 13, weight: 800, anchor: "end" }));
+  // Left character: the narrator/guide.
+  parts.push(`<g transform="translate(214 308) rotate(-3)">`);
+  parts.push(`<ellipse cx="166" cy="392" rx="152" ry="44" fill="#1f2924" opacity="0.16"/>`);
+  parts.push(`<path d="M136 158 C 82 204, 70 281, 101 354 C 148 430, 259 425, 306 350 C 342 268, 311 190, 246 153 Z" fill="#fff7e7" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<circle cx="151" cy="232" r="15" fill="#202820"/><circle cx="239" cy="232" r="15" fill="#202820"/>`);
+  parts.push(`<path d="M168 295 C 191 316, 221 316, 246 294" fill="none" stroke="#202820" stroke-width="10" stroke-linecap="round"/>`);
+  parts.push(`<path d="M106 168 C 143 91, 263 99, 299 174 C 248 145, 158 143, 106 168 Z" fill="${accent}" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<path d="M109 363 C 83 458, 91 559, 178 591 C 281 566, 318 479, 299 364 Z" fill="#fdf4da" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<path d="M109 421 C 33 437, 20 510, 80 539" fill="none" stroke="#202820" stroke-width="15" stroke-linecap="round"/>`);
+  parts.push(`<path d="M299 421 C 395 414, 444 353, 405 289" fill="none" stroke="#202820" stroke-width="15" stroke-linecap="round"/>`);
+  parts.push(`</g>`);
 
-  parts.push(`<rect x="${M + 28}" y="${M + 66}" width="272" height="6" rx="3" fill="${c.panelEdge}"/>`);
-  parts.push(`<rect x="${M + 28}" y="${M + 66}" width="${progressW}" height="6" rx="3" fill="${accent}"/>`);
+  // Right-side concept machine, intentionally without readable text.
+  parts.push(`<g transform="translate(760 236) rotate(2)">`);
+  parts.push(`<rect x="0" y="86" width="500" height="392" rx="58" fill="#fffaf0" stroke="#202820" stroke-width="12"/>`);
+  parts.push(`<circle cx="88" cy="178" r="43" fill="${accent}" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<circle cx="250" cy="178" r="43" fill="${second}" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<circle cx="412" cy="178" r="43" fill="${third}" stroke="#202820" stroke-width="10"/>`);
+  parts.push(`<path d="M88 221 C 120 294, 181 322, 250 322 S 380 291, 412 221" fill="none" stroke="#202820" stroke-width="12" stroke-linecap="round"/>`);
+  parts.push(`<path d="M94 365 C 167 331, 243 409, 310 365 S 400 330, 444 374" fill="none" stroke="${accent}" stroke-width="15" stroke-linecap="round"/>`);
+  parts.push(`<path d="M80 424 C 139 402, 184 445, 242 424 S 331 386, 420 426" fill="none" stroke="${second}" stroke-width="11" stroke-linecap="round"/>`);
+  parts.push(`</g>`);
 
-  const leftX = M + 34;
-  const topY = M + 116;
-  parts.push(svgTextBlock(titleLines, leftX, topY, { fill: c.text, size: 48, weight: 850, lineHeight: 56 }));
-  const titleBottom = topY + titleLines.length * 56 + 16;
-  parts.push(`<rect x="${leftX}" y="${titleBottom}" width="486" height="210" rx="24" fill="url(#vo-accent)" stroke="${accent}" stroke-opacity="0.35"/>`);
-  parts.push(`<circle cx="${leftX + 56}" cy="${titleBottom + 56}" r="28" fill="${accent}" fill-opacity="0.18" stroke="${accent}" stroke-opacity="0.48"/>`);
-  parts.push(svgText(leftX + 56, titleBottom + 64, String(index + 1), { fill: accent, size: 25, weight: 850, anchor: "middle" }));
-  parts.push(svgText(leftX + 102, titleBottom + 52, "SOURCE CARD", { fill: accent, size: 12, weight: 850, spacing: 1.4 }));
-  parts.push(svgText(leftX + 102, titleBottom + 82, sourceTitle, { fill: c.text, size: 21, weight: 780 }));
-  parts.push(svgTextBlock(wrapSvgText(scene.visual || "Evidence-backed visual", 42, 3), leftX + 30, titleBottom + 132, { fill: c.muted, size: 18, weight: 560, lineHeight: 25 }));
-  parts.push(`<rect x="${leftX + 30}" y="${titleBottom + 166}" width="74" height="30" rx="15" fill="${accent}" fill-opacity="0.15"/>`);
-  parts.push(svgText(leftX + 67, titleBottom + 187, citationLabel, { fill: accent, size: 14, weight: 850, anchor: "middle" }));
-
-  const rightX = M + 570;
-  parts.push(`<rect x="${rightX}" y="${M + 132}" width="${W - M - rightX - 34}" height="330" rx="24" fill="${c.panel}" stroke="${c.panelEdge}"/>`);
-  parts.push(svgText(rightX + 34, M + 174, "NARRATION", { fill: accent, size: 12, weight: 850, spacing: 1.8 }));
-  parts.push(svgTextBlock(narrationLines, rightX + 34, M + 220, { fill: c.text, size: 24, weight: 620, lineHeight: 33 }));
-  parts.push(`<rect x="${rightX + 34}" y="${M + 490}" width="${W - M - rightX - 102}" height="1" fill="${c.panelEdge}"/>`);
-  parts.push(svgText(rightX + 34, M + 528, `Duration ${Math.max(1, Math.round(duration || 0))}s`, { fill: c.faint, size: 13, weight: 700 }));
-
-  parts.push(`<rect x="${M + 34}" y="${H - M - 102}" width="${W - M * 2 - 68}" height="78" rx="22" fill="#050806" fill-opacity="0.84" stroke="${c.panelEdge}"/>`);
-  parts.push(`<circle cx="${M + 66}" cy="${H - M - 62}" r="5" fill="${accent}"/>`);
-  parts.push(svgTextBlock(captionLines, M + 86, H - M - 71, { fill: c.text, size: 20, weight: 650, lineHeight: 26 }));
-  parts.push(svgText(W - M - 34, H - M - 31, "Source-grounded MP4", { fill: c.faint, size: 12.5, weight: 750, anchor: "end" }));
+  // Motion accents and progress dots, no words.
+  parts.push(`<g transform="translate(${pulseX} ${pulseY})">`);
+  for (let i = 0; i < 5; i += 1) {
+    parts.push(`<circle cx="${i * 58}" cy="${Math.sin(i + index) * 18}" r="${i === index % 5 ? 17 : 10}" fill="${c.accents[(i + index) % c.accents.length]}" opacity="0.78"/>`);
+  }
+  parts.push(`</g>`);
+  parts.push(`<g transform="translate(1210 842)">`);
+  for (let i = 0; i < Math.max(1, total); i += 1) {
+    parts.push(`<circle cx="${i * 34}" cy="0" r="${i === index ? 12 : 7}" fill="${i === index ? accent : "#202820"}" opacity="${i === index ? 0.9 : 0.28}"/>`);
+  }
+  parts.push(`</g>`);
   parts.push(`</svg>`);
   return parts.join("");
 }
@@ -6409,13 +8468,6 @@ function escapeXml(input) {
     .replaceAll("'", "&apos;");
 }
 
-function bibliography(citations) {
-  return [...new Map(citations.map((citation) => [citation.source_id, citation])).values()].map((citation) => ({
-    source_id: citation.source_id,
-    title: citation.source_title,
-  }));
-}
-
 function buildFlashcardPlan(options = {}) {
   const countPreset = Object.hasOwn(FLASHCARD_COUNT_PRESETS, options.count_preset)
     ? options.count_preset
@@ -6552,82 +8604,478 @@ function topicFromSentence(sentence) {
   return terms.length ? terms.join(" ") : "evidence";
 }
 
-// Build a genuine multi-level mind map (root -> category -> claim) from the
-// deterministic evidence. The interactive tree in the UI expands/collapses these
-// branches, so the local fallback must produce a real hierarchy (not a flat star)
-// even when no external LLM is configured.
+function buildMindMapEvidencePoints(citations = [], question = "") {
+  const points = [];
+  for (const item of citations.slice(0, 10)) {
+    const selected = selectMindMapEvidenceSentences(item.quote, question);
+    const sentences = selected.length ? selected : [bestSentenceForQuestion(item.quote, question)];
+    for (const sentence of sentences.slice(0, 5)) {
+      points.push({
+        text: sentence,
+        quote: item.quote,
+        citation: item.citation,
+        evidence_id: item.evidence_id,
+        source_id: item.source_id,
+        source_title: item.source_title,
+        heading_path: item.heading_path || [],
+        source_refs: {
+          ...sourceRefsFromEvidence(item),
+          evidence_id: item.evidence_id,
+        },
+      });
+    }
+  }
+
+  const seen = new Set();
+  return points.filter((point) => {
+    const key = evidenceDedupeKey(`${point.source_id || ""} ${point.text || ""}`);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 18);
+}
+
+function selectMindMapEvidenceSentences(text, question = "") {
+  const raw = String(text || "")
+    .replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]/g, ". ")
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ". ");
+  const clean = normalizeWhitespace(raw);
+  const sentenceCandidates = extractSentences(clean);
+  const segmented = sentenceCandidates.length >= 2 ? [] : raw
+    .split(/\s*(?:\n+|[;•]|(?:\s-\s))\s*/)
+    .map((segment) => normalizeWhitespace(segment))
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 36 && segment.length < 420);
+  const candidates = [...sentenceCandidates, ...segmented];
+  const queryTokens = tokenize(question);
+  const seen = new Set();
+  return candidates
+    .map((sentence) => stripCitations(sentence).trim())
+    .filter((sentence) => sentence.length > 30)
+    .filter((sentence) => {
+      const key = evidenceDedupeKey(sentence);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map((sentence) => ({
+      sentence,
+      score: overlapScore(queryTokens, tokenize(sentence)) * 6
+        + Math.min(4, tokenize(sentence).length / 4)
+        + (mindMapRuleCategory(sentence) ? 3 : 0)
+        - (isMindMapSourceError(sentence) ? 1 : 0),
+    }))
+    .sort((a, b) => b.score - a.score || a.sentence.length - b.sentence.length)
+    .slice(0, 5)
+    .map((item) => item.sentence);
+}
+
+// Build a genuine multi-level mind map (root -> category -> synthesized insight
+// -> supporting angle) from deterministic evidence. Visible labels must read like
+// topic chips; raw quotations stay in source_refs and citations.
 function buildMindMapPayload({ notebook, titleBase, topics = [], keyPoints = [], citations = [] }) {
   const centerId = "center";
   const nodes = [{ id: centerId, label: notebook.title || "Notebook", type: "notebook", source_refs: [] }];
   const edges = [];
 
-  const points = (keyPoints || [])
+  const rawPoints = (keyPoints || [])
     .filter((point) => point && (point.text || "").trim())
     .map((point, idx) => ({ ...point, idx }));
+  const points = focusMindMapPointsByNotebookTitle(rawPoints, notebook);
 
-  // Keep at least one claim available per category so every branch is expandable.
-  const maxCategories = Math.max(1, Math.min(7, points.length || 1));
-  let categoryLabels = (topics || [])
-    .map((topic) => titleCase(topic.label || topic.term || "").trim())
-    // Drop stop-word-ish single tokens that read as noise in a category chip.
-    .filter((label) => label.length >= 4 && !MIND_MAP_STOP_LABELS.has(label.toLowerCase()))
-    .filter(Boolean);
-  categoryLabels = [...new Set(categoryLabels)].slice(0, maxCategories);
-  if (!categoryLabels.length) categoryLabels = ["Key Themes"];
+  const categories = buildMindMapCategories({ notebook, topics, points });
+  const categoryByLabel = new Map(categories.map((cat) => [cat.label.toLowerCase(), cat]));
 
-  const categories = categoryLabels.map((label, ci) => ({
-    id: `cat-${ci + 1}`,
-    label,
-    term: label.toLowerCase(),
-    children: [],
-  }));
-
-  const used = new Set();
-  // Pass 1: attach each claim to the first category whose term it actually mentions.
   for (const point of points) {
-    const text = (point.text || "").toLowerCase();
-    const match = categories.find(
-      (cat) => cat.children.length < 5 && cat.term.length > 2 && text.includes(cat.term),
-    );
-    if (match) {
-      match.children.push(point);
-      used.add(point.idx);
-    }
-  }
-  // Pass 2: round-robin the remainder onto the leanest category so nothing is dropped.
-  for (const point of points) {
-    if (used.has(point.idx)) continue;
-    const target = categories.reduce(
-      (leanest, cat) => (cat.children.length < leanest.children.length ? cat : leanest),
-      categories[0],
-    );
-    target.children.push(point);
-    used.add(point.idx);
+    const label = mindMapCategoryForPoint(point, categories, notebook);
+    const category = categoryByLabel.get(label.toLowerCase()) || leanestMindMapCategory(categories);
+    if (category) category.children.push(point);
   }
 
-  // Drop categories that never received a claim — a childless category just
-  // dangles in the tree with no branch to unfold.
-  const filledCategories = categories.filter((cat) => cat.children.length > 0);
-  const emitCategories = filledCategories.length ? filledCategories : categories.slice(0, 1);
+  if (points.length && categories.every((cat) => !cat.children.length)) {
+    categories[0].children.push(...points);
+  }
+
+  const emitCategories = categories.filter((cat) => cat.children.length > 0).slice(0, 7);
 
   for (const cat of emitCategories) {
-    nodes.push({ id: cat.id, label: cat.label, type: "topic", source_refs: [] });
-    edges.push({ id: `edge-${cat.id}`, source: centerId, target: cat.id });
-    cat.children.slice(0, 6).forEach((point, ci) => {
-      const childId = `${cat.id}-claim-${ci + 1}`;
-      // A readable, source-grounded fragment beats a scrambled keyword salad.
-      const label = truncate(stripCitations(point.text || ""), 56) || cat.label;
+    const categoryRefs = cat.children.flatMap((point) => mindMapSourceRefsForPoint(point)).slice(0, 4);
+    nodes.push({
+      id: cat.id,
+      label: cat.label,
+      type: "topic",
+      source_refs: categoryRefs,
+    });
+    edges.push({ id: `edge-${cat.id}`, source: centerId, target: cat.id, label: "organizes" });
+    const seenLabels = new Set();
+    cat.children.slice(0, 5).forEach((point, ci) => {
+      const childId = `${cat.id}-insight-${ci + 1}`;
+      const insightLabel = uniqueMindMapLabel(mindMapInsightLabel(point, cat.label, notebook), seenLabels, cat.label);
+      const refs = mindMapSourceRefsForPoint(point);
       nodes.push({
         id: childId,
-        label,
-        type: "claim",
-        source_refs: normalizeMindMapRefs(point.source_refs),
+        label: insightLabel,
+        type: "subtopic",
+        evidence_id: point.evidence_id || "",
+        source_refs: refs,
       });
-      edges.push({ id: `edge-${childId}`, source: cat.id, target: childId });
+      edges.push({ id: `edge-${childId}`, source: cat.id, target: childId, label: "contains" });
+
+      // Keep proof in source_refs instead of adding low-value "Beleg: file_name"
+      // leaf nodes. The map should read as concepts first, citations second.
     });
   }
 
+  if (!emitCategories.length) {
+    nodes.push({
+      id: "cat-1",
+      label: "Kernaussagen",
+      type: "topic",
+      source_refs: [],
+    });
+    edges.push({ id: "edge-cat-1", source: centerId, target: "cat-1", label: "organizes" });
+  }
+
   return { title: titleBase, nodes, edges, citations };
+}
+
+function focusMindMapPointsByNotebookTitle(points = [], notebook) {
+  const titleTokens = [...new Set(tokenize(notebook?.title || "")
+    .filter((token) => !MIND_MAP_LABEL_STOP_TERMS.has(token))
+    .filter((token) => token.length > 3))];
+  if (titleTokens.length < 2 || points.length < 5) return points;
+
+  const scored = points.map((point) => {
+    const context = [
+      point?.source_title,
+      ...(point?.heading_path || []),
+      point?.text,
+      point?.quote,
+    ].filter(Boolean).join(" ");
+    const contextTokens = tokenize(context);
+    const score = overlapScore(titleTokens, contextTokens)
+      + titleTokens.filter((token) => normalizeWhitespace(context).toLowerCase().includes(token)).length;
+    return { point, score };
+  });
+  const focused = scored
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.point.idx - b.point.idx)
+    .map((item) => item.point);
+  const minimumUseful = Math.min(4, Math.max(2, Math.ceil(points.length * 0.18)));
+  return focused.length >= minimumUseful ? focused : points;
+}
+
+function buildMindMapCategories({ notebook, topics = [], points = [] }) {
+  const maxCategories = Math.max(3, Math.min(7, Math.max(points.length + 2, 4)));
+  const candidates = [];
+  const notebookText = notebook?.title || "";
+
+  for (const label of mindMapTitleCategories(notebookText)) candidates.push(label);
+  for (const point of points) {
+    const category = mindMapRuleCategory(mindMapPointEvidenceText(point)) || mindMapRuleCategory(mindMapPointContext(point, notebook));
+    if (category) candidates.push(category);
+  }
+  for (const topic of topics || []) {
+    candidates.push(sanitizeMindMapLabel(topic.label || topic.term || ""));
+  }
+  for (const point of points) {
+    candidates.push(sanitizeMindMapLabel(topicFromSentence(mindMapPointEvidenceText(point) || mindMapPointContext(point, notebook))));
+  }
+
+  const labels = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const label = sanitizeMindMapLabel(candidate);
+    const key = label.toLowerCase();
+    if (!label || seen.has(key) || isWeakMindMapLabel(label, "topic")) continue;
+    seen.add(key);
+    labels.push(label);
+    if (labels.length >= maxCategories) break;
+  }
+
+  if (!labels.length) labels.push(isMindMapGerman(notebookText) ? "Kernaussagen" : "Key Themes");
+
+  return labels.map((label, index) => ({
+    id: `cat-${index + 1}`,
+    label,
+    children: [],
+  }));
+}
+
+function mindMapTitleCategories(title = "") {
+  const text = String(title || "");
+  const labels = [];
+  if (/\bwerkvertrag|mängel?|mangel|vergütung|abnahme|nacherfüllung\b/i.test(text)) {
+    if (/\bmängel?|mangel|werkvertrag\b/i.test(text)) labels.push("Mängelrechte");
+    if (/\bvergütung|zahlung|honorar|rechnung\b/i.test(text)) labels.push("Vergütung");
+    if (/\babnahme\b/i.test(text)) labels.push("Abnahme");
+    labels.push("Beweisführung");
+  }
+  if (/\bsource.?studio|notebook|evidence|citation|retrieval|quelle|zitat|beleg\b/i.test(text)) {
+    labels.push(isMindMapGerman(text) ? "Quellenarbeit" : "Source Work");
+    labels.push(isMindMapGerman(text) ? "Prüfpfad" : "Evidence Trail");
+    labels.push(isMindMapGerman(text) ? "Antwortqualität" : "Answer Quality");
+  }
+  if (/\benyp|guitar|gitarre|techno|festival|booking|club|live|duo\b/i.test(text)) {
+    labels.push("Live-Konzept");
+    labels.push("Sound & Technik");
+    labels.push("Auftritte & Booking");
+    labels.push("Profil & Stil");
+  }
+  return labels;
+}
+
+function mindMapCategoryForPoint(point, categories, notebook) {
+  const evidenceText = mindMapPointEvidenceText(point);
+  const context = mindMapPointContext(point, notebook);
+  const ruleLabel = mindMapRuleCategory(evidenceText) || mindMapRuleCategory(context);
+  if (ruleLabel) {
+    const direct = categories.find((cat) => cat.label.toLowerCase() === ruleLabel.toLowerCase());
+    if (direct) return direct.label;
+  }
+
+  const tokens = tokenize(evidenceText || context);
+  const scored = categories.map((cat) => ({
+    cat,
+    score: overlapScore(tokenize(cat.label), tokens) + (context.toLowerCase().includes(cat.label.toLowerCase()) ? 2 : 0),
+  })).sort((a, b) => b.score - a.score || a.cat.children.length - b.cat.children.length);
+  if (scored[0]?.score > 0) return scored[0].cat.label;
+  return leanestMindMapCategory(categories)?.label || (isMindMapGerman(context) ? "Kernaussagen" : "Key Themes");
+}
+
+function leanestMindMapCategory(categories) {
+  return categories.reduce(
+    (leanest, cat) => (!leanest || cat.children.length < leanest.children.length ? cat : leanest),
+    null,
+  );
+}
+
+function mindMapRuleCategory(text = "") {
+  const hay = String(text || "");
+  const german = isMindMapGerman(hay);
+  const rules = [
+    [/(no public|auto-generated captions|transcript|caption|youtube)/i, german ? "Quellenarbeit" : "Source Work"],
+    [/(beweis|beleg|quelle|zitat|citation|evidence|ledger|audit|protokoll|foto|screenshot|email|e-mail|ticket)/i, german ? "Beweisführung" : "Evidence Trail"],
+    [/(offen|unklar|streit|risiko|risk|gap|unclear|unknown|limitation|caveat|conflict|dispute)/i, german ? "Offene Punkte" : "Open Questions"],
+    [/(mängel|mangel|mangelhaft|gewährleistung|defect|defects|warranty)/i, german ? "Mängelrechte" : "Defect Claims"],
+    [/(abnahme|acceptance|accepted)/i, german ? "Abnahme" : "Acceptance"],
+    [/(vergütung|zahlung|honorar|rechnung|fällig|payment|invoice|fee|compensation)/i, german ? "Vergütung" : "Payment"],
+    [/(nacherfüllung|nachbesserung|frist|remedy|rectification|repair|deadline)/i, german ? "Nacherfüllung" : "Remediation"],
+    [/(retrieval|chunk|embedding|source|upload|pdf|youtube|transcript|quelle)/i, german ? "Quellenarbeit" : "Source Work"],
+    [/(festival|club|booking|show|veranstaltung|corporate|privat|private|kontakt|contact|epk|rider|pressefoto|press)/i, german ? "Auftritte & Booking" : "Shows & Booking"],
+    [/(guitar|gitarre|bass|hi-?hat|melodie|pickup|tonabnehmer|pedalboard|laptop|loop|loops|live)/i, german ? "Sound & Technik" : "Sound & Technique"],
+    [/(duo|musiker|timo|oliver|worldmusic|latin|techno|akustik)/i, german ? "Profil & Stil" : "Profile & Style"],
+    [/(artifact|studio|slide|audio|video|mind.?map|flashcard|quiz|report)/i, german ? "Studio Outputs" : "Studio Outputs"],
+    [/(model|provider|llm|prompt|anthropic|openai|gemini)/i, german ? "Modellsteuerung" : "Model Routing"],
+    [/(workflow|process|pipeline|flow|step|phase|ablauf|prozess)/i, german ? "Ablauf" : "Workflow"],
+  ];
+  return rules.find(([pattern]) => pattern.test(hay))?.[1] || "";
+}
+
+function mindMapInsightLabel(point, categoryLabel, notebook) {
+  const evidenceText = mindMapPointEvidenceText(point);
+  const context = evidenceText || mindMapPointContext(point, notebook);
+  const german = isMindMapGerman(`${context} ${notebook?.title || ""}`);
+  const rules = [
+    [/(zwei gitarren|two guitars|keine loops|no loops|kein laptop|no laptop|alles live|live)/i, german ? "Zwei Gitarren live" : "Two Guitars Live"],
+    [/(kick|bass|hi-?hat|melodie|tonabnehmer|pickup|pedalboard|gitarrentechnik)/i, german ? "Gitarren erzeugen das Setup" : "Guitars Drive The Setup"],
+    [/(festival|club|booking|corporate|privat|private|veranstaltung|show|kontakt|contact)/i, german ? "Buchbar für Shows" : "Bookable For Shows"],
+    [/(timo|oliver|worldmusic|latin|techno|akustik|duo)/i, german ? "Eigenes Akustik-Techno-Profil" : "Acoustic-Techno Profile"],
+    [/(epk|rider|pressefoto|press photo|download)/i, german ? "Booking-Unterlagen verfügbar" : "Booking Assets Available"],
+    [/(beweis|beleg|protokoll|foto|screenshot|email|e-mail|ticket|citation|evidence|ledger)/i, german ? "Belege systematisch sichern" : "Evidence Must Trace Claims"],
+    [/(offen|unklar|streitig|bestreit|risk|risiko|gap|unclear|unknown|limitation|caveat|dispute)/i, german ? "Klärungsbedarf markieren" : "Clarify Remaining Risk"],
+    [/\babnahme\b[\s\S]{0,100}(vergütung|fällig)|(vergütung|fällig)[\s\S]{0,100}\babnahme\b/i, german ? "Abnahme steuert Fälligkeit" : "Acceptance Controls Payment"],
+    [/(mängel|mangel)[\s\S]{0,100}(abnahme|verweiger)|(abnahme|verweiger)[\s\S]{0,100}(mängel|mangel)/i, german ? "Mängel machen Abnahme streitig" : "Defects Put Acceptance In Dispute"],
+    [/(mängel|mangel)[\s\S]{0,100}(vergütung|zahlung|honorar)|(vergütung|zahlung|honorar)[\s\S]{0,100}(mängel|mangel)/i, german ? "Mängeleinwand gegen Zahlung" : "Defects Affect Payment"],
+    [/(nacherfüllung|nachbesserung|frist|rectification|remedy|deadline)/i, german ? "Nacherfüllung zuerst prüfen" : "Remedy Comes First"],
+    [/(no public|auto-generated captions|transcript|caption|youtube)/i, german ? "Transkriptzugang klären" : "Transcript Access Check"],
+    [/(retrieval|chunk|embedding|source|upload|quelle|pdf)/i, german ? "Quelle in Belege zerlegen" : "Sources Become Evidence"],
+    [/(citation|zitat|beleg|audit|verify|verification|prüf)/i, german ? "Prüfpfad sichtbar machen" : "Verification Path Visible"],
+    [/(artifact|studio|slide|audio|video|mind.?map|flashcard|quiz|report)/i, german ? "Artefakt aus Quellen bauen" : "Source-Grounded Artifact"],
+    [/(must|should|requires?|muss|soll|braucht|notwendig)/i, german ? "Anforderung herausarbeiten" : "Requirement To Check"],
+    [/(because|therefore|deshalb|weil|daher|folglich)/i, german ? "Begründung verbinden" : "Reasoning Link"],
+  ];
+  const matched = rules.find(([pattern]) => pattern.test(context))?.[1];
+  if (matched) return matched;
+
+  const heading = lastMeaningfulMindMapHeading(point.heading_path);
+  if (heading && !labelsOverlap(heading, categoryLabel)) return sanitizeMindMapLabel(heading);
+  return mindMapPhraseLabel(point.text || point.quote || context, categoryLabel, german);
+}
+
+function mindMapPointContext(point, notebook) {
+  return [
+    notebook?.title,
+    point?.source_title,
+    ...(point?.heading_path || []),
+    point?.text,
+  ].filter(Boolean).join(" ");
+}
+
+function mindMapPointEvidenceText(point) {
+  return [
+    ...(point?.heading_path || []),
+    point?.text,
+  ].filter(Boolean).join(" ");
+}
+
+function mindMapSourceRefsForPoint(point) {
+  return normalizeMindMapRefs(point.source_refs).map((ref) => ({
+    ...ref,
+    evidence_id: point.evidence_id || ref.evidence_id || "",
+  }));
+}
+
+function uniqueMindMapLabel(label, seen, fallback) {
+  const clean = sanitizeMindMapLabel(label) || sanitizeMindMapLabel(fallback) || "Insight";
+  if (!seen.has(clean.toLowerCase())) {
+    seen.add(clean.toLowerCase());
+    return clean;
+  }
+  const suffix = sanitizeMindMapLabel(fallback) || "Detail";
+  const next = sanitizeMindMapLabel(`${clean} ${suffix}`);
+  seen.add(next.toLowerCase());
+  return next;
+}
+
+function mindMapPhraseLabel(text, fallback, german) {
+  const tokens = tokenize(text)
+    .filter((token) => !MIND_MAP_LABEL_STOP_TERMS.has(token))
+    .filter((token) => !/^\d+$/.test(token))
+    .slice(0, 5);
+  const unique = [...new Set(tokens)].slice(0, 4);
+  const phrase = unique.length >= 2 ? titleCase(unique.join(" ")) : "";
+  if (phrase && !isWeakMindMapLabel(phrase, "claim")) return sanitizeMindMapLabel(phrase);
+  return sanitizeMindMapLabel(fallback) || (german ? "Kernaussage" : "Key Insight");
+}
+
+function sanitizeMindMapLabel(text) {
+  let clean = stripCitations(String(text || ""))
+    .replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]/g, "")
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, "")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/[_]+/g, " ")
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  clean = clean.replace(/^["'`]+|["'`]+$/g, "").replace(/[.!?:;,]+$/g, "").trim();
+  if (!clean) return "";
+  if (clean.length > 58 || (/\s/.test(clean) && /[.!?]/.test(clean))) {
+    clean = titleCase(tokenize(clean)
+      .filter((token) => !MIND_MAP_LABEL_STOP_TERMS.has(token))
+      .slice(0, 4)
+      .join(" "));
+  }
+  return truncate(clean, 58);
+}
+
+function isWeakMindMapLabel(label, type = "") {
+  const clean = sanitizeMindMapLabel(label);
+  if (!clean) return true;
+  const lower = clean.toLowerCase();
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (MIND_MAP_STOP_LABELS.has(lower)) return true;
+  if (/^format\s+(pdf|cda|jpe?g|png|gif|md|docx|pptx?|csv|mp[34]|wav|aiff?|avi|mov|webm)\b/i.test(clean)) return true;
+  if (/\[\d+\]|\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(label)) return true;
+  if (clean.length > 68 || words.length > 8) return true;
+  if (/[.!?]/.test(label) && words.length > 4) return true;
+  if (type === "topic" && words.length >= 3 && mindMapLabelLooksLikeKeywordSoup(words)) return true;
+  if (type === "topic" && words.length === 1 && !MIND_MAP_STRONG_SINGLE_LABELS.has(lower)) return true;
+  return false;
+}
+
+function mindMapLabelLooksLikeKeywordSoup(words = []) {
+  const stems = words
+    .map((word) => word.toLowerCase().replace(/[^a-z0-9äöüß]/gi, ""))
+    .filter(Boolean)
+    .map((word) => word.replace(/(ations?|ments?|ings?|ers?|ors?|ed|es|s)$/i, "").slice(0, 6));
+  if (stems.length < 3) return false;
+  return new Set(stems).size <= stems.length - 1;
+}
+
+function lastMeaningfulMindMapHeading(headings = []) {
+  return [...(headings || [])]
+    .reverse()
+    .map((heading) => sanitizeMindMapLabel(heading))
+    .find((heading) => heading && !isWeakMindMapLabel(heading, "heading")) || "";
+}
+
+function labelsOverlap(a, b) {
+  const left = new Set(tokenize(a));
+  return tokenize(b).some((token) => left.has(token));
+}
+
+function isMindMapGerman(text = "") {
+  return /[äöüß]|\b(der|die|das|und|nicht|muss|soll|quelle|beleg|vergütung|mängel|abnahme)\b/i.test(String(text || ""));
+}
+
+function isMindMapSourceError(text = "") {
+  return /\b(no public|auto-generated captions|caption unavailable|transcript unavailable|watch link)\b/i.test(String(text || ""));
+}
+
+function finalizeMindMapPayload(generated, local) {
+  const localUsable = local && typeof local === "object" && Array.isArray(local.nodes) && Array.isArray(local.edges);
+  if (!generated || typeof generated !== "object" || !Array.isArray(generated.nodes) || !Array.isArray(generated.edges)) {
+    return localUsable ? local : generated;
+  }
+
+  if (localUsable && generated !== local && isWeakMindMapPayload(generated)) {
+    return {
+      ...local,
+      title: typeof generated.title === "string" && generated.title.trim() ? generated.title.trim() : local.title,
+      citations: Array.isArray(local.citations) ? local.citations : generated.citations,
+      mindmap_fallback_reason: "provider_returned_weak_mindmap",
+    };
+  }
+
+  return {
+    ...generated,
+    nodes: generated.nodes.map((node, index) => ({
+      ...node,
+      id: node.id || `node-${index + 1}`,
+      label: sanitizeMindMapLabel(node.label || node.title || node.text || "") || `Node ${index + 1}`,
+      type: node.type || (index === 0 ? "notebook" : "claim"),
+      source_refs: normalizeMindMapRefs(node.source_refs),
+    })),
+    edges: generated.edges
+      .filter((edge) => edge && edge.source && edge.target)
+      .map((edge, index) => ({
+        ...edge,
+        id: edge.id || `edge-${index + 1}`,
+        label: sanitizeMindMapLabel(edge.label || ""),
+      })),
+  };
+}
+
+function isWeakMindMapPayload(payload) {
+  const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const edges = Array.isArray(payload.edges) ? payload.edges : [];
+  if (nodes.length < 8 || edges.length < 4) return true;
+  const root = nodes.find((node) => node.type === "notebook") || nodes.find((node) => !edges.some((edge) => edge.target === node.id)) || nodes[0];
+  const firstLevel = edges.filter((edge) => edge.source === root?.id).map((edge) => nodes.find((node) => node.id === edge.target)).filter(Boolean);
+  if (firstLevel.length < 2) return true;
+  if (mindMapMaxDepth(root?.id, edges) < 2) return true;
+  const nonRootNodes = nodes.filter((node) => node.id !== root?.id);
+  const weakLabels = nonRootNodes.filter((node) => isWeakMindMapLabel(node.label || "", node.type || "")).length;
+  return weakLabels > Math.max(1, Math.floor(nonRootNodes.length * 0.28));
+}
+
+function mindMapMaxDepth(rootId, edges) {
+  if (!rootId) return 0;
+  const children = new Map();
+  for (const edge of edges) {
+    if (!children.has(edge.source)) children.set(edge.source, []);
+    children.get(edge.source).push(edge.target);
+  }
+  const walk = (nodeId, depth, seen = new Set()) => {
+    if (seen.has(nodeId)) return depth;
+    seen.add(nodeId);
+    const next = children.get(nodeId) || [];
+    if (!next.length) return depth;
+    return Math.max(...next.map((childId) => walk(childId, depth + 1, new Set(seen))));
+  };
+  return walk(rootId, 0);
 }
 
 // Single tokens that surface from the keyword extractor but read as noise when
@@ -6649,9 +9097,80 @@ const MIND_MAP_STOP_LABELS = new Set([
   "could",
   "should",
   "every",
+  "here",
   "other",
   "value",
   "values",
+  "watch",
+]);
+
+const MIND_MAP_STRONG_SINGLE_LABELS = new Set([
+  "abnahme",
+  "acceptance",
+  "beweise",
+  "beweisführung",
+  "evidence",
+  "vergütung",
+  "payment",
+  "mängelrechte",
+  "defect claims",
+  "nacherfüllung",
+  "remediation",
+  "risiken",
+  "risks",
+  "workflow",
+]);
+
+const MIND_MAP_LABEL_STOP_TERMS = new Set([
+  "aber",
+  "about",
+  "again",
+  "also",
+  "and",
+  "answer",
+  "around",
+  "based",
+  "because",
+  "become",
+  "before",
+  "being",
+  "could",
+  "dann",
+  "dass",
+  "dem",
+  "den",
+  "der",
+  "des",
+  "die",
+  "dies",
+  "diese",
+  "dieser",
+  "ein",
+  "eine",
+  "einer",
+  "from",
+  "für",
+  "here",
+  "into",
+  "ist",
+  "mit",
+  "nicht",
+  "oder",
+  "should",
+  "source",
+  "sources",
+  "that",
+  "the",
+  "then",
+  "there",
+  "this",
+  "und",
+  "werden",
+  "which",
+  "with",
+  "would",
+  "you",
+  "your",
 ]);
 
 function normalizeMindMapRefs(refs) {
@@ -6674,13 +9193,21 @@ function csvCell(value) {
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-function escapeRegExp(input) {
-  return String(input || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function truncate(input, maxLength) {
   const clean = String(input || "").replace(/\s+/g, " ").trim();
   return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trim()}...` : clean;
+}
+
+function indentBlock(input, prefix = "  ") {
+  return String(input || "")
+    .split("\n")
+    .map((line) => `${prefix}${line}`)
+    .join("\n");
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
 }
 
 function statusError(status, message) {

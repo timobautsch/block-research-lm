@@ -52,6 +52,40 @@ async function request(path, options) {
   return body;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJob(jobId, { timeoutMs = 300_000, intervalMs = 2_000 } = {}) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const { job } = await request(`/api/jobs/${jobId}`);
+    if (job.status === "completed") return job;
+    if (job.status === "failed") {
+      throw new Error(`Artifact job ${jobId} failed: ${job.error || "unknown error"}`);
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`Artifact job ${jobId} did not complete within ${timeoutMs}ms.`);
+}
+
+async function createCompletedArtifact(payload) {
+  const response = await request("/api/artifacts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (response.artifact?.content_json) return response;
+  if (!response.job?.id) {
+    throw new Error(`Expected artifact or job response: ${JSON.stringify(response)}`);
+  }
+  const job = await waitForJob(response.job.id);
+  if (!job.result_artifact_id) {
+    throw new Error(`Artifact job ${job.id} completed without result_artifact_id.`);
+  }
+  const { artifact } = await request(`/api/artifacts/${job.result_artifact_id}`);
+  return { ...response, job, artifact };
+}
+
 async function ensureAuth() {
   try {
     return await request("/api/auth/signup", {
@@ -100,31 +134,25 @@ if (!chat.message?.citations?.length) {
   throw new Error("Expected chat citations.");
 }
 
-const artifact = await request("/api/artifacts", {
-  method: "POST",
-  body: JSON.stringify({
-    notebook_id: notebook.id,
-    type: "quiz",
-    options: {},
-  }),
+const artifact = await createCompletedArtifact({
+  notebook_id: notebook.id,
+  type: "quiz",
+  options: {},
 });
 
 if (!artifact.artifact?.content_json?.questions?.length) {
   throw new Error("Expected quiz questions.");
 }
 
-const flashcards = await request("/api/artifacts", {
-  method: "POST",
-  body: JSON.stringify({
-    notebook_id: notebook.id,
-    type: "flashcards",
-    options: {
-      topic: "Evidence Packs",
-      difficulty: "medium",
-      count: 6,
-      card_types: ["concept", "application", "source-check"],
-    },
-  }),
+const flashcards = await createCompletedArtifact({
+  notebook_id: notebook.id,
+  type: "flashcards",
+  options: {
+    topic: "Evidence Packs",
+    difficulty: "medium",
+    count: 6,
+    card_types: ["concept", "application", "source-check"],
+  },
 });
 
 if (!flashcards.artifact?.content_json?.deck_id || !flashcards.artifact?.content_json?.cards?.length) {

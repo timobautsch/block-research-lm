@@ -8,6 +8,7 @@ outputs/
 coverage/
 playwright-report/
 test-results/
+test_kit/coherent_crypto_dossier/
 
 .env
 .env.*
