@@ -17,6 +17,7 @@ import {
   CheckCircle,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Circle,
   ClipboardList,
@@ -35,12 +36,11 @@ import {
   Loader2,
   Lock,
   LogOut,
-  Map,
+  Map as MapIcon,
   Maximize2,
   MessageSquareText,
   Minimize2,
   Minus,
-  MoreVertical,
   NotebookPen,
   PanelLeft,
   PlayCircle,
@@ -67,7 +67,7 @@ import {
   Youtube,
 } from "lucide-react";
 
-type SourceType = "markdown" | "text" | "pdf" | "url" | "note" | "docx" | "youtube" | "audio" | "google_doc" | "image";
+type SourceType = "markdown" | "text" | "pdf" | "url" | "note" | "docx" | "pptx" | "epub" | "youtube" | "audio" | "google_doc" | "image";
 type SourceStatus = "pending" | "parsing" | "indexed" | "failed";
 type AnswerStyle = "Strict" | "Balanced" | "Exploratory";
 type ArtifactType =
@@ -88,6 +88,7 @@ type FlashcardDifficulty = "mixed" | "easy" | "medium" | "hard";
 type FlashcardCountPreset = "fewer" | "standard" | "more";
 type FlashcardCardType = "concept" | "application" | "cloze" | "caveat" | "source-check" | "compare";
 type SourceMode = "active" | "selected" | "all";
+type ReportFormatKind = "custom" | "template" | "suggested";
 interface AudioOverviewOptions {
   format: AudioFormat;
   length: AudioLength;
@@ -105,7 +106,15 @@ interface FlashcardOptions {
   sourceMode: SourceMode;
   selectedSourceIds: string[];
 }
+interface ReportFormatOption {
+  id: string;
+  title: string;
+  description: string;
+  kind: ReportFormatKind;
+  prompt: string;
+}
 type MobilePanel = "sources" | "chat" | "studio";
+type WorkspaceResizeTarget = "sources" | "studio";
 const AUTH_MODES = ["login", "signup", "reset-request", "reset-confirm"] as const;
 type AuthMode = (typeof AUTH_MODES)[number];
 type ApiInit = Parameters<typeof fetch>[1];
@@ -113,6 +122,16 @@ const BRAND_NAME = "blockresearch.ai LM";
 const BRAND_EYEBROW = "Block Research AI";
 const BRAND_LOGO_PATH = "/brand/blockresearch-mark.svg";
 const ASSISTANT_NAME = "Block Research LM";
+const LAST_NOTEBOOK_STORAGE_KEY = "sourcestudio:last-notebook-id";
+const WORKSPACE_LAYOUT_STORAGE_KEY = "sourcestudio:workspace-layout";
+const WORKSPACE_RESIZER_WIDTH = 14;
+const WORKSPACE_MIN_SOURCE = 260;
+const WORKSPACE_MIN_CHAT = 360;
+const WORKSPACE_MIN_STUDIO = 280;
+const WORKSPACE_MAX_SOURCE = 620;
+const WORKSPACE_MAX_STUDIO = 680;
+const DEFAULT_WORKSPACE_LAYOUT = { sources: 340, studio: 400 };
+type WorkspaceLayout = typeof DEFAULT_WORKSPACE_LAYOUT;
 
 interface AuthUser {
   id: string;
@@ -276,11 +295,6 @@ interface StoryboardPayload {
   narration?: string;
 }
 
-interface ReportPointPayload {
-  text?: string;
-  citation?: string;
-}
-
 interface InfographicPanelPayload {
   panel?: number;
   headline?: string;
@@ -360,38 +374,6 @@ interface ChatMessage {
     citation_coverage?: number;
     support_score?: number;
   };
-}
-
-interface ArtifactEvidenceAudit {
-  status?: string;
-  evidence_pack_id?: string;
-  retrieval_run_id?: string;
-  retrieval_intent?: string;
-  query?: string;
-  evidence_items?: number;
-  cited_evidence_items?: number;
-  uncited_evidence_ids?: string[];
-  invalid_evidence_ids?: string[];
-  invalid_citation_count?: number;
-  evidence_coverage?: number;
-  active_source_count?: number;
-  source_count?: number;
-  cited_source_count?: number;
-  source_coverage?: number;
-  artifact_items?: number;
-  cited_artifact_items?: number;
-  item_citation_coverage?: number;
-  summary?: string;
-  constraints?: Record<string, unknown>;
-  top_sources?: Array<{
-    source_id?: string;
-    title?: string;
-    references?: number;
-    evidence_items?: number;
-    cited_items?: number;
-    coverage?: number;
-    support_types?: string[];
-  }>;
 }
 
 interface Artifact {
@@ -509,6 +491,29 @@ interface SourceForm {
   base64?: string;
 }
 
+type QueuedSourceFileStatus = "queued" | "adding" | "added" | "failed";
+
+interface QueuedSourceFile {
+  id: string;
+  file: File;
+  type: SourceType;
+  title: string;
+  file_name: string;
+  mime_type: string;
+  size: number;
+  status: QueuedSourceFileStatus;
+  error?: string;
+  sourceId?: string;
+  progress?: number;
+  progressLabel?: string;
+  progressDetail?: string;
+}
+
+const MAX_SOURCE_UPLOAD_MB = 200;
+const MAX_SOURCE_UPLOAD_BYTES = MAX_SOURCE_UPLOAD_MB * 1024 * 1024;
+const SOURCE_UPLOAD_LIMIT_LABEL = `${MAX_SOURCE_UPLOAD_MB} MB`;
+const SOURCE_UPLOAD_PARALLELISM = 3;
+
 const emptySourceForm: SourceForm = {
   type: "markdown",
   title: "",
@@ -516,24 +521,31 @@ const emptySourceForm: SourceForm = {
   body: "",
 };
 
-const artifactTypes: Array<{
+type StudioArtifactTool = {
   type: ArtifactType;
   title: string;
   action: string;
   icon: ReactNode;
-}> = [
-  { type: "youtube-kit", title: "Title & Description", action: "YouTube", icon: <Youtube size={18} /> },
-  { type: "thumbnail", title: "Thumbnail", action: "Image", icon: <Image size={18} /> },
+};
+
+const youtubeStudioTypes: StudioArtifactTool[] = [
+  { type: "youtube-kit", title: "Title & Description", action: "Metadata", icon: <Youtube size={18} /> },
+  { type: "thumbnail", title: "Thumbnail", action: "Visual", icon: <Image size={18} /> },
+];
+
+const coreStudioTypes: StudioArtifactTool[] = [
   { type: "audio", title: "Audio Overview", action: "Script", icon: <AudioLines size={18} /> },
   { type: "slide-deck", title: "Slide Deck", action: "Slides", icon: <Presentation size={18} /> },
   { type: "video", title: "Video Overview", action: "Render", icon: <Video size={18} /> },
-  { type: "mindmap", title: "Mind Map", action: "Map", icon: <Map size={18} /> },
+  { type: "mindmap", title: "Mind Map", action: "Map", icon: <MapIcon size={18} /> },
   { type: "report", title: "Reports", action: "Write", icon: <ClipboardList size={18} /> },
   { type: "flashcards", title: "Flashcards", action: "Cards", icon: <Layers3 size={18} /> },
   { type: "quiz", title: "Quiz", action: "Test", icon: <ListChecks size={18} /> },
   { type: "infographic", title: "Infographic", action: "Visual", icon: <Sparkles size={18} /> },
   { type: "data-table", title: "Data Table", action: "Extract", icon: <Table2 size={18} /> },
 ];
+
+const artifactTypes: StudioArtifactTool[] = [...youtubeStudioTypes, ...coreStudioTypes];
 
 const sourceTabs: Array<{ type: SourceType; label: string; icon: ReactNode }> = [
   { type: "markdown", label: "Paste text", icon: <FileText size={15} /> },
@@ -579,6 +591,37 @@ const sourceModeOptions: Array<{ value: SourceMode; label: string }> = [
   { value: "active", label: "Active" },
   { value: "selected", label: "Selected" },
   { value: "all", label: "All" },
+];
+
+const baseReportFormatOptions: ReportFormatOption[] = [
+  {
+    id: "custom",
+    title: "Create Your Own",
+    description: "Craft reports your way by specifying structure, style, tone, and more",
+    kind: "custom",
+    prompt: "Create a custom source-grounded report using the structure, style, tone, and focus requested by the user.",
+  },
+  {
+    id: "briefing-doc",
+    title: "Briefing Doc",
+    description: "Overview of your sources featuring key insights and quotes",
+    kind: "template",
+    prompt: "Create a concise briefing document with summary, key insights, direct quotes, risks, open questions, and bibliography.",
+  },
+  {
+    id: "study-guide",
+    title: "Study Guide",
+    description: "Short-answer quiz, suggested essay questions, and glossary of key terms",
+    kind: "template",
+    prompt: "Create a study guide with core concepts, short-answer questions, essay prompts, glossary terms, citations, and source-backed explanations.",
+  },
+  {
+    id: "blog-post",
+    title: "Blog Post",
+    description: "Insightful takeaways distilled into a highly readable article",
+    kind: "template",
+    prompt: "Create a readable blog post that distills source-backed takeaways, examples, caveats, and citations without adding outside facts.",
+  },
 ];
 
 const defaultAudioOverviewOptions: AudioOverviewOptions = {
@@ -634,6 +677,17 @@ function flashcardArtifactOptions(options: FlashcardOptions) {
   };
 }
 
+function reportArtifactOptions(format: ReportFormatOption, customPrompt = ""): Record<string, unknown> {
+  const instructions = customPrompt.trim();
+  const title = format.kind === "custom" ? customReportTitle(instructions) : format.title;
+  return {
+    report_type: title,
+    report_format: format.id,
+    report_format_kind: format.kind,
+    prompt: [format.prompt, instructions ? `User instructions: ${instructions}` : ""].filter(Boolean).join("\n\n"),
+  };
+}
+
 export default function App() {
   const [showLanding, setShowLanding] = useState(() => window.location.hash !== "#workspace");
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
@@ -642,9 +696,15 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [notebook, setNotebook] = useState<Notebook | null>(null);
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+  const deletingSourceIdsRef = useRef<Set<string>>(new Set());
+  const pendingSourceActiveOverridesRef = useRef<globalThis.Map<string, boolean>>(new globalThis.Map());
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
+  const workspacePreferredLayoutRef = useRef<WorkspaceLayout>(readWorkspaceLayout());
+  const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => workspacePreferredLayoutRef.current);
+  const [workspaceResizeTarget, setWorkspaceResizeTarget] = useState<WorkspaceResizeTarget | "">("");
   const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
+  const [sourceFileQueue, setSourceFileQueue] = useState<QueuedSourceFile[]>([]);
   const [activeSourceId, setActiveSourceId] = useState("");
   const [, setSourceBlocks] = useState<SourceBlock[]>([]);
   const [, setHighlightedBlockIds] = useState<string[]>([]);
@@ -657,14 +717,16 @@ export default function App() {
   const [isArtifactDetailOpen, setIsArtifactDetailOpen] = useState(false);
   const [playingArtifactId, setPlayingArtifactId] = useState("");
   const inlineAudioRef = useRef<HTMLAudioElement>(null);
-  const [isGroundingDetailOpen, setIsGroundingDetailOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isShareOpen, setIsShareOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
   const [isNotepadOpen, setIsNotepadOpen] = useState(false);
   const [noteTitle, setNoteTitle] = useState("");
   const [noteBody, setNoteBody] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
-  const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail">("");
+  const [customizeType, setCustomizeType] = useState<"" | "audio" | "flashcards" | "thumbnail" | "report">("");
+  const [customReportPrompt, setCustomReportPrompt] = useState("");
+  const [isCustomReportPromptOpen, setIsCustomReportPromptOpen] = useState(false);
   const [thumbnailPrompt, setThumbnailPrompt] = useState("");
   const [thumbnailRefs, setThumbnailRefs] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -675,39 +737,41 @@ export default function App() {
   const [isDebugOpen, setIsDebugOpen] = useState(false);
   const [debugStatus, setDebugStatus] = useState<DebugStatusResponse | null>(null);
   const [isBooting, setIsBooting] = useState(true);
+  const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
   const [isAddingSource, setIsAddingSource] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
   const [creatingTypes, setCreatingTypes] = useState<Set<ArtifactType>>(() => new Set());
+  const [deletingArtifactIds, setDeletingArtifactIds] = useState<Set<string>>(() => new Set());
+  const [isDeletingAllArtifacts, setIsDeletingAllArtifacts] = useState(false);
+  const [sourcePanelFocusTick, setSourcePanelFocusTick] = useState(0);
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [sourceFormNotice, setSourceFormNotice] = useState("");
+  const [sourceFormNoticeTone, setSourceFormNoticeTone] = useState<"success" | "warning" | "error">("error");
   const didBootRef = useRef(false);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const sourceBodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const sourcePanelRef = useRef<HTMLElement | null>(null);
+  const workspaceRef = useRef<HTMLElement | null>(null);
 
   const selectedArtifact = useMemo(
-    () =>
-      notebook?.artifacts.find((artifact) => artifact.id === selectedArtifactId) ||
-      notebook?.artifacts[0] ||
-      null,
+    () => notebook?.artifacts.find((artifact) => artifact.id === selectedArtifactId) || null,
     [notebook, selectedArtifactId],
   );
   const visibleMessages = useMemo(
     () => visibleNotebookMessages(notebook?.messages || []),
     [notebook?.messages],
   );
-  const latestAssistant = useMemo(
-    () => [...visibleMessages].reverse().find((message) => message.role === "assistant"),
-    [visibleMessages],
-  );
+  const suggestedReportFormats = useMemo(() => buildSuggestedReportFormats(notebook), [notebook]);
   const isSourceReady = useMemo(() => {
     const body = sourceForm.body.trim();
     const url = sourceForm.original_url.trim();
-    const hasFile = Boolean(sourceForm.base64);
+    const hasFile = Boolean(sourceForm.base64 || sourceFileQueue.length);
     if (sourceNeedsUrl(sourceForm.type)) return Boolean(url || body);
     if (sourceAcceptsFile(sourceForm.type)) return Boolean(hasFile || body);
     return Boolean(body || hasFile);
-  }, [sourceForm]);
+  }, [sourceFileQueue.length, sourceForm]);
+  const sourceUploadDone = sourceFileQueue.filter((file) => file.status === "added" || file.status === "failed").length;
 
   useEffect(() => {
     if (didBootRef.current) return;
@@ -722,6 +786,13 @@ export default function App() {
       setActiveSourceId(notebook.sources[0].id);
     }
   }, [activeSourceId, notebook]);
+
+  useEffect(() => {
+    if (!selectedArtifactId || !notebook) return;
+    if (notebook.artifacts.some((artifact) => artifact.id === selectedArtifactId)) return;
+    setSelectedArtifactId("");
+    setIsArtifactDetailOpen(false);
+  }, [notebook, selectedArtifactId]);
 
   useEffect(() => {
     if (!activeSourceId) return;
@@ -753,6 +824,24 @@ export default function App() {
     };
   }, [authUser, showLanding]);
 
+  useEffect(() => {
+    const node = workspaceRef.current;
+    if (!node) return undefined;
+    const syncLayout = () => {
+      if (window.getComputedStyle(node).display !== "grid") return;
+      const width = workspaceInnerWidth(node);
+      setWorkspaceLayout(normalizeWorkspaceLayout(workspacePreferredLayoutRef.current, width));
+    };
+    syncLayout();
+    const observer = new ResizeObserver(syncLayout);
+    observer.observe(node);
+    window.addEventListener("resize", syncLayout);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", syncLayout);
+    };
+  }, [authUser, showLanding]);
+
   async function boot() {
     setIsBooting(true);
     setError("");
@@ -779,8 +868,12 @@ export default function App() {
   async function loadWorkspaceData() {
     const list = await api<{ notebooks: Notebook[] }>("/api/notebooks");
     if (list.notebooks.length) {
+      const rememberedId = readRememberedNotebookId();
+      const target = list.notebooks.find((item) => item.id === rememberedId) || list.notebooks[0];
       setNotebooks(list.notebooks);
-      setNotebook(await loadNotebook(list.notebooks[0].id));
+      const loaded = await loadNotebook(target.id);
+      setNotebook(loaded);
+      rememberNotebookId(loaded.id);
     } else {
       // Start with an empty notebook (NotebookLM-style) — no pre-seeded demo sources.
       const created = await api<{ notebook: Notebook }>("/api/notebooks", {
@@ -790,6 +883,7 @@ export default function App() {
       const fresh = await loadNotebook(created.notebook.id);
       setNotebooks([fresh]);
       setNotebook(fresh);
+      rememberNotebookId(fresh.id);
     }
   }
 
@@ -823,25 +917,88 @@ export default function App() {
   }
 
   async function createNotebook() {
+    if (isCreatingNotebook) return;
+    const previousNotebook = notebook;
+    const previousNotebooks = notebooks;
+    const previousActiveSourceId = activeSourceId;
+    const previousSelectedArtifactId = selectedArtifactId;
+    const pendingNotebook: Notebook = {
+      id: "pending-new-notebook",
+      title: "Untitled notebook",
+      description: "",
+      summary: "",
+      active_source_count: 0,
+      source_count: 0,
+      sources: [],
+      artifacts: [],
+      jobs: [],
+      knowledge: [],
+      messages: [],
+      suggested_questions: [],
+      suggested_artifacts: [],
+    };
     setOpenMenu("");
     setError("");
-    setIsBooting(true);
+    setToast("Creating notebook…");
+    setIsCreatingNotebook(true);
+    setNotebook(pendingNotebook);
+    setActiveSourceId("");
+    setSelectedArtifactId("");
+    setMobilePanel("chat");
+    setIsAddSourceOpen(false);
+    setIsNotepadOpen(false);
+    setIsArtifactDetailOpen(false);
+    setIsShareOpen(false);
+    setCustomizeType("");
+    setSourceFileQueue([]);
+    setSourceForm(emptySourceForm);
+    setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
+    setIsDragging(false);
     try {
-      const created = await api<{ notebook: Notebook }>("/api/notebooks", {
+      const created = await api<{ notebook: Partial<Notebook> & { id: string; title?: string } }>("/api/notebooks", {
         method: "POST",
         body: JSON.stringify({ title: "Untitled notebook" }),
       });
-      const loaded = await loadNotebook(created.notebook.id);
+      const shell: Notebook = {
+        id: created.notebook.id,
+        title: created.notebook.title || "Untitled notebook",
+        description: created.notebook.description || "",
+        summary: created.notebook.summary || "",
+        active_source_count: 0,
+        source_count: 0,
+        sources: [],
+        artifacts: [],
+        jobs: [],
+        knowledge: [],
+        messages: [],
+        suggested_questions: [],
+        suggested_artifacts: [],
+        created_at: created.notebook.created_at,
+        updated_at: created.notebook.updated_at,
+      };
+      setNotebook(shell);
+      setNotebooks((current) => [shell, ...current.filter((item) => item.id !== shell.id)]);
+      rememberNotebookId(shell.id);
+      setActiveSourceId("");
+      setSelectedArtifactId("");
+      setMobilePanel("chat");
+      const loaded = await loadNotebook(shell.id);
       setNotebook(loaded);
+      rememberNotebookId(loaded.id);
       setActiveSourceId("");
       setSelectedArtifactId("");
       await refreshNotebookList();
-      setMobilePanel("sources");
-      openAddSource();
+      setToast("New notebook opened.");
     } catch (createError) {
+      setNotebook((current) => (current?.id === pendingNotebook.id ? previousNotebook : current));
+      setNotebooks(previousNotebooks);
+      setActiveSourceId(previousActiveSourceId);
+      setSelectedArtifactId(previousSelectedArtifactId);
+      setToast("");
       setError(messageFromError(createError));
     } finally {
-      setIsBooting(false);
+      setIsCreatingNotebook(false);
     }
   }
 
@@ -853,6 +1010,7 @@ export default function App() {
     try {
       const loaded = await loadNotebook(id);
       setNotebook(loaded);
+      rememberNotebookId(loaded.id);
       setActiveSourceId(loaded.sources[0]?.id || "");
       setSelectedArtifactId("");
     } catch (switchError) {
@@ -864,16 +1022,32 @@ export default function App() {
 
   function openAddSource(type: SourceType = "markdown") {
     setSourceForm({ ...emptySourceForm, type });
+    setSourceFileQueue([]);
     setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
     setIsAddSourceOpen(true);
     window.requestAnimationFrame(() => sourceBodyRef.current?.focus());
   }
 
+  function closeAddSourceDialog() {
+    if (isAddingSource) return;
+    setIsAddSourceOpen(false);
+    setIsDragging(false);
+    setSourceFileQueue([]);
+    setSourceForm(emptySourceForm);
+    setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
+  }
+
   async function setAllSourcesActive(active: boolean) {
-    if (!notebook) return;
+    const previousNotebook = notebook;
+    if (!previousNotebook) return;
     setError("");
-    const targets = notebook.sources.filter((source) => source.active !== active);
+    const targets = previousNotebook.sources.filter((source) => source.active !== active);
     if (!targets.length) return;
+    const targetIds = targets.map((source) => source.id);
+    trackPendingSourceActiveState(targetIds, active);
+    applySourceActiveState(targetIds, active);
     try {
       await Promise.all(
         targets.map((source) =>
@@ -883,9 +1057,12 @@ export default function App() {
           }),
         ),
       );
-      await refreshNotebook();
+      clearPendingSourceActiveState(targetIds, active);
+      await refreshNotebookAfterSourceToggle(previousNotebook.id);
       refreshDebugSilently();
     } catch (toggleError) {
+      clearPendingSourceActiveState(targetIds, active);
+      setNotebook((current) => (current?.id === previousNotebook.id ? previousNotebook : current));
       setError(messageFromError(toggleError));
     }
   }
@@ -927,6 +1104,7 @@ export default function App() {
       setNotebook(null);
       setActiveSourceId("");
       setSelectedArtifactId("");
+      forgetRememberedNotebookId();
       setShowLanding(true);
       window.history.replaceState(null, "", window.location.pathname);
     }
@@ -934,7 +1112,7 @@ export default function App() {
 
   async function refreshNotebook(id = notebook?.id) {
     if (!id) return;
-    setNotebook(await loadNotebook(id));
+    setNotebook(notebookWithPendingSourceOverrides(await loadNotebook(id)));
   }
 
   async function loadNotebook(id: string) {
@@ -942,9 +1120,152 @@ export default function App() {
     return response.notebook;
   }
 
-  async function pollSourceUntilReady(sourceId: string, notebookId: string) {
+  function withSourceActiveState(current: Notebook, sourceIds: Set<string>, active: boolean) {
+    const sources = current.sources.map((source) => (sourceIds.has(source.id) ? { ...source, active } : source));
+    return {
+      ...current,
+      sources,
+      active_source_count: sources.filter((source) => source.active).length,
+    };
+  }
+
+  function applySourceActiveState(sourceIds: string[], active: boolean) {
+    if (!sourceIds.length) return;
+    const idSet = new Set(sourceIds);
+    setNotebook((current) => (current ? withSourceActiveState(current, idSet, active) : current));
+  }
+
+  function trackPendingSourceActiveState(sourceIds: string[], active: boolean) {
+    sourceIds.forEach((sourceId) => pendingSourceActiveOverridesRef.current.set(sourceId, active));
+  }
+
+  function clearPendingSourceActiveState(sourceIds: string[], active: boolean) {
+    sourceIds.forEach((sourceId) => {
+      if (pendingSourceActiveOverridesRef.current.get(sourceId) === active) {
+        pendingSourceActiveOverridesRef.current.delete(sourceId);
+      }
+    });
+  }
+
+  function notebookWithPendingSourceOverrides(current: Notebook) {
+    const overrides = pendingSourceActiveOverridesRef.current;
+    if (!overrides.size) return current;
+    const sources = current.sources.map((source) => {
+      if (!overrides.has(source.id)) return source;
+      return { ...source, active: Boolean(overrides.get(source.id)) };
+    });
+    return {
+      ...current,
+      sources,
+      active_source_count: sources.filter((source) => source.active).length,
+    };
+  }
+
+  async function refreshNotebookAfterSourceToggle(notebookId: string) {
+    const fresh = notebookWithPendingSourceOverrides(await loadNotebook(notebookId));
+    setNotebook((current) => (current?.id === notebookId ? fresh : current));
+  }
+
+  function openSourcesPanel() {
+    setOpenMenu("");
+    setMobilePanel("sources");
+    window.requestAnimationFrame(() => {
+      sourcePanelRef.current?.focus({ preventScroll: true });
+      sourcePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      setSourcePanelFocusTick(Date.now());
+      window.setTimeout(() => setSourcePanelFocusTick(0), 900);
+    });
+  }
+
+  function workspacePointerWidth(target: WorkspaceResizeTarget, clientX: number) {
+    const node = workspaceRef.current;
+    if (!node) return null;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    const paddingLeft = Number.parseFloat(style.paddingLeft || "0");
+    const paddingRight = Number.parseFloat(style.paddingRight || "0");
+    const innerWidth = Math.max(0, rect.width - paddingLeft - paddingRight);
+    const x = clampNumber(clientX - rect.left - paddingLeft, 0, innerWidth);
+    return {
+      innerWidth,
+      width: target === "sources" ? x : innerWidth - x,
+    };
+  }
+
+  function updateWorkspaceLayout(target: WorkspaceResizeTarget, width: number, innerWidth?: number) {
+    const next = normalizeWorkspaceLayout({ ...workspacePreferredLayoutRef.current, [target]: width }, innerWidth);
+    workspacePreferredLayoutRef.current = next;
+    rememberWorkspaceLayout(next);
+    setWorkspaceLayout(next);
+  }
+
+  function resizeWorkspaceFromPointer(target: WorkspaceResizeTarget, clientX: number) {
+    const metrics = workspacePointerWidth(target, clientX);
+    if (!metrics) return;
+    updateWorkspaceLayout(target, metrics.width, metrics.innerWidth);
+  }
+
+  function startWorkspaceResize(target: WorkspaceResizeTarget, event: ReactPointerEvent<HTMLButtonElement>) {
+    if (!workspaceRef.current) return;
+    event.preventDefault();
+    setWorkspaceResizeTarget(target);
+    resizeWorkspaceFromPointer(target, event.clientX);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const handleMove = (moveEvent: PointerEvent) => resizeWorkspaceFromPointer(target, moveEvent.clientX);
+    const stopResize = () => {
+      setWorkspaceResizeTarget("");
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+  }
+
+  function handleWorkspaceResizeKey(target: WorkspaceResizeTarget, event: ReactKeyboardEvent<HTMLButtonElement>) {
+    const keyStep = event.shiftKey ? 48 : 24;
+    let delta = 0;
+    if (event.key === "Home") {
+      event.preventDefault();
+      updateWorkspaceLayout(target, target === "sources" ? WORKSPACE_MIN_SOURCE : WORKSPACE_MIN_STUDIO, workspaceRef.current ? workspaceInnerWidth(workspaceRef.current) : undefined);
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      updateWorkspaceLayout(target, target === "sources" ? WORKSPACE_MAX_SOURCE : WORKSPACE_MAX_STUDIO, workspaceRef.current ? workspaceInnerWidth(workspaceRef.current) : undefined);
+      return;
+    }
+    if (target === "sources") {
+      if (event.key === "ArrowLeft") delta = -keyStep;
+      if (event.key === "ArrowRight") delta = keyStep;
+    } else {
+      if (event.key === "ArrowLeft") delta = keyStep;
+      if (event.key === "ArrowRight") delta = -keyStep;
+    }
+    if (!delta) return;
+    event.preventDefault();
+    const innerWidth = workspaceRef.current ? workspaceInnerWidth(workspaceRef.current) : undefined;
+    updateWorkspaceLayout(target, workspaceLayout[target] + delta, innerWidth);
+  }
+
+  function resetWorkspaceLayout() {
+    const innerWidth = workspaceRef.current ? workspaceInnerWidth(workspaceRef.current) : undefined;
+    const next = normalizeWorkspaceLayout(DEFAULT_WORKSPACE_LAYOUT, innerWidth);
+    workspacePreferredLayoutRef.current = DEFAULT_WORKSPACE_LAYOUT;
+    rememberWorkspaceLayout(DEFAULT_WORKSPACE_LAYOUT);
+    setWorkspaceLayout(next);
+  }
+
+  function closeArtifactDetail() {
+    setIsArtifactDetailOpen(false);
+  }
+
+  async function pollSourcesUntilReady(sourceIds: string[], notebookId: string) {
+    const pendingSourceIds = new Set(sourceIds.filter(Boolean));
+    if (!pendingSourceIds.size) return;
     const deadline = Date.now() + 8 * 60 * 1000;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && pendingSourceIds.size) {
       await new Promise((resolve) => setTimeout(resolve, 2500));
       let fresh: Notebook;
       try {
@@ -952,13 +1273,32 @@ export default function App() {
       } catch {
         break;
       }
-      setNotebook((current) => (current?.id === notebookId ? fresh : current));
-      const source = fresh.sources.find((item) => item.id === sourceId);
-      if (!source || source.status === "indexed" || source.status === "failed") {
-        if (source?.status === "failed") {
-          setError("That source could not be indexed. Try again, or paste the text/transcript directly.");
+      setNotebook((current) => {
+        if (current?.id !== notebookId) return current;
+        if (!deletingSourceIdsRef.current.size) return fresh;
+        const sources = fresh.sources.filter((source) => !deletingSourceIdsRef.current.has(source.id));
+        return {
+          ...fresh,
+          sources,
+          source_count: sources.length,
+          active_source_count: sources.filter((source) => source.active).length,
+        };
+      });
+      let indexedAny = false;
+      for (const sourceId of Array.from(pendingSourceIds)) {
+        const source = fresh.sources.find((item) => item.id === sourceId);
+        if (!source || source.status === "indexed" || source.status === "failed") {
+          pendingSourceIds.delete(sourceId);
+          if (source?.status === "failed") {
+            setError(sourceIds.length > 1
+              ? "One source could not be indexed. Try again, or paste the text/transcript directly."
+              : "That source could not be indexed. Try again, or paste the text/transcript directly.");
+          }
+          if (source?.status === "indexed") indexedAny = true;
         }
-        if (source?.status === "indexed") {
+      }
+      if (!pendingSourceIds.size) {
+        if (indexedAny) {
           // The server auto-names the notebook just after indexing finishes; poll a few
           // more times so the AI-suggested title appears without a manual refresh.
           for (let attempt = 0; attempt < 5 && isDefaultNotebookTitle(fresh.title); attempt += 1) {
@@ -975,6 +1315,10 @@ export default function App() {
         break;
       }
     }
+  }
+
+  async function pollSourceUntilReady(sourceId: string, notebookId: string) {
+    await pollSourcesUntilReady([sourceId], notebookId);
   }
 
   async function loadSourceBlocks(sourceId: string) {
@@ -995,9 +1339,10 @@ export default function App() {
         body: JSON.stringify({ reset: true }),
       });
       setNotebook(seeded.notebook);
+      rememberNotebookId(seeded.notebook.id);
       setActiveSourceId(seeded.notebook.sources[0]?.id || "");
       setSelectedArtifactId(seeded.notebook.artifacts[0]?.id || "");
-      setToast("Demo notebook rebuilt.");
+      setToast("Notebook rebuilt.");
       refreshDebugSilently();
     } catch (seedError) {
       setError(messageFromError(seedError));
@@ -1047,6 +1392,10 @@ export default function App() {
   async function handleSourceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!notebook) return;
+    if (sourceFileQueue.length) {
+      await uploadQueuedSourceFiles();
+      return;
+    }
     if (!isSourceReady) {
       const notice = sourceNeedsUrl(sourceForm.type)
         ? `Add a ${sourceTypeLabel(sourceForm.type)} URL or paste fallback text first.`
@@ -1054,6 +1403,7 @@ export default function App() {
           ? `Choose a ${sourceTypeLabel(sourceForm.type)} file or paste extracted text first.`
           : "Paste source text or choose a file first.";
       setSourceFormNotice(notice);
+      setSourceFormNoticeTone("error");
       sourceBodyRef.current?.focus();
       return;
     }
@@ -1066,6 +1416,7 @@ export default function App() {
     setIsAddingSource(true);
     setError("");
     setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
     try {
       const response = await api<{ source: Source }>(`/api/notebooks/${notebook.id}/sources`, {
         method: "POST",
@@ -1096,55 +1447,259 @@ export default function App() {
       setSourceFormNotice(
         messageFromError(sourceError) || "Could not add this source. Check the link or file and try again.",
       );
+      setSourceFormNoticeTone("error");
     } finally {
       setIsAddingSource(false);
     }
   }
 
-  async function processFile(file: File) {
-    const base64 = await fileToBase64(file);
-    const text = file.type.includes("text") || file.name.endsWith(".md") ? await file.text() : "";
-    setSourceFormNotice("");
+  function queueSourceFiles(files: File[]) {
+    if (!files.length) return false;
+    const accepted = files.filter((file) => file.size <= MAX_SOURCE_UPLOAD_BYTES);
+    const rejected = files.length - accepted.length;
+    if (!accepted.length) {
+      setSourceFormNotice(`Uploaded files can be up to ${SOURCE_UPLOAD_LIMIT_LABEL}.`);
+      setSourceFormNoticeTone("error");
+      return false;
+    }
+    setSourceFileQueue((current) => {
+      const existing = new Set(current.map((item) => sourceFileFingerprint(item.file)));
+      const additions = accepted
+        .filter((file) => !existing.has(sourceFileFingerprint(file)))
+        .map((file) => queuedSourceFile(file));
+      return [...current, ...additions];
+    });
+    const first = accepted[0];
     setSourceForm((current) => ({
       ...current,
-      type: sourceTypeFromFile(file),
-      title: current.title || file.name.replace(/\.[^.]+$/, ""),
-      file_name: file.name,
-      mime_type: file.type || "application/octet-stream",
-      base64,
-      body: text || current.body,
+      type: sourceTypeFromFile(first),
+      title: "",
+      file_name: first.name,
+      mime_type: first.type || "application/octet-stream",
+      base64: undefined,
+      body: "",
     }));
+    setSourceFormNotice(
+      rejected
+        ? `${rejected} file${rejected === 1 ? "" : "s"} skipped because uploads are limited to ${SOURCE_UPLOAD_LIMIT_LABEL} each.`
+        : `${accepted.length} file${accepted.length === 1 ? "" : "s"} ready to add.`,
+    );
+    setSourceFormNoticeTone(rejected ? "warning" : "success");
+    return true;
+  }
+
+  async function uploadQueuedSourceFiles() {
+    if (!notebook || !sourceFileQueue.length) return;
+    const notebookId = notebook.id;
+    const queue = sourceFileQueue.filter((item) => item.status !== "added");
+    if (!queue.length) {
+      setSourceFileQueue([]);
+      setSourceForm(emptySourceForm);
+      setIsAddSourceOpen(false);
+      return;
+    }
+    const queuedIds = new Set(queue.map((item) => item.id));
+    setIsAddingSource(true);
+    setError("");
+    setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
+    try {
+      setSourceFileQueue((current) => current.map((queued) =>
+        queuedIds.has(queued.id)
+          ? {
+              ...queued,
+              status: "adding",
+              error: "",
+              progress: 8,
+              progressLabel: "Queued",
+              progressDetail: "Waiting for upload slot",
+            }
+          : queued,
+      ));
+      const results = await mapWithConcurrency(queue, SOURCE_UPLOAD_PARALLELISM, async (item) => {
+        let lastUploadPercent = 0;
+        const updateQueuedFile = (patch: Partial<QueuedSourceFile>) => {
+          setSourceFileQueue((current) => current.map((queued) =>
+            queued.id === item.id ? { ...queued, ...patch } : queued,
+          ));
+        };
+        try {
+          const [base64, body] = await Promise.all([
+            fileToBase64(item.file, (readProgress) => {
+              const progress = 2 + Math.round(readProgress * 24);
+              updateQueuedFile({
+                progress,
+                progressLabel: "Reading file",
+                progressDetail: `${progress}% prepared`,
+              });
+            }),
+            isTextLikeFile(item.file) ? item.file.text() : Promise.resolve(""),
+          ]);
+          updateQueuedFile({
+            progress: 28,
+            progressLabel: "Uploading file",
+            progressDetail: `Starting transfer · ${formatFileSize(item.size)}`,
+          });
+          const response = await apiWithUploadProgress<{ source: Source }>(
+            `/api/notebooks/${notebookId}/sources`,
+            {
+              type: item.type,
+              title: sourceFileQueue.length === 1 ? sourceForm.title.trim() || item.title : item.title,
+              body,
+              file_name: item.file_name,
+              mime_type: item.mime_type,
+              base64,
+              active: true,
+              crawl: false,
+              defer_indexing: true,
+            },
+            (uploadProgress) => {
+              const transferRatio = uploadProgress.total ? uploadProgress.loaded / uploadProgress.total : uploadProgress.percent ?? 0;
+              const progress = Math.min(96, 28 + Math.round(transferRatio * 68));
+              if (progress <= lastUploadPercent) return;
+              lastUploadPercent = progress;
+              updateQueuedFile({
+                progress,
+                progressLabel: "Uploading file",
+                progressDetail: uploadProgress.total
+                  ? `${formatFileSize(uploadProgress.loaded)} / ${formatFileSize(uploadProgress.total)} transferred`
+                  : `${progress}% transferred`,
+              });
+            },
+          );
+          updateQueuedFile({
+            status: "added",
+            sourceId: response.source.id,
+            progress: 100,
+            progressLabel: "Upload accepted",
+            progressDetail: "Indexing continues in Sources",
+          });
+          return { itemId: item.id, source: response.source, sourceId: response.source.id, ok: true as const };
+        } catch (uploadError) {
+          updateQueuedFile({
+            status: "failed",
+            error: messageFromError(uploadError),
+            progress: 100,
+            progressLabel: "Failed",
+            progressDetail: messageFromError(uploadError),
+          });
+          return { itemId: item.id, error: messageFromError(uploadError), ok: false as const };
+        }
+      });
+      const addedSources = results.filter((result): result is Extract<typeof result, { ok: true }> => result.ok);
+      const failed = results.length - addedSources.length;
+      const sourceIds = addedSources.map((result) => result.sourceId);
+      const acceptedSources = addedSources.map((result) => result.source);
+      const lastSourceId = sourceIds[sourceIds.length - 1] || "";
+      if (lastSourceId) setActiveSourceId(lastSourceId);
+      if (!failed) {
+        setNotebook((current) => {
+          if (!current || current.id !== notebookId) return current;
+          const existingIds = new Set(current.sources.map((source) => source.id));
+          const mergedSources = [
+            ...acceptedSources.filter((source) => !existingIds.has(source.id)),
+            ...current.sources,
+          ];
+          return {
+            ...current,
+            sources: mergedSources,
+            source_count: mergedSources.length,
+            active_source_count: mergedSources.filter((source) => source.active).length,
+          };
+        });
+        setSourceFileQueue([]);
+        setSourceForm(emptySourceForm);
+        setIsAddSourceOpen(false);
+        setMobilePanel("sources");
+        setToast(`${addedSources.length} file${addedSources.length === 1 ? "" : "s"} uploaded. Indexing continues in Sources.`);
+        void refreshNotebook(notebookId);
+        refreshDebugSilently();
+        if (sourceIds.length) void pollSourcesUntilReady(sourceIds, notebookId);
+      } else {
+        if (sourceIds.length) {
+          void refreshNotebook(notebookId);
+          void pollSourcesUntilReady(sourceIds, notebookId);
+        }
+        setSourceFormNotice(`${failed} of ${queue.length} file${queue.length === 1 ? "" : "s"} could not be added. Fix or remove them and try again.`);
+        setSourceFormNoticeTone("error");
+        if (addedSources.length) setToast(`${addedSources.length} source${addedSources.length === 1 ? "" : "s"} added; ${failed} failed.`);
+      }
+    } finally {
+      setIsAddingSource(false);
+    }
+  }
+
+  function clearSourceFileQueue() {
+    if (isAddingSource) return;
+    setSourceFileQueue([]);
+    setSourceForm((current) => ({ ...current, file_name: "", mime_type: "", base64: undefined }));
+    setSourceFormNotice("");
+    setSourceFormNoticeTone("error");
   }
 
   async function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) await processFile(file);
+    const files = Array.from(event.target.files || []);
+    if (files.length) queueSourceFiles(files);
+    event.target.value = "";
   }
 
   async function handleDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     setIsDragging(false);
-    const file = event.dataTransfer?.files?.[0];
-    if (file) await processFile(file);
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length) queueSourceFiles(files);
   }
 
   async function toggleSource(source: Source) {
+    const previousNotebook = notebook;
+    if (!previousNotebook) return;
+    const currentSource = previousNotebook.sources.find((item) => item.id === source.id) || source;
+    const nextActive = !currentSource.active;
     setError("");
-    await api(`/api/sources/${source.id}/active`, {
-      method: "PATCH",
-      body: JSON.stringify({ active: !source.active }),
-    });
-    await refreshNotebook();
-    refreshDebugSilently();
+    trackPendingSourceActiveState([source.id], nextActive);
+    applySourceActiveState([source.id], nextActive);
+    try {
+      await api(`/api/sources/${source.id}/active`, {
+        method: "PATCH",
+        body: JSON.stringify({ active: nextActive }),
+      });
+      clearPendingSourceActiveState([source.id], nextActive);
+      await refreshNotebookAfterSourceToggle(previousNotebook.id);
+      refreshDebugSilently();
+    } catch (toggleError) {
+      clearPendingSourceActiveState([source.id], nextActive);
+      setNotebook((current) => (current?.id === previousNotebook.id ? previousNotebook : current));
+      setError(messageFromError(toggleError));
+    }
   }
 
   async function deleteSource(source: Source) {
     setError("");
-    await api(`/api/sources/${source.id}`, { method: "DELETE" });
-    if (activeSourceId === source.id) setActiveSourceId("");
-    await refreshNotebook();
-    setToast("Source removed from notebook and indexes.");
-    refreshDebugSilently();
+    const previousNotebook = notebook;
+    if (!previousNotebook) return;
+    const remainingSources = previousNotebook.sources.filter((item) => item.id !== source.id);
+    const nextActiveSourceId = remainingSources[0]?.id || "";
+    deletingSourceIdsRef.current.add(source.id);
+    setNotebook({
+      ...previousNotebook,
+      sources: remainingSources,
+      source_count: remainingSources.length,
+      active_source_count: remainingSources.filter((item) => item.active).length,
+    });
+    setActiveSourceId((current) => (current === source.id ? nextActiveSourceId : current));
+    setToast("Removing source…");
+    try {
+      await api(`/api/sources/${source.id}`, { method: "DELETE" });
+      setToast("Source removed from notebook and indexes.");
+      void refreshNotebook(previousNotebook.id).catch(() => undefined);
+      refreshDebugSilently();
+    } catch (deleteError) {
+      setNotebook((current) => (current?.id === previousNotebook.id ? previousNotebook : current));
+      setActiveSourceId((current) => current || source.id);
+      setError(messageFromError(deleteError));
+    } finally {
+      deletingSourceIdsRef.current.delete(source.id);
+    }
   }
 
   async function askQuestion(input = question) {
@@ -1192,11 +1747,15 @@ export default function App() {
     }
   }
 
-  async function createArtifact(type: ArtifactType) {
+  async function createArtifact(type: ArtifactType, overrideOptions: Record<string, unknown> = {}) {
     if (!notebook) return;
     if (creatingTypes.has(type)) return;
+    const artifactLabel =
+      type === "report" && typeof overrideOptions.report_type === "string"
+        ? overrideOptions.report_type
+        : artifactTitle(type);
     setCreatingTypes((current) => new Set(current).add(type));
-    setToast(`Generating ${artifactTitle(type)}…`);
+    setToast(`Generating ${artifactLabel}…`);
     setError("");
     try {
       const start = await api<{ job: ArtifactJob }>("/api/artifacts", {
@@ -1213,29 +1772,39 @@ export default function App() {
               }
             : type === "flashcards"
               ? flashcardArtifactOptions(flashcardOptions)
-              : type === "thumbnail"
-                ? { prompt: thumbnailPrompt.trim(), reference_images: thumbnailRefs }
-                : {},
+            : type === "thumbnail"
+              ? { prompt: thumbnailPrompt.trim(), reference_images: thumbnailRefs }
+              : type === "youtube-kit"
+                ? { language: "English", ...overrideOptions }
+                : overrideOptions,
         }),
       });
       // The artifact is generated in the background; poll the job until it finishes.
       // Long outputs (audio/video, 60-120s) would otherwise exceed Firebase Hosting's
       // ~60s rewrite-proxy timeout. Each poll is a fast request, so it stays well under.
       let job = start.job;
-      const deadline = Date.now() + 5 * 60 * 1000;
+      const deadline = Date.now() + artifactPollDeadlineMs(type);
       while (job && (job.status === "queued" || job.status === "running") && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
         const poll = await api<{ job: ArtifactJob }>(`/api/jobs/${job.id}`);
         job = poll.job;
+        if (job?.status === "running" && job.progress > 0) {
+          setToast(`Generating ${artifactLabel}… ${job.progress}%`);
+        }
       }
       if (!job || job.status !== "completed" || !job.result_artifact_id) {
-        throw new Error(job?.error || "Generation timed out. Please try again.");
+        if (job && (job.status === "queued" || job.status === "running")) {
+          setToast(`${artifactLabel} is still generating in the background. Open Activity for status.`);
+          refreshDebugSilently();
+          return;
+        }
+        throw new Error(job?.error || "Generation failed. Please try again.");
       }
       await refreshNotebook();
       // Don't hijack the view: only auto-open the result if nothing else is open,
       // so concurrent generations finishing don't yank you between results.
       setSelectedArtifactId((current) => current || job.result_artifact_id);
-      setToast(`${artifactTitle(type)} ready.`);
+      setToast(`${artifactLabel} ready.`);
       refreshDebugSilently();
     } catch (artifactError) {
       setError(messageFromError(artifactError));
@@ -1246,6 +1815,39 @@ export default function App() {
         return next;
       });
     }
+  }
+
+  function closeReportFormatModal() {
+    setCustomizeType("");
+    setIsCustomReportPromptOpen(false);
+  }
+
+  function handleReportFormat(format: ReportFormatOption) {
+    if (creatingTypes.has("report")) return;
+    if (format.kind === "custom") {
+      setIsCustomReportPromptOpen(true);
+      return;
+    }
+    closeReportFormatModal();
+    void createArtifact("report", reportArtifactOptions(format));
+  }
+
+  function handleCustomReportGenerate() {
+    if (creatingTypes.has("report")) return;
+    const customFormat = baseReportFormatOptions[0];
+    closeReportFormatModal();
+    void createArtifact("report", reportArtifactOptions(customFormat, customReportPrompt));
+  }
+
+  function handleStudioArtifact(artifact: StudioArtifactTool) {
+    if (artifact.type === "audio" || artifact.type === "flashcards" || artifact.type === "thumbnail" || artifact.type === "report") {
+      if (artifact.type === "report") {
+        setIsCustomReportPromptOpen(false);
+      }
+      setCustomizeType(artifact.type);
+      return;
+    }
+    void createArtifact(artifact.type);
   }
 
   function toggleArtifactAudio(artifact: Artifact) {
@@ -1265,6 +1867,61 @@ export default function App() {
       });
   }
 
+  async function deleteArtifactOutput(artifact: Artifact) {
+    if (!notebook || deletingArtifactIds.has(artifact.id)) return;
+    const previousNotebook = notebook;
+    const wasSelected = selectedArtifactId === artifact.id;
+    setDeletingArtifactIds((current) => new Set(current).add(artifact.id));
+    if (playingArtifactId === artifact.id) {
+      inlineAudioRef.current?.pause();
+      setPlayingArtifactId("");
+    }
+    if (wasSelected) closeArtifactDetail();
+    setNotebook({
+      ...previousNotebook,
+      artifacts: previousNotebook.artifacts.filter((item) => item.id !== artifact.id),
+    });
+    if (wasSelected) setSelectedArtifactId("");
+    try {
+      await api(`/api/artifacts/${artifact.id}`, { method: "DELETE" });
+      setToast("Output deleted.");
+      refreshDebugSilently();
+    } catch (deleteError) {
+      setNotebook((current) => (current?.id === previousNotebook.id ? previousNotebook : current));
+      if (wasSelected) setSelectedArtifactId(artifact.id);
+      setError(messageFromError(deleteError));
+    } finally {
+      setDeletingArtifactIds((current) => {
+        const next = new Set(current);
+        next.delete(artifact.id);
+        return next;
+      });
+    }
+  }
+
+  async function deleteAllArtifactOutputs() {
+    if (!notebook || !notebook.artifacts.length || isDeletingAllArtifacts) return;
+    const confirmed = window.confirm(`Delete all ${notebook.artifacts.length} outputs from this notebook? Sources and chat will stay.`);
+    if (!confirmed) return;
+    const previousNotebook = notebook;
+    inlineAudioRef.current?.pause();
+    setPlayingArtifactId("");
+    setIsDeletingAllArtifacts(true);
+    closeArtifactDetail();
+    setSelectedArtifactId("");
+    setNotebook({ ...previousNotebook, artifacts: [], jobs: [] });
+    try {
+      const result = await api<{ deleted?: number }>(`/api/notebooks/${previousNotebook.id}/artifacts`, { method: "DELETE" });
+      setToast(`${result.deleted ?? previousNotebook.artifacts.length} outputs deleted.`);
+      refreshDebugSilently();
+    } catch (deleteError) {
+      setNotebook((current) => (current?.id === previousNotebook.id ? previousNotebook : current));
+      setError(messageFromError(deleteError));
+    } finally {
+      setIsDeletingAllArtifacts(false);
+    }
+  }
+
   function focusCitation(citation: Citation) {
     const sourceId = citation.source_id || citation.sourceId || "";
     setActiveSourceId(sourceId);
@@ -1282,11 +1939,6 @@ export default function App() {
   function openHome() {
     setShowLanding(true);
     window.history.replaceState(null, "", window.location.pathname);
-  }
-
-  function startNoteSource() {
-    setMobilePanel("sources");
-    openAddSource("note");
   }
 
   function saveOverviewToNote() {
@@ -1371,16 +2023,85 @@ export default function App() {
     setToast("Notebook export downloaded as JSON.");
   }
 
+  function buildShareMarkdown() {
+    if (!notebook) return "";
+    const activeSources = notebook.sources.filter((source) => source.active);
+    const latestAssistant = [...visibleMessages].reverse().find((message) => message.role === "assistant");
+    const provider = [
+      providerStatus?.active_grounded_answer_provider || "local",
+      providerStatus?.grounded_answer_model || "local-grounded-v1",
+    ].filter(Boolean).join(" · ");
+    const sourceLines = activeSources.slice(0, 16).map((source, index) => {
+      const meta = [
+        sourceTypeLabel(source.type),
+        source.word_count ? `${source.word_count} words` : "",
+        source.original_url || "",
+      ].filter(Boolean).join(" · ");
+      return `${index + 1}. ${source.title}${meta ? ` (${meta})` : ""}`;
+    });
+    const artifactLines = notebook.artifacts.slice(0, 16).map((artifact, index) => {
+      const meta = [
+        artifactTitle(artifact.type),
+        artifact.created_at ? formatArtifactTimestamp(artifact.created_at) : "",
+      ].filter(Boolean).join(" · ");
+      return `${index + 1}. ${artifact.title}${meta ? ` (${meta})` : ""}`;
+    });
+
+    const lines = [
+      `# ${notebook.title || "Untitled notebook"}`,
+      "",
+      notebook.summary ? `> ${notebook.summary}` : "",
+      "",
+      "## Notebook",
+      `- Active sources: ${activeSources.length} / ${notebook.sources.length}`,
+      `- Studio outputs: ${notebook.artifacts.length}`,
+      `- Grounded answer provider: ${provider}`,
+      `- Exported: ${new Date().toISOString()}`,
+      "",
+      "## Sources",
+      sourceLines.length ? sourceLines.join("\n") : "No active sources.",
+      activeSources.length > sourceLines.length ? `...and ${activeSources.length - sourceLines.length} more active sources.` : "",
+      "",
+      "## Latest grounded answer",
+      latestAssistant ? clipReportText(latestAssistant.content, 4500) : "No grounded answer yet.",
+      "",
+      "## Studio outputs",
+      artifactLines.length ? artifactLines.join("\n") : "No Studio outputs yet.",
+    ];
+    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  async function copyShareBrief() {
+    if (!notebook) return;
+    try {
+      await copyTextToClipboard(buildShareMarkdown());
+      setIsShareOpen(false);
+      setToast("Share brief copied.");
+    } catch (copyError) {
+      setError(messageFromError(copyError));
+    }
+  }
+
+  function downloadShareBrief() {
+    if (!notebook) return;
+    downloadText(`${downloadSlug(notebook.title)}-evidence-brief.md`, buildShareMarkdown(), "text/markdown");
+    setIsShareOpen(false);
+    setToast("Share brief downloaded as Markdown.");
+  }
+
   const sourceCount = notebook?.sources.length || 0;
   const activeCount = notebook?.active_source_count || 0;
   const activeProviderLabel = providerLabel(providerStatus);
   const runningDebugJobs = debugStatus?.debug.running_jobs.length || notebook?.jobs.filter((job) => ["queued", "running"].includes(job.status)).length || 0;
   const isWorking = isBooting || isAddingSource || isAsking || creatingTypes.size > 0 || runningDebugJobs > 0;
+  const workspaceStyle = {
+    "--workspace-source-width": `${workspaceLayout.sources}px`,
+    "--workspace-studio-width": `${workspaceLayout.studio}px`,
+  } as CSSProperties;
 
   if (showLanding) {
     return (
       <LandingPage
-        activeCount={activeCount}
         sourceCount={sourceCount}
         providerLabel={activeProviderLabel}
         isBooting={isBooting}
@@ -1411,7 +2132,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-cluster">
-          <button className="title-button brand-menu" type="button" onClick={() => setMobilePanel("sources")} aria-label="Open sources">
+          <button className="title-button brand-menu" type="button" onClick={openSourcesPanel} aria-label="Open sources">
             <PanelLeft size={18} />
           </button>
           <button className="brand-mark" type="button" onClick={openHome} aria-label={`${BRAND_EYEBROW} home`} title="Home">
@@ -1487,9 +2208,9 @@ export default function App() {
                       </button>
                     ))}
                     <div className="menu-divider" />
-                    <button type="button" className="menu-item" onClick={() => void createNotebook()}>
-                      <Plus size={15} />
-                      <span>Create notebook</span>
+                    <button type="button" className="menu-item" onClick={() => void createNotebook()} disabled={isCreatingNotebook}>
+                      {isCreatingNotebook ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+                      <span>{isCreatingNotebook ? "Creating…" : "Create notebook"}</span>
                     </button>
                   </Menu>
                 ) : null}
@@ -1499,11 +2220,11 @@ export default function App() {
         </div>
 
         <div className="topbar-actions">
-          <button className="ghost-button create-notebook" type="button" onClick={() => void createNotebook()}>
-            <Plus size={15} />
-            Create notebook
+          <button className="ghost-button create-notebook" type="button" onClick={() => void createNotebook()} disabled={isCreatingNotebook} aria-busy={isCreatingNotebook}>
+            {isCreatingNotebook ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+            {isCreatingNotebook ? "Creating…" : "Create notebook"}
           </button>
-          <button className="primary-button" type="button" onClick={exportNotebook}>
+          <button className="primary-button" type="button" onClick={() => setIsShareOpen(true)} disabled={!notebook}>
             <Share2 size={15} />
             Share
           </button>
@@ -1596,8 +2317,20 @@ export default function App() {
         </div>
       ) : null}
 
-      <main className="workspace" data-active-panel={mobilePanel}>
-        <section className="panel source-panel" aria-label="Sources panel">
+      <main
+        ref={workspaceRef}
+        className="workspace"
+        data-active-panel={mobilePanel}
+        data-resizing={workspaceResizeTarget || undefined}
+        style={workspaceStyle}
+      >
+        <section
+          ref={sourcePanelRef}
+          className="panel source-panel"
+          aria-label="Sources panel"
+          tabIndex={-1}
+          data-focus-pulse={sourcePanelFocusTick > 0}
+        >
           <PanelHeader icon={<Library size={18} />} title="Sources" count={sourceCount} />
 
           <div className="source-add">
@@ -1619,8 +2352,9 @@ export default function App() {
                 className="select-all-button"
                 onClick={() => void setAllSourcesActive(activeCount !== sourceCount)}
                 aria-pressed={activeCount === sourceCount}
+                aria-label={activeCount === sourceCount ? "Deselect all sources" : "Select all sources"}
               >
-                Select all
+                {activeCount === sourceCount ? "Deselect all" : "Select all"}
                 <span className="source-check" data-selected={activeCount === sourceCount} aria-hidden="true">
                   {activeCount === sourceCount ? <CheckCircle2 size={18} /> : <Circle size={18} />}
                 </span>
@@ -1637,37 +2371,58 @@ export default function App() {
                 <span>Add a document, note, or website to start grounding answers.</span>
               </div>
             ) : null}
-            {notebook?.sources.map((source) => (
-              <article
-                key={source.id}
-                className="source-card"
-                data-active={source.id === activeSourceId}
-                data-selected={source.active}
-              >
-                <button
-                  type="button"
-                  className="source-check"
+            {notebook?.sources.map((source) => {
+              const progress = sourceProgressInfo(source);
+              return (
+                <article
+                  key={source.id}
+                  className="source-card"
+                  data-active={source.id === activeSourceId}
                   data-selected={source.active}
-                  onClick={() => void toggleSource(source)}
-                  aria-label={source.active ? "Deselect source" : "Select source"}
-                  aria-pressed={source.active}
+                  data-status={source.status}
+                  data-working={Boolean(progress)}
                 >
-                  {source.active ? <CheckCircle2 size={18} /> : <Circle size={18} />}
-                </button>
-                <button className="source-card-main" type="button" onClick={() => setActiveSourceId(source.id)}>
-                  <span className="source-icon" data-type={source.type}>{sourceIcon(source.type)}</span>
-                  <span>
-                    <strong>{source.title}</strong>
-                    <small>{sourceStatusLine(source)}</small>
-                  </span>
-                </button>
-                <button className="icon-button subtle source-delete" type="button" onClick={() => void deleteSource(source)} aria-label="Delete source">
-                  <Trash2 size={15} />
-                </button>
-              </article>
-            ))}
+                  <button
+                    type="button"
+                    className="source-check"
+                    data-selected={source.active}
+                    onClick={() => void toggleSource(source)}
+                    aria-label={source.active ? "Deselect source" : "Select source"}
+                    aria-pressed={source.active}
+                  >
+                    {source.active ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+                  </button>
+                  <button className="source-card-main" type="button" onClick={() => setActiveSourceId(source.id)}>
+                    <span className="source-icon" data-type={source.type}>{sourceIcon(source.type)}</span>
+                    <span>
+                      <strong>{source.title}</strong>
+                      <small>{sourceStatusLine(source)}</small>
+                      {progress ? (
+                        <span className="source-progress" aria-label={`${progress.label}: ${progress.percent}%`}>
+                          <span className="source-progress-track" aria-hidden="true">
+                            <span className="source-progress-fill" style={{ width: `${progress.percent}%` }} />
+                          </span>
+                          <span className="source-progress-detail">{progress.detail}</span>
+                        </span>
+                      ) : null}
+                    </span>
+                  </button>
+                  <button className="icon-button subtle source-delete" type="button" onClick={() => void deleteSource(source)} aria-label="Delete source">
+                    <Trash2 size={15} />
+                  </button>
+                </article>
+              );
+            })}
           </div>
         </section>
+
+        <WorkspaceResizeHandle
+          target="sources"
+          active={workspaceResizeTarget === "sources"}
+          onPointerDown={(event) => startWorkspaceResize("sources", event)}
+          onKeyDown={(event) => handleWorkspaceResizeKey("sources", event)}
+          onReset={resetWorkspaceLayout}
+        />
 
         <section className="panel chat-panel" aria-label="Chat panel">
           <div className="chat-toolbar">
@@ -1688,10 +2443,6 @@ export default function App() {
               </button>
             ))}
               </div>
-              <button className="ghost-button compact grounding-button" type="button" onClick={() => setIsGroundingDetailOpen(true)}>
-                <ShieldCheck size={15} />
-                Grounding
-              </button>
             </div>
           </div>
 
@@ -1754,8 +2505,99 @@ export default function App() {
           </p>
         </section>
 
+        <WorkspaceResizeHandle
+          target="studio"
+          active={workspaceResizeTarget === "studio"}
+          onPointerDown={(event) => startWorkspaceResize("studio", event)}
+          onKeyDown={(event) => handleWorkspaceResizeKey("studio", event)}
+          onReset={resetWorkspaceLayout}
+        />
+
         <section className="panel studio-panel" aria-label="Studio panel">
           <PanelHeader icon={<Sparkles size={18} />} title="Studio" count={notebook?.artifacts.length || 0} />
+
+          {customizeType === "report" ? (
+          <div className="modal-backdrop report-format-backdrop" role="presentation" onClick={closeReportFormatModal}>
+          <section className="modal report-format-modal" role="dialog" aria-modal="true" aria-label="Create report" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-header report-format-header">
+            <div>
+              <h2><ClipboardList size={21} /> Create report</h2>
+            </div>
+            <button className="icon-button subtle report-format-close" type="button" onClick={closeReportFormatModal} aria-label="Close report formats">
+              <X size={24} />
+            </button>
+          </div>
+          <section className="report-format-body" aria-label="Report formats">
+            <div className="report-format-section">
+              <h3>Format</h3>
+              <div className="report-format-grid">
+                {baseReportFormatOptions.map((format) => (
+                  <button
+                    key={format.id}
+                    type="button"
+                    className="report-format-card"
+                    data-kind={format.kind}
+                    data-selected={format.kind === "custom" && isCustomReportPromptOpen}
+                    onClick={() => handleReportFormat(format)}
+                    disabled={creatingTypes.has("report")}
+                  >
+                    {format.kind !== "custom" ? (
+                      <span className="report-format-edit" aria-hidden="true"><Pencil size={18} /></span>
+                    ) : null}
+                    <strong>{format.title}</strong>
+                    <span>{format.description}</span>
+                  </button>
+                ))}
+              </div>
+              {isCustomReportPromptOpen ? (
+                <div className="report-custom-panel">
+                  <label>
+                    <span>Describe the report</span>
+                    <textarea
+                      value={customReportPrompt}
+                      onChange={(event) => setCustomReportPrompt(event.target.value)}
+                      placeholder="Structure, audience, tone, sections, or angle"
+                      rows={3}
+                      autoFocus
+                    />
+                  </label>
+                  <div className="report-custom-actions">
+                    <button className="secondary-button" type="button" onClick={() => setIsCustomReportPromptOpen(false)}>Back</button>
+                    <button className="primary-button" type="button" onClick={handleCustomReportGenerate} disabled={creatingTypes.has("report")}>
+                      {creatingTypes.has("report") ? <Loader2 className="spin" size={15} /> : <Sparkles size={15} />}
+                      Generate
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="report-format-section">
+              <div className="report-suggested-heading">
+                <Sparkles size={22} />
+                <h3>Suggested Format</h3>
+              </div>
+              <div className="report-format-grid">
+                {suggestedReportFormats.map((format) => (
+                  <button
+                    key={format.id}
+                    type="button"
+                    className="report-format-card"
+                    data-kind={format.kind}
+                    onClick={() => handleReportFormat(format)}
+                    disabled={creatingTypes.has("report")}
+                  >
+                    <span className="report-format-edit" aria-hidden="true"><Pencil size={18} /></span>
+                    <strong>{format.title}</strong>
+                    <span>{format.description}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
+          </section>
+          </div>
+          ) : null}
 
           {customizeType === "audio" ? (
           <div className="modal-backdrop" role="presentation" onClick={() => setCustomizeType("")}>
@@ -2026,20 +2868,48 @@ export default function App() {
           </div>
           ) : null}
 
+          <section className="youtube-studio-section" aria-label="YouTube Studio">
+            <div className="youtube-studio-header">
+              <span className="youtube-studio-badge">
+                <Youtube size={14} />
+                YouTube Studio
+              </span>
+            </div>
+            <div className="youtube-studio-grid">
+              {youtubeStudioTypes.map((artifact) => (
+                <button
+                  key={artifact.type}
+                  className="studio-tile youtube-studio-tile"
+                  data-kind={artifact.type}
+                  type="button"
+                  onClick={() => handleStudioArtifact(artifact)}
+                  disabled={creatingTypes.has(artifact.type)}
+                >
+                  <span className="studio-icon">{creatingTypes.has(artifact.type) ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
+                  <span>
+                    <strong>{artifact.title}</strong>
+                    <small>{artifact.action}</small>
+                  </span>
+                  <span className="studio-chevron">
+                    <ArrowRight size={14} />
+                  </span>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <div className="studio-section-label" aria-hidden="true">
+            <span>Notebook Studio</span>
+          </div>
+
           <div className="studio-grid">
-            {artifactTypes.map((artifact) => (
+            {coreStudioTypes.map((artifact) => (
               <button
                 key={artifact.type}
                 className="studio-tile"
                 data-kind={artifact.type}
                 type="button"
-                onClick={() => {
-                  if (artifact.type === "audio" || artifact.type === "flashcards" || artifact.type === "thumbnail") {
-                    setCustomizeType(artifact.type);
-                  } else {
-                    void createArtifact(artifact.type);
-                  }
-                }}
+                onClick={() => handleStudioArtifact(artifact)}
                 disabled={creatingTypes.has(artifact.type)}
               >
                 <span className="studio-icon">{creatingTypes.has(artifact.type) ? <Loader2 className="spin" size={18} /> : artifact.icon}</span>
@@ -2057,8 +2927,19 @@ export default function App() {
             <>
               <div className="studio-divider" />
               <div className="section-heading studio-list-heading">
-                <strong>Outputs</strong>
-                <span>{notebook.artifacts.length}</span>
+                <div className="studio-list-title">
+                  <strong>Outputs</strong>
+                  <span>{notebook.artifacts.length}</span>
+                </div>
+                <button
+                  type="button"
+                  className="output-clear-button"
+                  onClick={() => void deleteAllArtifactOutputs()}
+                  disabled={isDeletingAllArtifacts || !notebook.artifacts.length}
+                >
+                  {isDeletingAllArtifacts ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                  Clear all
+                </button>
               </div>
               <div className="artifact-list">
                 {notebook.artifacts.map((artifact) => (
@@ -2067,7 +2948,7 @@ export default function App() {
                     role="button"
                     tabIndex={0}
                     className="artifact-row"
-                    data-active={artifact.id === selectedArtifact?.id}
+                    data-active={artifact.id === selectedArtifactId}
                     data-kind={artifact.type}
                     onClick={() => {
                       setSelectedArtifactId(artifact.id);
@@ -2100,7 +2981,19 @@ export default function App() {
                           {playingArtifactId === artifact.id ? <PauseCircle size={20} /> : <PlayCircle size={20} />}
                         </button>
                       ) : null}
-                      <MoreVertical size={16} />
+                      <button
+                        type="button"
+                        className="artifact-delete"
+                        aria-label={`Delete output ${artifact.title}`}
+                        title="Delete output"
+                        disabled={deletingArtifactIds.has(artifact.id) || isDeletingAllArtifacts}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteArtifactOutput(artifact);
+                        }}
+                      >
+                        {deletingArtifactIds.has(artifact.id) ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                      </button>
                     </span>
                   </div>
                 ))}
@@ -2109,10 +3002,6 @@ export default function App() {
             </>
           ) : null}
 
-          <button className="add-note-button" type="button" onClick={startNoteSource}>
-            <NotebookPen size={16} />
-            Add note
-          </button>
         </section>
       </main>
 
@@ -2122,14 +3011,70 @@ export default function App() {
         <MobileTab panel="studio" active={mobilePanel} onChange={setMobilePanel} icon={<Sparkles size={17} />} label="Studio" />
       </nav>
 
+      {isShareOpen ? (
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsShareOpen(false)}>
+          <section className="modal share-modal" role="dialog" aria-modal="true" aria-label="Share notebook" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <p className="panel-eyebrow">Notebook packet</p>
+                <h2>Share notebook</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setIsShareOpen(false)} aria-label="Close share">
+                <XCircle size={17} />
+              </button>
+            </div>
+            <div className="share-panel">
+              <div className="share-summary">
+                <span className="share-summary-icon">
+                  <Share2 size={21} />
+                </span>
+                <div>
+                  <h3>{notebook?.title || "Untitled notebook"}</h3>
+                  <p>{notebook?.summary || "Source-grounded notebook packet with sources, latest answer, and Studio outputs."}</p>
+                </div>
+              </div>
+              <div className="share-stats" aria-label="Notebook share contents">
+                <span><Library size={14} /> {activeCount} active sources</span>
+                <span><Sparkles size={14} /> {notebook?.artifacts.length || 0} outputs</span>
+                <span><ShieldCheck size={14} /> Evidence brief</span>
+              </div>
+              <div className="share-action-grid">
+                <button className="share-action-card" type="button" onClick={() => void copyShareBrief()}>
+                  <span><Copy size={18} /></span>
+                  <strong>Copy brief</strong>
+                  <small>Markdown summary with sources and latest grounded answer</small>
+                </button>
+                <button className="share-action-card" type="button" onClick={downloadShareBrief}>
+                  <span><Download size={18} /></span>
+                  <strong>Download brief</strong>
+                  <small>Portable Evidence Pack for docs, email, or Slack</small>
+                </button>
+                <button
+                  className="share-action-card"
+                  type="button"
+                  onClick={() => {
+                    exportNotebook();
+                    setIsShareOpen(false);
+                  }}
+                >
+                  <span><Database size={18} /></span>
+                  <strong>Full archive</strong>
+                  <small>Complete notebook JSON for backup or handoff</small>
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {isAddSourceOpen ? (
-        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsAddSourceOpen(false)}>
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={closeAddSourceDialog}>
           <section className="modal add-source-modal" role="dialog" aria-modal="true" aria-label="Add sources" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <div>
                 <h2>Add sources</h2>
               </div>
-              <button className="icon-button subtle" type="button" onClick={() => setIsAddSourceOpen(false)} aria-label="Close add sources">
+              <button className="icon-button subtle" type="button" onClick={closeAddSourceDialog} aria-label="Close add sources" disabled={isAddingSource}>
                 <X size={18} />
               </button>
             </div>
@@ -2140,6 +3085,7 @@ export default function App() {
               <label
                 className="add-source-dropzone"
                 data-drag={isDragging}
+                data-has-queue={sourceFileQueue.length > 0}
                 onDragOver={(event) => {
                   event.preventDefault();
                   setIsDragging(true);
@@ -2148,98 +3094,162 @@ export default function App() {
                 onDrop={(event) => void handleDrop(event)}
               >
                 <UploadCloud size={30} />
-                <strong>Drop a file here, or click to upload</strong>
-                <p>PDF, Markdown, text, DOCX, images, audio — and more.</p>
-                {sourceForm.file_name ? (
+                <strong>Drop files here, or click to upload</strong>
+                <p>PDF, Markdown, text, DOCX, images, audio, video — up to {SOURCE_UPLOAD_LIMIT_LABEL} each.</p>
+                {sourceFileQueue.length ? (
+                  <div className="add-source-queue" aria-label="Files ready to add">
+                    {sourceFileQueue.map((item) => {
+                      const progress = queuedSourceFileProgress(item);
+                      return (
+                        <div className="add-source-file" data-status={item.status} key={item.id}>
+                          <span className="add-source-file-icon" aria-hidden="true">
+                            {item.status === "adding" ? <Loader2 className="spin" size={14} /> : item.status === "added" ? <CheckCircle2 size={14} /> : item.status === "failed" ? <X size={14} /> : sourceIcon(item.type)}
+                          </span>
+                          <span className="add-source-file-copy">
+                            <strong>{item.file_name}</strong>
+                            <small>{sourceTypeLabel(item.type)} · {formatFileSize(item.size)}{item.error ? ` · ${item.error}` : ""}</small>
+                            <span className="add-source-upload-progress" aria-label={`${progress.label}: ${progress.percent}%`}>
+                              <span className="add-source-upload-track" aria-hidden="true">
+                                <span className="add-source-upload-fill" style={{ width: `${progress.percent}%` }} />
+                              </span>
+                              <span className="add-source-upload-detail">{progress.detail}</span>
+                            </span>
+                          </span>
+                          <em>{progress.label}</em>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : sourceForm.file_name ? (
                   <span className="add-source-attached">
                     <CheckCircle2 size={14} /> {sourceForm.file_name}
                   </span>
                 ) : null}
-                <input type="file" accept={sourceFileAccept(sourceForm.type)} onChange={(event) => void handleFile(event)} />
+                <input type="file" multiple accept={sourceFileAccept(sourceForm.type)} onChange={(event) => void handleFile(event)} />
               </label>
 
-              <div className="add-source-or"><span>or</span></div>
-
-              <div className="add-source-types" role="tablist" aria-label="Source type">
-                {sourceTabs.map((tab) => (
-                  <button
-                    key={tab.type}
-                    type="button"
-                    role="tab"
-                    aria-selected={sourceForm.type === tab.type}
-                    onClick={() => {
-                      setSourceFormNotice("");
-                      setSourceForm((current) => ({ ...current, type: tab.type, file_name: "", base64: undefined }));
-                      window.requestAnimationFrame(() => sourceBodyRef.current?.focus());
-                    }}
-                  >
-                    {tab.icon}
-                    {tab.label}
+              {sourceFileQueue.length ? (
+                <div className="add-source-batch-row">
+                  <span>{sourceFileQueue.length} file{sourceFileQueue.length === 1 ? "" : "s"} queued as separate sources.</span>
+                  <button className="secondary-button" type="button" onClick={clearSourceFileQueue} disabled={isAddingSource}>
+                    Clear files
                   </button>
-                ))}
-              </div>
-
-              {sourceNeedsUrl(sourceForm.type) ? (
-                <label className="modal-field">
-                  <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
-                  <input
-                    value={sourceForm.original_url}
-                    onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        event.currentTarget.form?.requestSubmit();
-                      }
-                    }}
-                    placeholder={sourceUrlPlaceholder(sourceForm.type)}
-                    inputMode="url"
-                    autoFocus
-                  />
-                </label>
+                </div>
               ) : null}
 
-              {sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note" ? (
-                <label className="modal-field">
-                  <span>{sourceBodyLabel(sourceForm.type)}</span>
-                  <textarea
-                    ref={sourceBodyRef}
-                    value={sourceForm.body}
-                    onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                        event.preventDefault();
-                        event.currentTarget.form?.requestSubmit();
-                      }
-                    }}
-                    placeholder={sourceBodyPlaceholder(sourceForm.type)}
-                    aria-invalid={Boolean(sourceFormNotice)}
-                    rows={5}
-                  />
-                </label>
-              ) : null}
+              {!sourceFileQueue.length ? (
+                <>
+                  <div className="add-source-or"><span>or</span></div>
 
-              <label className="modal-field">
-                <span>Title (optional)</span>
-                <input
-                  value={sourceForm.title}
-                  onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
-                  placeholder="We infer one from the content"
-                />
-              </label>
+                  <div className="add-source-types" role="tablist" aria-label="Source type">
+                    {sourceTabs.map((tab) => (
+                      <button
+                        key={tab.type}
+                        type="button"
+                        role="tab"
+                        aria-selected={sourceForm.type === tab.type}
+                        onClick={() => {
+                          setSourceFormNotice("");
+                          setSourceFormNoticeTone("error");
+                          setSourceFileQueue([]);
+                          setSourceForm((current) => ({ ...current, type: tab.type, file_name: "", base64: undefined }));
+                          window.requestAnimationFrame(() => sourceBodyRef.current?.focus());
+                        }}
+                      >
+                        {tab.icon}
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
 
-              {sourceFormNotice ? <p className="source-form-help">{sourceFormNotice}</p> : null}
+                  {sourceNeedsUrl(sourceForm.type) ? (
+                    <label className="modal-field">
+                      <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
+                      <input
+                        value={sourceForm.original_url}
+                        onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            event.currentTarget.form?.requestSubmit();
+                          }
+                        }}
+                        placeholder={sourceUrlPlaceholder(sourceForm.type)}
+                        inputMode="url"
+                        autoFocus
+                      />
+                    </label>
+                  ) : null}
+
+                  {sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note" ? (
+                    <label className="modal-field">
+                      <span>{sourceBodyLabel(sourceForm.type)}</span>
+                      <textarea
+                        ref={sourceBodyRef}
+                        value={sourceForm.body}
+                        onChange={(event) => setSourceForm((current) => ({ ...current, body: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                            event.preventDefault();
+                            event.currentTarget.form?.requestSubmit();
+                          }
+                        }}
+                        placeholder={sourceBodyPlaceholder(sourceForm.type)}
+                        aria-invalid={Boolean(sourceFormNotice)}
+                        rows={5}
+                      />
+                    </label>
+                  ) : null}
+
+                  <label className="modal-field">
+                    <span>Title (optional)</span>
+                    <input
+                      value={sourceForm.title}
+                      onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
+                      placeholder="We infer one from the content"
+                    />
+                  </label>
+                </>
+              ) : (
+                <>
+                  <div className="add-source-batch-note">
+                    <strong>Batch upload</strong>
+                    <span>File type and title are inferred per file. Each item becomes its own source and indexes independently.</span>
+                  </div>
+                  {sourceFileQueue.length === 1 ? (
+                    <label className="modal-field">
+                      <span>Title (optional)</span>
+                      <input
+                        value={sourceForm.title}
+                        onChange={(event) => setSourceForm((current) => ({ ...current, title: event.target.value }))}
+                        placeholder="We infer one from the file name"
+                      />
+                    </label>
+                  ) : null}
+                </>
+              )}
+
+              {sourceFormNotice ? <p className="source-form-help" data-tone={sourceFormNoticeTone}>{sourceFormNotice}</p> : null}
               <div className="modal-actions">
                 <span style={{ marginRight: "auto", fontSize: "0.78rem", opacity: 0.55 }}>
                   {sourceNeedsUrl(sourceForm.type)
                     ? "Press Enter or click Add source"
+                    : sourceFileQueue.length
+                      ? `Click Add to create ${sourceFileQueue.length} source${sourceFileQueue.length === 1 ? "" : "s"}`
                     : sourceForm.type === "markdown" || sourceForm.type === "text" || sourceForm.type === "note"
                       ? "Press ⌘/Ctrl + Enter or click Add source"
                       : "Click Add source to finish"}
                 </span>
-                <button className="secondary-button" type="button" onClick={() => setIsAddSourceOpen(false)}>Cancel</button>
+                <button className="secondary-button" type="button" onClick={closeAddSourceDialog} disabled={isAddingSource}>Cancel</button>
                 <button className="primary-button" type="submit" disabled={isAddingSource}>
                   {isAddingSource ? <Loader2 className="spin" size={16} /> : <ArrowRight size={16} />}
-                  {isAddingSource ? "Adding…" : "Add & analyze"}
+                  {isAddingSource && sourceFileQueue.length
+                    ? `Adding ${sourceUploadDone}/${sourceFileQueue.length}…`
+                    : isAddingSource
+                      ? "Adding…"
+                      : sourceFileQueue.length
+                        ? `Add ${sourceFileQueue.length} file${sourceFileQueue.length === 1 ? "" : "s"}`
+                        : "Add & analyze"}
                 </button>
               </div>
             </form>
@@ -2298,15 +3308,22 @@ export default function App() {
       ) : null}
 
       {isArtifactDetailOpen ? (
-        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsArtifactDetailOpen(false)}>
-          <section className="modal artifact-modal" role="dialog" aria-modal="true" aria-label="Artifact preview" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={closeArtifactDetail}>
+          <section
+            className="modal artifact-modal"
+            data-artifact-type={selectedArtifact?.type || "none"}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Artifact preview"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="modal-header">
               <div>
                 <p className="panel-eyebrow">Studio artifact</p>
                 <h2>{artifactTypeLabel(selectedArtifact?.type)}</h2>
                 {selectedArtifact ? <p className="artifact-subhead">{artifactSubhead(selectedArtifact)}</p> : null}
               </div>
-              <button className="icon-button subtle" type="button" onClick={() => setIsArtifactDetailOpen(false)} aria-label="Close artifact preview">
+              <button className="icon-button subtle" type="button" onClick={closeArtifactDetail} aria-label="Close artifact preview">
                 <XCircle size={17} />
               </button>
             </div>
@@ -2317,23 +3334,6 @@ export default function App() {
               onToast={setToast}
               onError={setError}
             />
-          </section>
-        </div>
-      ) : null}
-
-      {isGroundingDetailOpen ? (
-        <div className="modal-backdrop artifact-modal-backdrop" role="presentation" onClick={() => setIsGroundingDetailOpen(false)}>
-          <section className="modal grounding-modal" role="dialog" aria-modal="true" aria-label="Grounding details" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <div>
-                <p className="panel-eyebrow">Citation Ledger</p>
-                <h2>Grounding details</h2>
-              </div>
-              <button className="icon-button subtle" type="button" onClick={() => setIsGroundingDetailOpen(false)} aria-label="Close grounding details">
-                <XCircle size={17} />
-              </button>
-            </div>
-            <GroundingDetail message={latestAssistant} providerStatus={providerStatus} />
           </section>
         </div>
       ) : null}
@@ -2378,6 +3378,37 @@ export default function App() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function WorkspaceResizeHandle({
+  target,
+  active,
+  onPointerDown,
+  onKeyDown,
+  onReset,
+}: {
+  target: WorkspaceResizeTarget;
+  active: boolean;
+  onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
+  onReset: () => void;
+}) {
+  return (
+    <button
+      className="workspace-resizer"
+      data-active={active}
+      data-target={target}
+      type="button"
+      aria-label={target === "sources" ? "Resize sources column" : "Resize studio column"}
+      title="Drag to resize. Double-click to reset."
+      onClick={(event) => event.currentTarget.focus()}
+      onPointerDown={onPointerDown}
+      onKeyDown={onKeyDown}
+      onDoubleClick={onReset}
+    >
+      <span aria-hidden="true" />
+    </button>
   );
 }
 
@@ -2515,12 +3546,12 @@ function AuthPage({
     }[mode] || `${BRAND_NAME} account`;
   const subtitle =
     mode === "signup"
-      ? "Create a local account, seed a private notebook, and keep the research workspace scoped to your session."
+      ? "Create an account, start a private notebook, and keep the research workspace scoped to your session."
       : mode === "reset-request"
-        ? "Request a password reset token for the local demo account database."
+        ? "Request a password reset token for your account."
         : mode === "reset-confirm"
           ? "Use the reset token to replace the password and create a fresh session."
-          : "Use your local account to access notebooks, sources, citations, and generated artifacts.";
+          : "Use your account to access notebooks, sources, citations, and generated artifacts.";
 
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2555,7 +3586,7 @@ function AuthPage({
         if (response.reset_token) {
           onResetTokenChange(response.reset_token);
           onModeChange("reset-confirm");
-          setNotice("Local reset token generated. Set a new password below.");
+          setNotice("Reset token generated. Set a new password below.");
         } else {
           setNotice("If the email exists, a reset flow has been created.");
         }
@@ -2623,7 +3654,7 @@ function AuthPage({
               {mode === "signup" ? <UserPlus size={20} /> : mode.startsWith("reset") ? <KeyRound size={20} /> : <Lock size={20} />}
             </span>
             <div>
-              <p className="panel-eyebrow">Secure local access</p>
+              <p className="panel-eyebrow">Secure account access</p>
               <h2 id="auth-title">{title}</h2>
             </div>
           </div>
@@ -2794,7 +3825,6 @@ function accountInitials(name: string, email: string) {
 }
 
 function LandingPage({
-  activeCount,
   sourceCount,
   providerLabel,
   isBooting,
@@ -2803,7 +3833,6 @@ function LandingPage({
   onSignIn,
   onCreateAccount,
 }: {
-  activeCount: number;
   sourceCount: number;
   providerLabel: string;
   isBooting: boolean;
@@ -2813,34 +3842,49 @@ function LandingPage({
   onCreateAccount: () => void;
 }) {
   const landingMetrics = [
-    { value: isBooting ? "..." : String(sourceCount || 4), label: "seed sources" },
-    { value: isBooting ? "..." : String(activeCount || 4), label: "active evidence streams" },
-    { value: providerLabel.includes("Anthropic") ? "Claude" : "Local", label: "grounded answer route" },
+    { value: "Hybrid", label: "BM25 + semantic vector search" },
+    { value: "Rerank", label: "Cohere-ready second-stage ranking" },
+    { value: providerLabel.includes("Anthropic") ? "Claude" : "Fallback", label: "grounded answer route" },
   ];
   const steps = [
     {
       icon: <UploadCloud size={18} />,
-      title: "Upload sources",
-      body: "Markdown, notes, URLs and PDF text extraction become stable source blocks.",
+      title: "Normalize sources",
+      body: "PDFs, URLs, YouTube, audio, notes and documents collapse into stable Source Blocks with heading and range metadata.",
     },
     {
-      icon: <GitBranch size={18} />,
-      title: "Build Evidence Packs",
-      body: "Retrieval is scoped to active sources and saved as auditable evidence.",
+      icon: <Layers3 size={18} />,
+      title: "Semantic chunking",
+      body: "Structured chunks keep heading boundaries and overlap, while semantic topic shifts create cleaner retrieval units.",
+    },
+    {
+      icon: <Database size={18} />,
+      title: "Hybrid search",
+      body: "BM25, keyword overlap, vector cosine, query rewrites and entity signals produce a candidate set for reranking.",
     },
     {
       icon: <ShieldCheck size={18} />,
-      title: "Verify every claim",
-      body: "Citation Ledgers check support before answers and artifacts are shown.",
+      title: "Grounded generation",
+      body: "Evidence Packs feed chat and Studio artifacts; Citation Ledgers strip unsupported claims before users rely on them.",
     },
   ];
+  const stack = [
+    "Supabase pgvector",
+    "Deterministic vector fallback",
+    "Cohere rerank",
+    "OpenAI / Voyage embeddings",
+    "Deepgram transcription",
+    "ElevenLabs audio",
+  ];
   const outputs = [
-    "Audio briefings",
-    "Reports",
-    "Mind maps",
+    "Audio Overview",
+    "Slide decks",
+    "YouTube kit",
     "Flashcards",
     "Quizzes",
-    "Slide decks",
+    "Infographics",
+    "Data tables",
+    "Mind maps",
   ];
   return (
     <div className="landing-shell">
@@ -2854,7 +3898,7 @@ function LandingPage({
         <nav>
           <a href="#overview">Overview</a>
           <a href="#audio">Audio</a>
-          <a href="#plans">Plans</a>
+          <a href="#plans">Outputs</a>
         </nav>
         <div className="landing-auth-actions">
           {isAuthenticated ? (
@@ -2878,35 +3922,35 @@ function LandingPage({
         <section className="landing-hero" aria-labelledby="landing-title">
           <div className="hero-product-scene" aria-hidden="true">
             <div className="scene-window scene-sources">
-              <span>Sources</span>
-              <strong>4 active</strong>
-              <p>Notebook architecture notes</p>
-              <p>SME automation playbook</p>
-              <p>Grounding best practices</p>
+              <span>01 · Sources</span>
+              <strong>{isBooting ? "Indexing" : `${sourceCount || 4} source types`}</strong>
+              <p>PDF · URL · YouTube · audio</p>
+              <p>Markdown spine</p>
+              <p>Stable Source Blocks</p>
             </div>
             <div className="scene-window scene-chat">
-              <span>Evidence Pack</span>
-              <strong>Ask anything from your sources</strong>
-              <p>{BRAND_NAME} uses source blocks, retrieval runs and Citation Ledgers to keep answers auditable. [1]</p>
+              <span>02 · Retrieval</span>
+              <strong>Hybrid search + rerank</strong>
+              <p>BM25 and semantic vectors retrieve candidates; a reranker promotes the passages most likely to answer the question.</p>
               <div>
-                <mark>[1]</mark>
-                <mark>[2]</mark>
-                <mark>[3]</mark>
+                <mark>BM25</mark>
+                <mark>Vector</mark>
+                <mark>Rerank</mark>
               </div>
             </div>
             <div className="scene-window scene-studio">
-              <span>Studio</span>
-              <strong>Audio Overview</strong>
-              <p>Host A and Host B explain the Evidence Pack in a conversational briefing.</p>
+              <span>03 · Evidence Pack</span>
+              <strong>Cited answer layer</strong>
+              <p>Claude or a deterministic fallback engine can only use retrieved evidence. Unsupported claims are removed.</p>
             </div>
           </div>
 
           <div className="landing-hero-copy">
-            <p className="landing-kicker">Source-grounded AI research</p>
-            <h1 id="landing-title">Understand anything in your sources.</h1>
+            <p className="landing-kicker">Private RAG architecture</p>
+            <h1 id="landing-title">A source-grounded RAG workbench.</h1>
             <p>
-              Upload research material, ask grounded questions, and generate reusable briefings from the same verified
-              Evidence Pack.
+              Block Research LM turns private sources into semantic chunks, hybrid retrieval results, reranked Evidence
+              Packs and cited Studio outputs.
             </p>
             <div className="landing-hero-actions">
               <button className="landing-primary" type="button" onClick={onOpenWorkspace}>
@@ -2914,13 +3958,13 @@ function LandingPage({
                 <ArrowRight size={18} />
               </button>
               <a className="landing-secondary" href="#overview">
-                <PlayCircle size={18} />
-                See how it works
+                <GitBranch size={18} />
+                View pipeline
               </a>
             </div>
           </div>
 
-          <div className="landing-metrics" aria-label="Live demo metrics">
+          <div className="landing-metrics" aria-label="Pipeline metrics">
             {landingMetrics.map((metric) => (
               <div key={metric.label}>
                 <strong>{metric.value}</strong>
@@ -2932,12 +3976,12 @@ function LandingPage({
 
         <section className="landing-section intro-band" id="overview">
           <div>
-            <p className="landing-kicker">Research, not generic PDF chat</p>
-            <h2>Learn more about any subject with the help of your own sources.</h2>
+            <p className="landing-kicker">Architecture, not generic PDF chat</p>
+            <h2>Every answer starts as retrieval, not model memory.</h2>
           </div>
           <p>
-            {BRAND_NAME} turns notes, documents and URLs into a controlled knowledge workspace. Responses stay
-            grounded in the information you provide, and every generated output keeps source references attached.
+            {BRAND_NAME} stores source blocks, chunks, embeddings, retrieval runs, Evidence Packs and Citation Ledgers
+            as first-class objects. The UI exposes the workflow, but the reliability comes from the pipeline underneath.
           </p>
         </section>
 
@@ -2951,23 +3995,35 @@ function LandingPage({
           ))}
         </section>
 
+        <section className="landing-section stack-band" aria-label="Technical stack">
+          <div>
+            <p className="landing-kicker">Retrieval stack</p>
+            <h2>BM25 recall, semantic recall, then rerank precision.</h2>
+          </div>
+          <div className="stack-list">
+            {stack.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </section>
+
         <section className="landing-section audio-band" id="audio">
           <div className="audio-copy">
-            <p className="landing-kicker">Audio Overview</p>
-            <h2>Turn source evidence into a podcast-style briefing.</h2>
+            <p className="landing-kicker">Studio artifacts</p>
+            <h2>The same Evidence Pack drives every output.</h2>
             <p>
-              The current demo creates a verified two-host transcript. The provider boundary is ready for ElevenLabs
-              rendering while keeping citations and the transcript visible in the artifact.
+              Audio, slides, reports, flashcards and YouTube assets are generated from the selected source context.
+              Each artifact keeps the retrieval audit attached instead of hiding source provenance.
             </p>
           </div>
           <div className="audio-script" aria-label="Audio overview example">
             <div>
-              <span>Host A</span>
-              <p>Let's anchor this in the source: Evidence Packs make retrieval auditable. [1]</p>
+              <span>Evidence Pack</span>
+              <p>Top reranked chunks become the compact context window used for generation. [1]</p>
             </div>
             <div>
-              <span>Host B</span>
-              <p>And the Citation Ledger checks whether each answer claim is supported before the user relies on it. [2]</p>
+              <span>Citation Ledger</span>
+              <p>Claims are checked against cited evidence before the answer or artifact is shown. [2]</p>
             </div>
           </div>
         </section>
@@ -2975,7 +4031,7 @@ function LandingPage({
         <section className="landing-section output-band" id="plans">
           <div>
             <p className="landing-kicker">Studio outputs</p>
-            <h2>One evidence layer, many reusable artifacts.</h2>
+            <h2>NotebookLM-style outputs, plus YouTube-specific tools.</h2>
           </div>
           <div className="output-list">
             {outputs.map((output) => (
@@ -2988,8 +4044,8 @@ function LandingPage({
         </section>
 
         <section className="landing-final">
-          <h2>Open the workspace and inspect the evidence.</h2>
-          <p>Sources, chat, citations, artifacts and provider status are already wired into the local demo.</p>
+          <h2>Open the workspace and inspect the retrieval trace.</h2>
+          <p>Sources, chunks, hybrid retrieval, reranking signals, citations and artifacts are wired into the workspace.</p>
           <button className="landing-primary" type="button" onClick={onOpenWorkspace}>
             Open {BRAND_NAME}
             <ArrowRight size={18} />
@@ -3222,87 +4278,6 @@ function ThinkingBubble({ topic = "" }: { topic?: string }) {
   );
 }
 
-function GroundingPanel({ message }: { message?: ChatMessage }) {
-  if (!message?.claim_stats) {
-    return (
-      <p className="ai-disclaimer">
-        Source-only mode is enforced server-side. Answers abstain when active sources do not support the question.
-      </p>
-    );
-  }
-  const stats = message.claim_stats;
-  const citationCoverage = Math.round((stats.citation_coverage ?? 0) * 100);
-  const supportScore = Math.round((stats.support_score ?? 0) * 100);
-  return (
-    <div className="ai-disclaimer grounding-strip">
-      <span>
-        <ShieldCheck size={14} />
-        {stats.claims_checked} claims checked
-      </span>
-      <span>{stats.supported} supported</span>
-      <span>{stats.partially_supported} partial</span>
-      <span>{stats.unsupported} unsupported</span>
-      <span>{citationCoverage}% citation coverage</span>
-      <span>{supportScore}% support score</span>
-    </div>
-  );
-}
-
-function GroundingDetail({ message, providerStatus }: { message?: ChatMessage; providerStatus: ProviderStatus | null }) {
-  const stats = message?.claim_stats;
-  return (
-    <div className="grounding-detail">
-      <div className="grounding-meta-grid">
-        <span>
-          <strong>Provider</strong>
-          {providerLabel(providerStatus)}
-        </span>
-        <span>
-          <strong>Model</strong>
-          {message?.model || providerStatus?.grounded_answer_model || "local-grounded-v1"}
-        </span>
-        <span>
-          <strong>Mode</strong>
-          {message?.mode || "source-only"}
-        </span>
-        <span>
-          <strong>Citations</strong>
-          {message?.citations?.length || 0}
-        </span>
-        <span>
-          <strong>Coverage</strong>
-          {stats?.citation_coverage !== undefined ? `${Math.round(stats.citation_coverage * 100)}%` : "n/a"}
-        </span>
-      </div>
-
-      {stats ? <GroundingPanel message={message} /> : (
-        <p className="ai-disclaimer">
-          Ask a grounded question to create the next Citation Ledger. The server verifies cited claims before the answer is shown.
-        </p>
-      )}
-
-      {message?.citations?.length ? (
-        <div className="ledger-list">
-          {message.citations.map((citation) => (
-            <article key={citation.evidence_id}>
-              <strong>[{citation.index}] {citation.source_title || citation.sourceTitle}</strong>
-              <p>{citation.quote}</p>
-              <small>
-                {(citation.heading_path || []).join(" / ") || "Source passage"} · {citation.block_ids?.length || 0} source block{citation.block_ids?.length === 1 ? "" : "s"} referenced
-              </small>
-            </article>
-          ))}
-        </div>
-      ) : (
-        <div className="ledger-empty">
-          <ShieldCheck size={18} />
-          <p>No citation cards are attached to the latest answer yet.</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function DebugPanel({ status, isWorking }: { status: DebugStatusResponse | null; isWorking: boolean }) {
   const debug = status?.debug;
   const events = status?.events || [];
@@ -3432,9 +4407,9 @@ function providerLabel(status: ProviderStatus | null) {
       anthropic: "Anthropic grounded answer",
       openai: "OpenAI grounded answer",
       google: "Gemini grounded answer",
-      local: "Local fallback",
-    }[status.active_grounded_answer_provider] || "Local fallback";
-  return status.external_grounded_answer_enabled ? label : "Local fallback";
+      local: "Deterministic fallback",
+    }[status.active_grounded_answer_provider] || "Deterministic fallback";
+  return status.external_grounded_answer_enabled ? label : "Deterministic fallback";
 }
 
 function providerMeta(message: ChatMessage) {
@@ -3443,9 +4418,10 @@ function providerMeta(message: ChatMessage) {
       anthropic: "Anthropic",
       openai: "OpenAI",
       google: "Gemini",
-      local: "Local",
+      local: "Deterministic fallback",
     }[message.provider || ""] || message.provider;
-  return [provider, message.model].filter(Boolean).join(" · ");
+  const model = message.model === "local-grounded-v1" ? "grounded-v1" : message.model;
+  return [provider, model].filter(Boolean).join(" · ");
 }
 
 function ArtifactPreview({
@@ -3472,7 +4448,7 @@ function ArtifactPreview({
   const svgMarkup = typeof payload.svg_markup === "string" ? payload.svg_markup : "";
   return (
     <div className="artifact-preview">
-      {artifact.type !== "quiz" ? (
+      {artifact.type !== "quiz" && artifact.type !== "data-table" ? (
       <div className="artifact-preview-top">
         <div>
           <h3>{artifact.title}</h3>
@@ -3507,12 +4483,6 @@ function ArtifactPreview({
         onToast={onToast}
         onError={onError}
       />
-      {payload.evidence_audit ? (
-        <details className="artifact-audit-disclosure">
-          <summary>Evidence audit</summary>
-          <ArtifactEvidenceAuditView audit={payload.evidence_audit as ArtifactEvidenceAudit | undefined} />
-        </details>
-      ) : null}
     </div>
   );
 }
@@ -3560,9 +4530,13 @@ function ArtifactPayload({
     const description = String(payload.description || "");
     const chapters = (payload.chapters as Array<{ time?: string; label?: string }>) || [];
     const tags = (payload.tags as string[]) || [];
-    const copy = (text: string, label: string) => {
-      void navigator.clipboard?.writeText(text);
-      onToast(`${label} copied.`);
+    const copy = async (text: string, label: string) => {
+      try {
+        await copyTextToClipboard(text);
+        onToast(`${label} copied.`);
+      } catch (error) {
+        onError(error instanceof Error ? error.message : `${label} could not be copied.`);
+      }
     };
     return (
       <div className="youtube-kit-preview">
@@ -3570,9 +4544,11 @@ function ArtifactPayload({
           <h4>Title options</h4>
           <div className="yt-titles">
             {titles.map((title, index) => (
-              <button key={index} type="button" className="yt-title" onClick={() => copy(title, "Title")}>
+              <button key={index} type="button" className="yt-title" onClick={() => void copy(title, "Title")} aria-label={`Copy title option ${index + 1}`}>
                 <span>{title}</span>
-                <Copy size={13} />
+                <span className="yt-title-copy" aria-hidden="true">
+                  <Copy size={13} /> Copy
+                </span>
               </button>
             ))}
           </div>
@@ -3580,7 +4556,7 @@ function ArtifactPayload({
         <section>
           <div className="yt-section-head">
             <h4>Description</h4>
-            <button type="button" onClick={() => copy(description, "Description")}>
+            <button type="button" onClick={() => void copy(description, "Description")}>
               <Copy size={13} /> Copy
             </button>
           </div>
@@ -3590,7 +4566,7 @@ function ArtifactPayload({
           <section>
             <div className="yt-section-head">
               <h4>Chapters</h4>
-              <button type="button" onClick={() => copy(chapters.map((chapter) => `${chapter.time} ${chapter.label}`).join("\n"), "Chapters")}>
+              <button type="button" onClick={() => void copy(chapters.map((chapter) => `${chapter.time} ${chapter.label}`).join("\n"), "Chapters")}>
                 <Copy size={13} /> Copy
               </button>
             </div>
@@ -3618,34 +4594,8 @@ function ArtifactPayload({
     );
   }
 
-  if (Array.isArray(payload.tldr) || Array.isArray(payload.key_points)) {
-    return (
-      <div className="report-preview">
-        {Array.isArray(payload.tldr) ? (
-          <section>
-            <h4>TL;DR</h4>
-            <ul>
-              {(payload.tldr as string[]).slice(0, 5).map((item, index) => (
-                <li key={`${item}-${index}`}>{item}</li>
-              ))}
-            </ul>
-          </section>
-        ) : null}
-        {Array.isArray(payload.key_points) ? (
-          <section>
-            <h4>Key points</h4>
-            <div className="artifact-json">
-              {(payload.key_points as ReportPointPayload[]).slice(0, 8).map((point, index) => (
-                <article key={`${point.text}-${index}`}>
-                  <strong>{point.citation || `[${index + 1}]`}</strong>
-                  <p>{point.text}</p>
-                </article>
-              ))}
-            </div>
-          </section>
-        ) : null}
-      </div>
-    );
+  if (artifact.type === "report" || Array.isArray(payload.detailed_sections) || Array.isArray(payload.key_findings)) {
+    return <ReportPreview payload={payload} onCitationClick={onCitationClick} />;
   }
 
   if (Array.isArray(payload.panels)) {
@@ -3806,6 +4756,160 @@ function ArtifactPayload({
   return <pre className="artifact-json">{JSON.stringify(payload, null, 2)}</pre>;
 }
 
+function reportItems(value: unknown): string[] {
+  if (!value) return [];
+  const items = Array.isArray(value) ? value : [value];
+  return items.map(reportItemText).filter(Boolean);
+}
+
+function reportItemText(item: unknown): string {
+  if (typeof item === "string") return item.trim();
+  if (!item || typeof item !== "object") return String(item ?? "").trim();
+  const record = item as Record<string, unknown>;
+  if (typeof record.text === "string") return record.text.trim();
+  if (typeof record.analysis === "string") return record.analysis.trim();
+  if (typeof record.body === "string") return record.body.trim();
+  if (typeof record.title === "string") return record.title.trim();
+  const parts = ["action", "finding", "recommendation", "citation"]
+    .map((key) => (typeof record[key] === "string" ? String(record[key]).trim() : ""))
+    .filter(Boolean);
+  if (parts.length) return parts.join(": ");
+  return Object.entries(record)
+    .filter(([, value]) => typeof value === "string" && value.trim())
+    .map(([key, value]) => `${key.replace(/_/g, " ")}: ${value}`)
+    .join("; ");
+}
+
+function ReportPreview({
+  payload,
+  onCitationClick,
+}: {
+  payload: Record<string, unknown>;
+  onCitationClick: (citation: Citation) => void;
+}) {
+  const citations = Array.isArray(payload.citations) ? payload.citations as Citation[] : [];
+  const executiveSummary = reportItems(payload.executive_summary);
+  const tldr = reportItems(payload.tldr).slice(0, 6);
+  const findings = Array.isArray(payload.key_findings)
+    ? payload.key_findings as Array<Record<string, unknown>>
+    : (Array.isArray(payload.key_points) ? payload.key_points as Array<Record<string, unknown>> : []);
+  const sections = Array.isArray(payload.detailed_sections) ? payload.detailed_sections as Array<Record<string, unknown>> : [];
+  const recommendations = reportItems(payload.recommendations);
+  const risks = reportItems(payload.risks_limitations);
+  const questions = reportItems(payload.open_questions);
+  const bibliography = reportItems(payload.bibliography);
+
+  return (
+    <article className="report-preview">
+      {executiveSummary.length ? (
+        <section className="report-section report-executive">
+          <h4>Executive summary</h4>
+          {executiveSummary.map((paragraph, index) => (
+            <p key={index}>{renderInline(paragraph, citations, onCitationClick, `report-exec-${index}`)}</p>
+          ))}
+        </section>
+      ) : null}
+
+      {tldr.length ? (
+        <section className="report-section report-brief">
+          <h4>TL;DR</h4>
+          <ul>
+            {tldr.map((item, index) => (
+              <li key={index}>{renderInline(item, citations, onCitationClick, `report-tldr-${index}`)}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {findings.length ? (
+        <section className="report-section">
+          <h4>Key findings</h4>
+          <div className="report-finding-list">
+            {findings.slice(0, 8).map((finding, index) => {
+              const heading = String(finding.heading || `Finding ${index + 1}`);
+              const text = reportItemText(finding);
+              const analysis = typeof finding.analysis === "string" ? finding.analysis : "";
+              return (
+                <article key={`${heading}-${index}`} className="report-finding">
+                  <strong>{heading}</strong>
+                  {text ? <p>{renderInline(text, citations, onCitationClick, `report-finding-${index}`)}</p> : null}
+                  {analysis ? <p>{renderInline(analysis, citations, onCitationClick, `report-finding-analysis-${index}`)}</p> : null}
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {sections.map((section, index) => {
+        const body = reportItems(section.body);
+        const evidence = reportItems(section.evidence);
+        const implications = reportItems(section.implications);
+        return (
+          <section key={`${section.heading || "section"}-${index}`} className="report-section">
+            <h4>{String(section.heading || `Section ${index + 1}`)}</h4>
+            {body.map((paragraph, paragraphIndex) => (
+              <p key={paragraphIndex}>{renderInline(paragraph, citations, onCitationClick, `report-section-${index}-${paragraphIndex}`)}</p>
+            ))}
+            {evidence.length ? (
+              <div className="report-mini-list">
+                <strong>Evidence</strong>
+                <ul>
+                  {evidence.map((item, itemIndex) => (
+                    <li key={itemIndex}>{renderInline(item, citations, onCitationClick, `report-evidence-${index}-${itemIndex}`)}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {implications.length ? (
+              <div className="report-mini-list">
+                <strong>Implications</strong>
+                <ul>
+                  {implications.map((item, itemIndex) => (
+                    <li key={itemIndex}>{renderInline(item, citations, onCitationClick, `report-implication-${index}-${itemIndex}`)}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </section>
+        );
+      })}
+
+      {recommendations.length ? (
+        <section className="report-section">
+          <h4>Recommendations</h4>
+          <ol className="report-ordered">
+            {recommendations.map((item, index) => (
+              <li key={index}>{renderInline(item, citations, onCitationClick, `report-rec-${index}`)}</li>
+            ))}
+          </ol>
+        </section>
+      ) : null}
+
+      <section className="report-section report-appendix">
+        {risks.length ? (
+          <div>
+            <h4>Risks and limitations</h4>
+            <ul>{risks.map((item, index) => <li key={index}>{renderInline(item, citations, onCitationClick, `report-risk-${index}`)}</li>)}</ul>
+          </div>
+        ) : null}
+        {questions.length ? (
+          <div>
+            <h4>Open questions</h4>
+            <ul>{questions.map((item, index) => <li key={index}>{renderInline(item, citations, onCitationClick, `report-question-${index}`)}</li>)}</ul>
+          </div>
+        ) : null}
+        {bibliography.length ? (
+          <div>
+            <h4>Bibliography</h4>
+            <ul>{bibliography.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          </div>
+        ) : null}
+      </section>
+    </article>
+  );
+}
+
 function DataTablePreview({
   artifact,
   payload,
@@ -3818,12 +4922,9 @@ function DataTablePreview({
   onCitationClick: (citation: Citation) => void;
 }) {
   const columns = dataTableColumns(payload, rows);
-  const sourceCount = new Set(
-    rows
-      .flatMap((row) => row.source_refs || [])
-      .map((ref) => String(ref.source_id || ""))
-      .filter(Boolean),
-  ).size;
+  const sourceNotes = dataTableSourceNotes(payload, rows, artifact);
+  const sourceCount = sourceNotes.length || artifact.source_refs_json?.length || 0;
+  const tableStyle = { "--data-table-columns": Math.max(columns.length, 1) } as CSSProperties;
   const csv = () => {
     const csvRows = [
       columns,
@@ -3834,19 +4935,29 @@ function DataTablePreview({
 
   return (
     <div className="data-table-preview">
+      <div className="data-table-breadcrumb">
+        <span>Studio</span>
+        <ChevronRight size={14} />
+        <strong>Data Table</strong>
+      </div>
       <div className="data-table-toolbar">
         <div>
+          <h3>{String(payload.title || artifact.title)}</h3>
+          <button type="button" className="data-table-source-pill" disabled={!sourceNotes.length}>
+            View {sourceCount || 0} source{sourceCount === 1 ? "" : "s"}
+          </button>
+        </div>
+        <div className="data-table-actions">
           <span>{rows.length} rows</span>
           <span>{columns.length} columns</span>
-          <span>{sourceCount || artifact.source_refs_json?.length || 0} sources</span>
+          <button type="button" onClick={csv} aria-label="Download data table CSV">
+            <Download size={14} />
+            CSV
+          </button>
         </div>
-        <button type="button" onClick={csv} aria-label="Download data table CSV">
-          <Download size={14} />
-          CSV
-        </button>
       </div>
 
-      <div className="data-table-scroll">
+      <div className="data-table-scroll" style={tableStyle}>
         <table>
           <thead>
             <tr>
@@ -3859,7 +4970,8 @@ function DataTablePreview({
           <tbody>
             {rows.map((row, rowIndex) => {
               const refs = row.source_refs || [];
-              const rowCitation = refs[0] ? citationFromSourceRef(refs[0], `Row ${rowIndex + 1}`) : null;
+              const sourceFallback = dataTableCellText(row.cells?.Source || row.cells?.source || `Row ${rowIndex + 1}`);
+              const rowCitation = refs[0] ? citationFromSourceRef(dataTableHydrateSourceRef(refs[0], sourceNotes), sourceFallback) : null;
               return (
                 <tr key={rowIndex}>
                   <td className="data-table-index">
@@ -3880,14 +4992,13 @@ function DataTablePreview({
                       <td key={column} data-column={column}>
                         {sourceRef ? (
                           <button type="button" className="data-table-source-link" onClick={() => onCitationClick(sourceRef)}>
-                            {text || sourceRef.source_title}
+                            {text || dataTableSourceLabel(sourceRef)}
                           </button>
                         ) : column.toLowerCase() === "support" ? (
                           <span className="data-table-support" data-support={support || text}>{dataTableSupportLabel(support || text)}</span>
                         ) : (
                           <>
                             <span>{text || "—"}</span>
-                            {support ? <span className="data-table-support" data-support={support}>{dataTableSupportLabel(support)}</span> : null}
                           </>
                         )}
                       </td>
@@ -3932,6 +5043,42 @@ function dataTableSupport(value: unknown, row: TableRowPayload, column: string) 
 
 function dataTableSupportLabel(value: string) {
   return value.replaceAll("_", " ");
+}
+
+function dataTableSourceNotes(payload: Record<string, unknown>, rows: TableRowPayload[], artifact: Artifact) {
+  const explicit = Array.isArray(payload.source_notes) ? payload.source_notes : [];
+  const rawNotes = explicit.length
+    ? explicit
+    : rows.flatMap((row) => row.source_refs || artifact.source_refs_json || []);
+  const notes = new globalThis.Map<string, Record<string, unknown>>();
+  rawNotes.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object") return;
+    const note = raw as Record<string, unknown>;
+    const label = String(note.label || note.citation || `[${index + 1}]`);
+    const key = String(note.source_id || note.source_title || label);
+    if (notes.has(key)) return;
+    notes.set(key, {
+      ...note,
+      label,
+      source_title: String(note.source_title || note.sourceTitle || note.title || "Source"),
+    });
+  });
+  return [...notes.values()];
+}
+
+function dataTableHydrateSourceRef(ref: Record<string, unknown>, sourceNotes: Array<Record<string, unknown>>) {
+  const sourceId = String(ref.source_id || "");
+  const label = String(ref.label || ref.citation || "");
+  const note = sourceNotes.find((item) =>
+    (sourceId && String(item.source_id || "") === sourceId) ||
+    (label && [item.label, item.citation].map(String).includes(label)),
+  );
+  return note ? { ...note, ...ref, source_title: ref.source_title || note.source_title } : ref;
+}
+
+function dataTableSourceLabel(citation: Citation) {
+  const match = /\[(\d+)\]/.exec(citation.evidence_id || citation.quote || "");
+  return match ? `[${match[1]}]` : citation.source_title || "[1]";
 }
 
 // ---------------------------------------------------------------------------
@@ -3979,8 +5126,8 @@ const MM_PAD_Y = 11;
 const MM_LINE_H = 18;
 const MM_MAX_TEXT = 168;
 const MM_MIN_W = 116;
-const MM_H_GAP = 78;
-const MM_V_GAP = 14;
+const MM_H_GAP = 96;
+const MM_V_GAP = 26;
 const MM_TOGGLE_R = 11;
 const MM_TOGGLE_OFF = 18;
 
@@ -4031,11 +5178,6 @@ function mmWrap(label: string): string[] {
   return lines.map((line) => (mmMeasure(line) > MM_MAX_TEXT ? mmTrimToWidth(line) : line));
 }
 
-function mmShortLabel(label: string, max = 30): string {
-  const text = String(label || "").replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…` : text;
-}
-
 function mmFindRoot(nodes: MindMapNode[], edges: MindMapEdge[]): string {
   const ids = new Set(nodes.filter((node) => node && node.id).map((node) => node.id as string));
   if (ids.has("center")) return "center";
@@ -4057,9 +5199,22 @@ function mmRefs(refs: unknown): Record<string, unknown>[] {
   return [];
 }
 
+function mmDisplayGraph(nodes: MindMapNode[], edges: MindMapEdge[]) {
+  const hidden = new Set(
+    nodes
+      .filter((node) => {
+        const label = String(node.label || "").trim();
+        return node.type === "claim" || /^(Beleg:|Check Supporting Source|Link Source Proof|format[_\s-])/i.test(label);
+      })
+      .map((node) => node.id),
+  );
+  return {
+    nodes: nodes.filter((node) => node.id && !hidden.has(node.id)),
+    edges: edges.filter((edge) => edge.source && edge.target && !hidden.has(edge.source) && !hidden.has(edge.target)),
+  };
+}
+
 function mmBuildLayout(nodes: MindMapNode[], edges: MindMapEdge[], expanded: Set<string>): MMLayout {
-  // NB: `Map` is imported from lucide-react (an icon) in this module and shadows
-  // the global Map constructor, so reach for it via globalThis.
   const byId = new globalThis.Map<string, MindMapNode>();
   for (const node of nodes) if (node && node.id) byId.set(node.id, node);
 
@@ -4165,8 +5320,8 @@ function mmComputeFit(
   const contentH = Math.max(1, bbox.maxY - bbox.minY);
   const padX = 48;
   const padY = 36;
-  const scale = Math.max(0.35, Math.min(1.1, Math.min((size.w - padX * 2) / contentW, (size.h - padY * 2) / contentH)));
-  const tx = padX - bbox.minX * scale;
+  const scale = Math.max(0.35, Math.min(1.35, Math.min((size.w - padX * 2) / contentW, (size.h - padY * 2) / contentH)));
+  const tx = (size.w - contentW * scale) / 2 - bbox.minX * scale;
   const ty = (size.h - contentH * scale) / 2 - bbox.minY * scale;
   return { scale, tx, ty };
 }
@@ -4308,7 +5463,8 @@ function MindMapPreview({
   title?: string;
   onCitationClick: (citation: Citation) => void;
 }) {
-  const rootId = useMemo(() => mmFindRoot(nodes, edges), [nodes, edges]);
+  const graph = useMemo(() => mmDisplayGraph(nodes, edges), [nodes, edges]);
+  const rootId = useMemo(() => mmFindRoot(graph.nodes, graph.edges), [graph]);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(rootId ? [rootId] : []));
   const [selectedId, setSelectedId] = useState<string>("");
   const [view, setView] = useState({ scale: 1, tx: 48, ty: 48 });
@@ -4316,10 +5472,9 @@ function MindMapPreview({
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const contentRef = useRef<SVGGElement>(null);
-  const didFit = useRef(false);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
 
-  const layout = useMemo(() => mmBuildLayout(nodes, edges, expanded), [nodes, edges, expanded]);
+  const layout = useMemo(() => mmBuildLayout(graph.nodes, graph.edges, expanded), [graph, expanded]);
 
   // Always keep the central root open so there is something to unfold from.
   useEffect(() => {
@@ -4344,13 +5499,11 @@ function MindMapPreview({
     return () => observer.disconnect();
   }, []);
 
-  // Fit the initial (compact) tree once, then leave the view under user control.
+  // Refit after expansion/collapse so newly revealed branches do not start clipped.
   useEffect(() => {
-    if (didFit.current) return;
     if (!layout.nodes.length || size.w <= 1) return;
     setView(mmComputeFit(layout.bbox, size));
-    didFit.current = true;
-  }, [layout, size]);
+  }, [layout.bbox, layout.nodes.length, size]);
 
   const selectedNode = layout.nodes.find((node) => node.id === selectedId) || null;
 
@@ -4464,17 +5617,6 @@ function MindMapPreview({
               {layout.links.map((link) => (
                 <g key={link.id}>
                   <path className="mm-link" d={mmLinkPath(link)} fill="none" />
-                  {link.label ? (
-                    <text
-                      className="mm-link-label"
-                      x={(link.x1 + link.x2) / 2}
-                      y={(link.y1 + link.y2) / 2 - 7}
-                      textAnchor="middle"
-                      fontFamily={MM_TEXT_FONT_FAMILY}
-                    >
-                      {mmShortLabel(link.label, 30)}
-                    </text>
-                  ) : null}
                 </g>
               ))}
               {layout.nodes.map((node) => (
@@ -4587,7 +5729,7 @@ function SlideDeckPreview({
   pptxUrl,
   pptxFileName,
   renderStatus,
-  onCitationClick,
+  onCitationClick: _onCitationClick,
   onToast,
   onError,
 }: {
@@ -4601,10 +5743,48 @@ function SlideDeckPreview({
   onError: (message: string) => void;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [presentationIndex, setPresentationIndex] = useState<number | null>(null);
   const [exporting, setExporting] = useState<"" | "pdf" | "png">("");
+  const slideStackRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     setActiveIndex(0);
+    setPresentationIndex(null);
   }, [slides.length, title]);
+  useEffect(() => {
+    const activeSlideNode = slideStackRef.current?.querySelector(`[data-slide-index="${activeIndex}"]`);
+    activeSlideNode?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeIndex]);
+  useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null) => {
+      if (!(target instanceof HTMLElement)) return false;
+      return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+    };
+    const moveDeck = (nextIndex: number) => {
+      const safeNext = Math.min(slides.length - 1, Math.max(0, nextIndex));
+      setActiveIndex(safeNext);
+      setPresentationIndex((current) => (current === null ? current : safeNext));
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!slides.length || isTypingTarget(event.target)) return;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown" || event.key === "PageDown" || event.key === " ") {
+        event.preventDefault();
+        const base = presentationIndex === null ? activeIndex : presentationIndex;
+        moveDeck(base + 1);
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp" || event.key === "PageUp") {
+        event.preventDefault();
+        const base = presentationIndex === null ? activeIndex : presentationIndex;
+        moveDeck(base - 1);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        moveDeck(0);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        moveDeck(slides.length - 1);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeIndex, presentationIndex, slides.length]);
   const activeSlide = slides[Math.min(activeIndex, Math.max(0, slides.length - 1))];
   if (!activeSlide) {
     return (
@@ -4616,10 +5796,26 @@ function SlideDeckPreview({
       </div>
     );
   }
-  const svg = activeSlide.svg_markup || "";
-  const svgSrc = svg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}` : "";
+  const activeSvg = activeSlide.svg_markup || "";
   const hasRenderedDeck = slides.some((slide) => slide.svg_markup);
   const hasPresentationFile = Boolean(pptxUrl);
+  const activeSlideNumber = Math.min(activeIndex + 1, slides.length);
+  const currentPresentationIndex = presentationIndex === null ? null : Math.min(Math.max(presentationIndex, 0), slides.length - 1);
+  const presentationSlide = currentPresentationIndex === null ? null : slides[currentPresentationIndex];
+
+  const openPresentation = (index: number) => {
+    setActiveIndex(index);
+    setPresentationIndex(index);
+  };
+
+  const movePresentation = (direction: -1 | 1) => {
+    setPresentationIndex((current) => {
+      const base = current === null ? activeIndex : current;
+      const next = Math.min(slides.length - 1, Math.max(0, base + direction));
+      setActiveIndex(next);
+      return next;
+    });
+  };
 
   const runExport = async (kind: "pdf" | "png") => {
     setExporting(kind);
@@ -4628,7 +5824,8 @@ function SlideDeckPreview({
         await downloadSlideDeckPdf(slides, title);
         onToast("Slide deck PDF downloaded.");
       } else {
-        await downloadSvgAsPng(svg, `${downloadSlug(title || "slide")}-${activeIndex + 1}.png`);
+        if (!activeSvg) throw new Error("This slide is not rendered as an image yet.");
+        await downloadSvgAsPng(activeSvg, `${downloadSlug(title || "slide")}-${activeSlideNumber}.png`);
         onToast("Slide PNG downloaded.");
       }
     } catch (error) {
@@ -4639,78 +5836,135 @@ function SlideDeckPreview({
   };
 
   return (
-    <div className="slide-preview">
-      <div className="slide-deck-meta">
-        <span>{renderStatus === "rendered_svg_pptx" ? "Keynote-ready presentation" : "Slide deck"}</span>
-        <strong>{slides.length} slides</strong>
-      </div>
-      {svgSrc ? (
-        <figure className="slide-frame">
-          <img src={svgSrc} alt={activeSlide.title || `Slide ${activeIndex + 1}`} />
-        </figure>
-      ) : (
-        <div className="slide-stage">
-          <span>{activeSlide.layout_type || "slide"} · {activeIndex + 1}/{slides.length}</span>
-          <h4>{activeSlide.title}</h4>
-          {activeSlide.subtitle ? <p>{activeSlide.subtitle}</p> : null}
-          <ul>
-            {(activeSlide.bullets || []).slice(0, 5).map((bullet, index) => (
-              <li key={`${bullet}-${index}`}>{bullet}</li>
-            ))}
-          </ul>
+    <div className="slide-preview slide-deck-viewer">
+      <div className="slide-viewer-toolbar">
+        <div className="slide-viewer-title">
+          <span>{renderStatus === "rendered_svg_pptx" ? "Presentation" : "Slide deck"}</span>
+          <strong>{title || "Slide Deck"}</strong>
+          <small>{activeSlideNumber}/{slides.length} selected</small>
         </div>
-      )}
-
-      {hasRenderedDeck ? (
-        <div className="slide-export">
-          {hasPresentationFile ? (
-            <a className="secondary-button" href={pptxUrl} download={pptxFileName || `${downloadSlug(title || "slide-deck")}.pptx`}>
-              <Download size={14} /> Download deck (PPTX)
-            </a>
-          ) : null}
-          <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("pdf")}>
-            <Download size={14} /> {exporting === "pdf" ? "Building PDF…" : "Download deck (PDF)"}
+        <div className="slide-viewer-actions">
+          <button type="button" className="secondary-button slide-play-button" onClick={() => openPresentation(activeIndex)}>
+            <PlayCircle size={15} /> Play
           </button>
-          <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("png")}>
-            <Download size={14} /> {exporting === "png" ? "Saving…" : "This slide (PNG)"}
-          </button>
-        </div>
-      ) : null}
-
-      <div className="slide-controls">
-        <button type="button" onClick={() => setActiveIndex((index) => Math.max(0, index - 1))} disabled={activeIndex === 0}>
-          Previous
-        </button>
-        <div>
-          {slides.slice(0, 16).map((slide, index) => (
-            <button
-              key={`${slide.title}-${index}`}
-              type="button"
-              data-active={index === activeIndex}
-              onClick={() => setActiveIndex(index)}
-              aria-label={`Open slide ${index + 1}`}
-            >
-              {index + 1}
-            </button>
-          ))}
-        </div>
-        <button type="button" onClick={() => setActiveIndex((index) => Math.min(slides.length - 1, index + 1))} disabled={activeIndex >= slides.length - 1}>
-          Next
-        </button>
-      </div>
-
-      <div className="slide-notes">
-        {activeSlide.speaker_notes ? <p><strong>Speaker notes</strong>{activeSlide.speaker_notes}</p> : null}
-        {activeSlide.citations?.length ? (
-          <div className="slide-citations">
-            {activeSlide.citations.slice(0, 4).map((citation, index) => (
-              <button key={citation.evidence_id || index} type="button" onClick={() => onCitationClick(citation)}>
-                [{citation.index || index + 1}] {citation.source_title || citation.sourceTitle || "Source"}
+          {hasRenderedDeck ? (
+            <>
+              {hasPresentationFile ? (
+                <a className="secondary-button" href={pptxUrl} download={pptxFileName || `${downloadSlug(title || "slide-deck")}.pptx`}>
+                  <Download size={14} /> PPTX
+                </a>
+              ) : null}
+              <button type="button" className="secondary-button" disabled={!!exporting} onClick={() => void runExport("pdf")}>
+                <Download size={14} /> {exporting === "pdf" ? "PDF…" : "PDF"}
               </button>
-            ))}
-          </div>
-        ) : null}
+              <button type="button" className="secondary-button" disabled={!!exporting || !activeSvg} onClick={() => void runExport("png")}>
+                <Download size={14} /> {exporting === "png" ? "PNG…" : "PNG"}
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
+
+      <div
+        ref={slideStackRef}
+        className="slide-stack"
+        aria-label="Slide deck pages"
+        aria-keyshortcuts="ArrowRight ArrowDown ArrowLeft ArrowUp PageDown PageUp Home End"
+        tabIndex={0}
+      >
+        {slides.map((slide, index) => {
+          const slideSvg = slide.svg_markup || "";
+          const slideSrc = slideSvg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(slideSvg)}` : "";
+          return (
+            <article key={`${slide.title || "slide"}-${index}`} className="slide-stack-item" data-active={index === activeIndex} data-slide-index={index}>
+              <div className="slide-stack-topline">
+                <span>{String(index + 1).padStart(2, "0")} / {String(slides.length).padStart(2, "0")}</span>
+                <strong>{slide.title || `Slide ${index + 1}`}</strong>
+                <button
+                  type="button"
+                  className="icon-button subtle"
+                  onClick={() => openPresentation(index)}
+                  aria-label={`Play slide ${index + 1} fullscreen`}
+                  title="Play"
+                >
+                  <PlayCircle size={16} />
+                </button>
+              </div>
+              {slideSrc ? (
+                <figure
+                  className="slide-frame slide-stack-frame"
+                  onClick={() => setActiveIndex(index)}
+                >
+                  <img src={slideSrc} alt={slide.title || `Slide ${index + 1}`} />
+                </figure>
+              ) : (
+                <div
+                  className="slide-stage slide-stack-stage"
+                  onClick={() => setActiveIndex(index)}
+                >
+                  <span>{slide.layout_type || "slide"} · {index + 1}/{slides.length}</span>
+                  <h4>{slide.title}</h4>
+                  {slide.subtitle ? <p>{slide.subtitle}</p> : null}
+                  <ul>
+                    {(slide.bullets || []).slice(0, 5).map((bullet, bulletIndex) => (
+                      <li key={`${bullet}-${bulletIndex}`}>{bullet}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
+
+      {presentationSlide && currentPresentationIndex !== null ? createPortal(
+        <div className="slide-presenter-backdrop" role="dialog" aria-modal="true" aria-label="Slide deck presentation" onClick={() => setPresentationIndex(null)}>
+          <div className="slide-presenter" onClick={(event) => event.stopPropagation()}>
+            <button type="button" className="icon-button subtle slide-presenter-close" onClick={() => setPresentationIndex(null)} aria-label="Close presentation">
+              <XCircle size={22} />
+            </button>
+            <button
+              type="button"
+              className="icon-button subtle slide-presenter-nav slide-presenter-prev"
+              onClick={() => movePresentation(-1)}
+              disabled={currentPresentationIndex === 0}
+              aria-label="Previous slide"
+            >
+              <ChevronLeft size={24} />
+            </button>
+            {presentationSlide.svg_markup ? (
+              <figure className="slide-presenter-frame">
+                <img
+                  src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(presentationSlide.svg_markup)}`}
+                  alt={presentationSlide.title || `Slide ${currentPresentationIndex + 1}`}
+                />
+              </figure>
+            ) : (
+              <div className="slide-stage slide-presenter-stage">
+                <span>{presentationSlide.layout_type || "slide"} · {currentPresentationIndex + 1}/{slides.length}</span>
+                <h4>{presentationSlide.title}</h4>
+                {presentationSlide.subtitle ? <p>{presentationSlide.subtitle}</p> : null}
+                <ul>
+                  {(presentationSlide.bullets || []).slice(0, 5).map((bullet, bulletIndex) => (
+                    <li key={`${bullet}-${bulletIndex}`}>{bullet}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <button
+              type="button"
+              className="icon-button subtle slide-presenter-nav slide-presenter-next"
+              onClick={() => movePresentation(1)}
+              disabled={currentPresentationIndex >= slides.length - 1}
+              aria-label="Next slide"
+            >
+              <ChevronRight size={24} />
+            </button>
+            <div className="slide-presenter-count">{currentPresentationIndex + 1}/{slides.length}</div>
+          </div>
+        </div>,
+        document.body
+      ) : null}
     </div>
   );
 }
@@ -4936,22 +6190,57 @@ function FlashcardSession({
               <span>{activeCard.card_type || "concept"}</span>
               <span>{activeCard.support_level || "supported"}</span>
             </div>
-            <button type="button" className="flashcard-card-face" onClick={() => setIsAnswerVisible((current) => !current)}>
-              <strong>{isAnswerVisible ? "Answer" : `Card ${activeIndex + 1} of ${visibleCards.length}`}</strong>
-              <p>{isAnswerVisible ? activeCard.answer : activeCard.question}</p>
-              {isAnswerVisible && isExplanationVisible && activeCard.explanation ? <small>{activeCard.explanation}</small> : null}
-              {!isAnswerVisible && activeCard.hint ? <small>{activeCard.hint}</small> : null}
+            <button
+              type="button"
+              className="flashcard-flip-card"
+              data-side={isAnswerVisible ? "answer" : "question"}
+              aria-pressed={isAnswerVisible}
+              onClick={() => setIsAnswerVisible((current) => !current)}
+            >
+              <span className="flashcard-flip-inner">
+                <span className="flashcard-card-face flashcard-card-front" aria-hidden={isAnswerVisible}>
+                  <span className="flashcard-card-kicker">Question {activeIndex + 1} / {visibleCards.length}</span>
+                  <span className="flashcard-card-copy">{activeCard.question}</span>
+                  <span className="flashcard-card-support">
+                    {activeCard.learning_goal || activeCard.hint || "Answer from memory, then flip."}
+                  </span>
+                </span>
+                <span className="flashcard-card-face flashcard-card-back" aria-hidden={!isAnswerVisible}>
+                  <span className="flashcard-card-kicker">Answer</span>
+                  <span className="flashcard-card-copy">{activeCard.answer}</span>
+                  <span className="flashcard-card-support">
+                    {isExplanationVisible && activeCard.explanation ? activeCard.explanation : activeCard.hint || "Use Explain for the source-grounded reasoning."}
+                  </span>
+                </span>
+              </span>
             </button>
             <div className="flashcard-card-footer">
-              <button type="button" onClick={() => openCardCitation(activeCard)} disabled={!activeCard.source_refs?.length}>
+              <button
+                type="button"
+                className="flashcard-action-button flashcard-evidence-button"
+                onClick={() => openCardCitation(activeCard)}
+                disabled={!activeCard.source_refs?.length}
+              >
                 <ShieldCheck size={15} />
-                {activeCard.citation || "Source"}
+                <span>{activeCard.citation || "Source"}</span>
               </button>
-              <button type="button" onClick={() => { setIsAnswerVisible(true); setIsExplanationVisible((current) => !current); }} disabled={!activeCard.explanation}>
+              <button
+                type="button"
+                className="flashcard-action-button flashcard-explain-button"
+                onClick={() => { setIsAnswerVisible(true); setIsExplanationVisible((current) => !current); }}
+                disabled={!activeCard.explanation}
+              >
                 <Sparkles size={15} />
-                Explain
+                <span>Explain</span>
               </button>
-              <button type="button" onClick={() => void deleteCard()} disabled={!deck}>
+              <button
+                type="button"
+                className="flashcard-action-button flashcard-delete-button"
+                onClick={() => void deleteCard()}
+                disabled={!deck}
+                aria-label="Delete flashcard"
+                title="Delete flashcard"
+              >
                 <Trash2 size={15} />
               </button>
             </div>
@@ -5237,72 +6526,6 @@ function quizOptionState(selected: number | undefined, correctIndex: number, opt
   return "muted";
 }
 
-function ArtifactEvidenceAuditView({ audit }: { audit?: ArtifactEvidenceAudit }) {
-  if (!audit || typeof audit !== "object") return null;
-  const sourceCoverage = Math.round((audit.source_coverage || 0) * 100);
-  const evidenceCoverage = Math.round((audit.evidence_coverage || 0) * 100);
-  const itemCoverage = Math.round((audit.item_citation_coverage || 0) * 100);
-  const status = audit.status || "needs_review";
-  return (
-    <section className="artifact-audit" data-status={status}>
-      <div className="section-heading">
-        <strong>Evidence audit</strong>
-        <span>{status.replaceAll("_", " ")}</span>
-      </div>
-      {audit.summary ? <p className="artifact-audit-summary">{audit.summary}</p> : null}
-      <div className="artifact-audit-grid">
-        <span>
-          <strong>{audit.evidence_items || 0}</strong>
-          evidence items
-        </span>
-        <span>
-          <strong>{audit.cited_evidence_items || 0}</strong>
-          cited items
-        </span>
-        <span>
-          <strong>{evidenceCoverage}%</strong>
-          evidence coverage
-        </span>
-        <span>
-          <strong>{sourceCoverage}%</strong>
-          source coverage
-        </span>
-        <span>
-          <strong>{itemCoverage}%</strong>
-          item citations
-        </span>
-        <span>
-          <strong>{audit.invalid_citation_count || 0}</strong>
-          invalid refs
-        </span>
-        <span>
-          <strong>{audit.retrieval_intent || "artifact"}</strong>
-          intent
-        </span>
-        <span>
-          <strong>{audit.artifact_items || 0}</strong>
-          audited items
-        </span>
-      </div>
-      {audit.top_sources?.length ? (
-        <div className="artifact-audit-sources">
-          {audit.top_sources.slice(0, 4).map((source) => (
-            <span key={source.source_id || source.title}>
-              {source.title || "Source"} · {source.cited_items || 0}/{source.references || source.evidence_items || 0}
-            </span>
-          ))}
-        </div>
-      ) : null}
-      {audit.uncited_evidence_ids?.length ? (
-        <small className="artifact-audit-muted">
-          Unused evidence: {audit.uncited_evidence_ids.slice(0, 6).join(", ")}
-          {audit.uncited_evidence_ids.length > 6 ? "..." : ""}
-        </small>
-      ) : null}
-    </section>
-  );
-}
-
 function MobileTab({
   panel,
   active,
@@ -5335,10 +6558,10 @@ function SkeletonRows({ count }: { count: number }) {
 }
 
 const defaultQuestions = [
-  "What does Block Research AI appear to offer across the website and blog sources?",
-  "Which trading-bot and automation themes appear most often in the sources?",
+  "What are the key takeaways from the active sources?",
+  "Which claims are directly supported by the sources?",
   "Find contradictions or open questions in the sources.",
-  "Create an executive brief from all active sources.",
+  "What should I verify before acting on this material?",
 ];
 
 // Legacy prompt used by earlier builds to auto-generate the opening overview.
@@ -5364,6 +6587,106 @@ function visibleNotebookMessages(messages: ChatMessage[]) {
   return visible;
 }
 
+function buildSuggestedReportFormats(notebook: Notebook | null): ReportFormatOption[] {
+  const topic = primaryReportTopic(notebook);
+  const corpus = [
+    notebook?.title,
+    notebook?.summary,
+    ...(notebook?.sources || []).filter((source) => source.active).map((source) => `${source.title} ${source.summary || ""}`),
+  ].join(" ");
+  const legalish = /\b(case|contract|legal|liability|settlement|dispute|claim|defense|damages|milestone)\b/i.test(corpus);
+  const technical = /\b(api|architecture|software|system|workflow|automation|implementation|integration|data|model)\b/i.test(corpus);
+  const communication = /\b(email|message|communication|protocol|stakeholder|client|vendor|customer)\b/i.test(corpus);
+
+  return [
+    {
+      id: "suggested-assessment",
+      title: legalish ? "Case Assessment Report" : `${topic} Assessment Report`,
+      description: legalish
+        ? "A comprehensive evaluation of the legal, technical, and evidentiary position"
+        : `A comprehensive evaluation of the strongest evidence, risks, and decisions around ${topic.toLowerCase()}`,
+      kind: "suggested",
+      prompt: `Create a ${legalish ? "case assessment report" : `${topic} assessment report`} with findings, evidence, risks, contradictions, open questions, and recommended next steps.`,
+    },
+    {
+      id: "suggested-communication",
+      title: communication ? "Communication Protocol" : "Decision Memo",
+      description: communication
+        ? "A formal guide for managing sensitive correspondence and unresolved issues"
+        : "A decision-ready memo that separates supported facts, options, tradeoffs, and next actions",
+      kind: "suggested",
+      prompt: communication
+        ? "Create a communication protocol with goals, tone, escalation rules, evidence-backed talking points, and risks to avoid."
+        : "Create a decision memo with context, options, evidence, tradeoffs, risks, and a recommendation.",
+    },
+    {
+      id: "suggested-concept-guide",
+      title: technical ? "Technical Concept Guide" : "Fundamental Concept Guide",
+      description: technical
+        ? "An introduction to the core architecture, workflows, dependencies, and implementation risks"
+        : "An introduction to the core principles, terminology, and source-backed examples",
+      kind: "suggested",
+      prompt: technical
+        ? "Create a technical concept guide explaining architecture, workflows, implementation dependencies, evidence, and open engineering questions."
+        : "Create a fundamental concept guide with definitions, core principles, examples, citations, and a glossary.",
+    },
+    {
+      id: "suggested-primer",
+      title: legalish ? "Procedural Primer" : `${topic} Primer`,
+      description: legalish
+        ? "A simplified overview of the stages and risks involved in formal disputes"
+        : `A simplified overview of the stages, risks, and important source-backed ideas in ${topic.toLowerCase()}`,
+      kind: "suggested",
+      prompt: `Create a primer for ${legalish ? "the dispute process" : topic} with a plain-language overview, key stages, risks, evidence, and open questions.`,
+    },
+  ];
+}
+
+function primaryReportTopic(notebook: Notebook | null) {
+  const topicMap = notebook?.knowledge.find((object) => object.type === "topic_map");
+  const topics = Array.isArray(topicMap?.data?.topics) ? topicMap.data.topics : [];
+  const topic = topics
+    .map((item) => (item && typeof item === "object" && "label" in item ? String((item as { label?: unknown }).label || "") : ""))
+    .find((label) => label.trim().length > 2);
+  const sourceTitle = notebook?.sources.find((source) => source.active)?.title || notebook?.sources[0]?.title || notebook?.title || "Source";
+  return reportTitleCase(cleanReportTopic(topic || sourceTitle || "Source"));
+}
+
+function cleanReportTopic(value: string) {
+  const cleaned = value
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b(report|guide|brief|overview|source|document|markdown|pdf)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "Source";
+}
+
+function reportTitleCase(value: string) {
+  const smallWords = new Set(["and", "or", "of", "for", "the", "a", "an", "to", "in", "on", "with"]);
+  return value
+    .split(/\s+/)
+    .slice(0, 4)
+    .map((word, index) => {
+      const lower = word.toLowerCase();
+      if (index > 0 && smallWords.has(lower)) return lower;
+      if (/^[A-Z0-9]{2,}$/.test(word)) return word;
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+}
+
+function customReportTitle(prompt: string) {
+  const cleaned = prompt.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "Custom Report";
+  return `Custom Report: ${clipReportText(cleaned, 44)}`;
+}
+
+function clipReportText(value: string, max: number) {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 1)).trim()}...`;
+}
+
 function sourceIcon(type: SourceType) {
   if (type === "url") return <Globe size={16} />;
   if (type === "youtube") return <Video size={16} />;
@@ -5372,6 +6695,7 @@ function sourceIcon(type: SourceType) {
   if (type === "note") return <NotebookPen size={16} />;
   if (type === "pdf") return <FileText size={16} />;
   if (type === "docx") return <FileText size={16} />;
+  if (type === "pptx") return <Presentation size={16} />;
   return <FileText size={16} />;
 }
 
@@ -5384,9 +6708,12 @@ function sourceTypeLabel(type: SourceType) {
       url: "Website",
       note: "Note",
       docx: "DOCX",
+      pptx: "PPTX",
+      epub: "EPUB",
       youtube: "YouTube",
       audio: "Audio",
       google_doc: "Google Doc",
+      image: "Image",
     } as Record<string, string>
   )[type] || "Source";
 }
@@ -5396,25 +6723,164 @@ function sourceNeedsUrl(type: SourceType) {
 }
 
 function sourceAcceptsFile(type: SourceType) {
-  return ["pdf", "docx", "audio", "markdown", "text"].includes(type);
+  return ["pdf", "docx", "pptx", "epub", "audio", "image", "markdown", "text"].includes(type);
 }
+
+const audioVideoSourceAccept = [
+  "audio/*",
+  "video/*",
+  ".3g2",
+  ".3gp",
+  ".aac",
+  ".aif",
+  ".aifc",
+  ".aiff",
+  ".amr",
+  ".au",
+  ".avi",
+  ".cda",
+  ".m4a",
+  ".mid",
+  ".midi",
+  ".mp3",
+  ".mp4",
+  ".mpeg",
+  ".mpg",
+  ".ogg",
+  ".opus",
+  ".ra",
+  ".ram",
+  ".snd",
+  ".wav",
+  ".wma",
+].join(",");
+
+const imageSourceAccept = [
+  "image/*",
+  ".avif",
+  ".bmp",
+  ".gif",
+  ".ico",
+  ".jp2",
+  ".png",
+  ".webp",
+  ".tif",
+  ".tiff",
+  ".heic",
+  ".heif",
+  ".jpeg",
+  ".jpg",
+  ".jpe",
+].join(",");
 
 function sourceFileAccept(type: SourceType) {
   if (type === "pdf") return ".pdf,application/pdf";
   if (type === "docx") return ".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  if (type === "audio") return "audio/*,video/*,.mp3,.m4a,.wav,.aac,.ogg,.mp4,.mov";
-  if (type === "image") return "image/*,.png,.jpg,.jpeg,.webp,.gif,.heic,.heif,.bmp,.tiff";
-  return ".md,.txt,.pdf,.docx,.csv,image/*,audio/*,video/*,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (type === "pptx") return ".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if (type === "epub") return ".epub,application/epub+zip";
+  if (type === "audio") return audioVideoSourceAccept;
+  if (type === "image") return imageSourceAccept;
+  return [
+    ".pdf",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".docx",
+    ".csv",
+    ".pptx",
+    ".epub",
+    imageSourceAccept,
+    audioVideoSourceAccept,
+    "text/*",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/epub+zip",
+  ].join(",");
 }
 
 function sourceTypeFromFile(file: File): SourceType {
   const name = file.name.toLowerCase();
   if (file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
   if (name.endsWith(".docx")) return "docx";
-  if (file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|heic|heif|bmp|tiff?|avif|ico)$/i.test(name)) return "image";
-  if (file.type.startsWith("audio/") || file.type.startsWith("video/") || /\.(mp3|m4a|wav|aac|ogg|opus|mp4|mov|avi|mpeg|wma)$/i.test(name)) return "audio";
-  if (name.endsWith(".txt")) return "text";
+  if (name.endsWith(".pptx")) return "pptx";
+  if (name.endsWith(".epub")) return "epub";
+  if (file.type.startsWith("image/") || /\.(png|jpe?g|jpe|webp|gif|heic|heif|bmp|tiff?|avif|ico|jp2)$/i.test(name)) return "image";
+  if (file.type.startsWith("audio/") || file.type.startsWith("video/") || /\.(3g2|3gp|aac|aif|aifc|aiff|amr|au|avi|cda|m4a|mid|midi|mp3|mp4|mpe?g|mpg|ogg|opus|ra|ram|snd|wav|wma|mov)$/i.test(name)) return "audio";
+  if (name.endsWith(".md") || name.endsWith(".markdown")) return "markdown";
+  if (name.endsWith(".txt") || name.endsWith(".csv")) return "text";
   return "markdown";
+}
+
+function queuedSourceFile(file: File): QueuedSourceFile {
+  return {
+    id: `source-file-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    file,
+    type: sourceTypeFromFile(file),
+    title: file.name.replace(/\.[^.]+$/, ""),
+    file_name: file.name,
+    mime_type: file.type || "application/octet-stream",
+    size: file.size,
+    status: "queued",
+    progress: 0,
+    progressLabel: "Ready",
+    progressDetail: "Waiting to upload",
+  };
+}
+
+function sourceFileFingerprint(file: File) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function sourceFileStatusLabel(status: QueuedSourceFileStatus) {
+  if (status === "adding") return "Adding";
+  if (status === "added") return "Added";
+  if (status === "failed") return "Failed";
+  return "Ready";
+}
+
+function queuedSourceFileProgress(item: QueuedSourceFile) {
+  const fallbackDetail = item.status === "added"
+    ? "Indexing continues in Sources"
+    : item.status === "failed"
+      ? item.error || "Upload failed"
+      : item.status === "adding"
+        ? "Uploading file"
+        : "Waiting to upload";
+  return {
+    percent: Math.round(clampNumber(item.progress ?? (item.status === "added" || item.status === "failed" ? 100 : 0), 0, 100)),
+    label: item.progressLabel || sourceFileStatusLabel(item.status),
+    detail: item.progressDetail || fallbackDetail,
+  };
+}
+
+function sourceProgressInfo(source: Source) {
+  if (source.status === "indexed" || source.status === "failed") return null;
+  const stage = String(source.metadata_json?.ingest_stage || source.status || "pending");
+  const stages: Record<string, { label: string; detail: string; percent: number }> = {
+    pending: { label: "Queued", detail: "Waiting for upload worker", percent: 8 },
+    upload_accepted: { label: "Upload accepted", detail: "Preparing source card", percent: 14 },
+    saving_file: { label: "Uploading file", detail: "Saving original file", percent: 22 },
+    extracting_text: { label: "Extracting text", detail: "Reading document content", percent: 38 },
+    chunking: { label: "Chunking", detail: "Splitting into RAG passages", percent: 56 },
+    embedding: { label: "Embedding", detail: "Creating semantic vectors", percent: 72 },
+    vector_indexing: { label: "Vector index", detail: "Writing search index", percent: 84 },
+    knowledge: { label: "Knowledge map", detail: "Building summaries and citations", percent: 93 },
+    parsing: { label: "Indexing", detail: "Preparing source", percent: 30 },
+  };
+  return stages[stage] || stages.parsing;
+}
+
+function formatFileSize(bytes: number) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const value = bytes / (1024 ** index);
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function isTextLikeFile(file: File) {
+  return file.type.includes("text") || /\.(md|markdown|txt|csv)$/i.test(file.name);
 }
 
 function sourceUrlPlaceholder(type: SourceType) {
@@ -5434,15 +6900,15 @@ function sourceBodyPlaceholder(type: SourceType) {
   if (type === "youtube") return "Paste transcript here if public captions are unavailable.";
   if (type === "audio") return "Paste transcript text for the audio file.";
   if (type === "google_doc") return "Paste document text if export is not accessible.";
-  if (type === "pdf" || type === "docx") return "Paste extracted text if local parsing cannot read the file.";
+  if (type === "pdf" || type === "docx") return "Paste extracted text if built-in parsing cannot read the file.";
   if (type === "note") return "Write a note that should become a citable source.";
   return "Paste source text or markdown.";
 }
 
 function sourceStatusLine(source: Source) {
   if (source.status === "failed") return "Failed to index";
-  if (source.status === "parsing") return "Indexing…";
-  if (source.status === "pending") return "Pending";
+  const progress = sourceProgressInfo(source);
+  if (progress) return progress.label;
   const words = source.word_count ? `${formatCount(source.word_count)} words` : "";
   return [sourceTypeLabel(source.type), words].filter(Boolean).join(" · ");
 }
@@ -5487,6 +6953,13 @@ function artifactTitle(type: ArtifactType) {
   return artifactTypes.find((artifact) => artifact.type === type)?.title || type;
 }
 
+function artifactPollDeadlineMs(type: ArtifactType) {
+  if (type === "video") return 15 * 60 * 1000;
+  if (type === "audio") return 10 * 60 * 1000;
+  if (type === "thumbnail" || type === "infographic") return 8 * 60 * 1000;
+  return 5 * 60 * 1000;
+}
+
 function estimateArtifactDuration(artifact: Artifact) {
   if (artifact.type !== "audio" && artifact.type !== "video") return "";
   const payload = artifact.content_json || {};
@@ -5506,8 +6979,8 @@ function artifactMetaLine(artifact: Artifact) {
   const duration = estimateArtifactDuration(artifact);
   if (duration) parts.push(duration);
   parts.push(artifactTitle(artifact.type));
-  const refs = artifact.source_refs_json?.length || 0;
-  parts.push(`${refs} ${refs === 1 ? "source" : "sources"}`);
+  const sourceCount = artifactSourceCount(artifact);
+  if (sourceCount) parts.push(`${sourceCount} ${sourceCount === 1 ? "source" : "sources"}`);
   const rel = relativeTime(artifact.created_at);
   if (rel) parts.push(rel);
   return parts.join(" · ");
@@ -5572,6 +7045,59 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
   return body as T;
 }
 
+function apiWithUploadProgress<T>(
+  path: string,
+  payload: unknown,
+  onProgress?: (progress: { loaded: number; total?: number; percent?: number }) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", path);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("content-type", "application/json");
+    xhr.upload.onprogress = (event) => {
+      onProgress?.({
+        loaded: event.loaded,
+        total: event.lengthComputable ? event.total : undefined,
+        percent: event.lengthComputable && event.total ? event.loaded / event.total : undefined,
+      });
+    };
+    xhr.onload = () => {
+      let body: Record<string, unknown> = {};
+      try {
+        body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+      } catch {
+        body = {};
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as T);
+      } else {
+        reject(new Error(String(body.error || `Request failed with ${xhr.status}`)));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network upload failed."));
+    xhr.send(JSON.stringify(payload));
+  });
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }));
+  return results;
+}
+
 function messageFromError(error: unknown) {
   return error instanceof Error ? error.message : "Request failed.";
 }
@@ -5581,12 +7107,102 @@ function isDefaultNotebookTitle(title?: string) {
   return value === "" || value === "Untitled notebook" || value === "SourceStudio Demo Notebook";
 }
 
-async function fileToBase64(file: File) {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
+function readRememberedNotebookId() {
+  try {
+    return window.localStorage.getItem(LAST_NOTEBOOK_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberNotebookId(id: string) {
+  try {
+    if (id) window.localStorage.setItem(LAST_NOTEBOOK_STORAGE_KEY, id);
+  } catch {
+    // Remembering the last notebook is convenience-only.
+  }
+}
+
+function forgetRememberedNotebookId() {
+  try {
+    window.localStorage.removeItem(LAST_NOTEBOOK_STORAGE_KEY);
+  } catch {
+    // Remembering the last notebook is convenience-only.
+  }
+}
+
+function readWorkspaceLayout(): WorkspaceLayout {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY) || "{}") as Partial<WorkspaceLayout>;
+    return normalizeWorkspaceLayout({
+      sources: Number.isFinite(parsed.sources) ? Number(parsed.sources) : DEFAULT_WORKSPACE_LAYOUT.sources,
+      studio: Number.isFinite(parsed.studio) ? Number(parsed.studio) : DEFAULT_WORKSPACE_LAYOUT.studio,
+    });
+  } catch {
+    return DEFAULT_WORKSPACE_LAYOUT;
+  }
+}
+
+function rememberWorkspaceLayout(layout: WorkspaceLayout) {
+  try {
+    window.localStorage.setItem(WORKSPACE_LAYOUT_STORAGE_KEY, JSON.stringify(normalizeWorkspaceLayout(layout)));
+  } catch {
+    // Workspace layout persistence is convenience-only.
+  }
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function workspaceInnerWidth(node: HTMLElement) {
+  const rect = node.getBoundingClientRect();
+  const style = window.getComputedStyle(node);
+  const padding = Number.parseFloat(style.paddingLeft || "0") + Number.parseFloat(style.paddingRight || "0");
+  return Math.max(0, rect.width - padding);
+}
+
+function normalizeWorkspaceLayout(layout: WorkspaceLayout, innerWidth = Number.POSITIVE_INFINITY): WorkspaceLayout {
+  const available = Math.max(0, innerWidth - (WORKSPACE_RESIZER_WIDTH * 2));
+  const maxSideTotal = Number.isFinite(innerWidth)
+    ? Math.max(WORKSPACE_MIN_SOURCE + WORKSPACE_MIN_STUDIO, available - WORKSPACE_MIN_CHAT)
+    : WORKSPACE_MAX_SOURCE + WORKSPACE_MAX_STUDIO;
+  let sources = clampNumber(layout.sources, WORKSPACE_MIN_SOURCE, Math.min(WORKSPACE_MAX_SOURCE, maxSideTotal - WORKSPACE_MIN_STUDIO));
+  let studio = clampNumber(layout.studio, WORKSPACE_MIN_STUDIO, Math.min(WORKSPACE_MAX_STUDIO, maxSideTotal - WORKSPACE_MIN_SOURCE));
+  const sideTotal = sources + studio;
+  if (sideTotal > maxSideTotal) {
+    const excess = sideTotal - maxSideTotal;
+    const sourceFlex = Math.max(0, sources - WORKSPACE_MIN_SOURCE);
+    const studioFlex = Math.max(0, studio - WORKSPACE_MIN_STUDIO);
+    const flexTotal = sourceFlex + studioFlex;
+    if (flexTotal > 0) {
+      sources -= Math.min(sourceFlex, excess * (sourceFlex / flexTotal));
+      studio -= Math.min(studioFlex, excess * (studioFlex / flexTotal));
+    }
+  }
+  return {
+    sources: Math.round(clampNumber(sources, WORKSPACE_MIN_SOURCE, WORKSPACE_MAX_SOURCE)),
+    studio: Math.round(clampNumber(studio, WORKSPACE_MIN_STUDIO, WORKSPACE_MAX_STUDIO)),
+  };
+}
+
+async function fileToBase64(file: File, onProgress?: (progress: number) => void) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read this file."));
+    reader.onprogress = (event) => {
+      if (event.lengthComputable && event.total) {
+        onProgress?.(event.loaded / event.total);
+      }
+    };
+    reader.onload = () => {
+      onProgress?.(1);
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 const ARTIFACT_TYPE_LABELS: Record<string, string> = {
@@ -5642,6 +7258,31 @@ function downloadText(fileName: string, text: string, mimeType = "application/js
   anchor.download = fileName;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back to a temporary textarea for browser contexts where clipboard
+      // permission is denied even though the API exists.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Copy failed. Select the text and copy it manually.");
 }
 
 function downloadSlug(input: string) {

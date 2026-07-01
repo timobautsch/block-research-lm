@@ -15,6 +15,7 @@ import {
 } from "./sourcestudio/auth-store.js";
 import { createDebugLogger } from "./sourcestudio/logger.js";
 import { createDurableStore } from "./sourcestudio/durable-store.js";
+import { MAX_SOURCE_REQUEST_BODY_BYTES, MAX_SOURCE_UPLOAD_MB } from "./sourcestudio/schemas.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -39,7 +40,7 @@ const authStore = createAuthStore({
 });
 const app = express();
 
-app.use(express.json({ limit: "18mb" }));
+app.use(express.json({ limit: MAX_SOURCE_REQUEST_BODY_BYTES }));
 app.use("/api", (_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
@@ -190,6 +191,14 @@ app.get("/api/artifacts/:id", routeHandler((req) => ({
   artifact: engine.getArtifact(req.params.id, userContext(req)),
 })));
 
+app.delete("/api/artifacts/:id", asyncHandler(async (req, res) => {
+  res.json(await engine.deleteArtifact(req.params.id, userContext(req)));
+}));
+
+app.delete("/api/notebooks/:id/artifacts", asyncHandler(async (req, res) => {
+  res.json(await engine.deleteNotebookArtifacts(req.params.id, userContext(req)));
+}));
+
 app.get("/api/artifacts/:id/flashcard-deck", asyncHandler(async (req, res) => {
   res.json({ deck: await engine.getFlashcardDeckForArtifact(req.params.id, userContext(req)) });
 }));
@@ -253,18 +262,21 @@ app.use((error, req, res, next) => {
   void next;
   const status = Number(error?.status || 500);
   const safeStatus = status >= 400 && status < 600 ? status : 500;
+  const publicMessage = error?.type === "entity.too.large"
+    ? `Uploaded files can be up to ${MAX_SOURCE_UPLOAD_MB} MB.`
+    : error.message;
   logger.error("http.request.error", {
     request_id: req.requestId,
     method: req.method,
     path: req.path,
     status: safeStatus,
-    error: safeStatus === 500 ? "SourceStudio request failed." : error.message,
+    error: safeStatus === 500 ? "SourceStudio request failed." : publicMessage,
     // Always record the real cause server-side (never sent to the client) so 500s are diagnosable.
     detail: String(error?.message || error).slice(0, 300),
     stack: String(error?.stack || "").split("\n").slice(1, 4).join(" | "),
   });
   res.status(safeStatus).json({
-    error: safeStatus === 500 ? "SourceStudio request failed." : error.message,
+    error: safeStatus === 500 ? "SourceStudio request failed." : publicMessage,
   });
 });
 

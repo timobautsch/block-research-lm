@@ -6,7 +6,7 @@ import test from "node:test";
 import { createAuthStore } from "../server/sourcestudio/auth-store.js";
 import { createSourceStudioEngine } from "../server/sourcestudio/engine.js";
 
-async function withEngine(fn) {
+async function withEngine(fn, env = {}) {
   const dir = await mkdtemp(join(tmpdir(), "sourcestudio-test-"));
   const engine = await createSourceStudioEngine({
     root: resolve("."),
@@ -14,10 +14,48 @@ async function withEngine(fn) {
     stateFile: join(dir, "state.json"),
     env: {
       SOURCESTUDIO_VIDEO_TTS: "false",
+      ...env,
     },
   });
   try {
     await fn(engine);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function withRerankerEngine(fn) {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-reranker-test-"));
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: String(url), options });
+    const body = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: body.documents.map((_, index) => ({
+          index,
+          relevance_score: index === 0 ? 0.95 : 0.25,
+        })),
+      }),
+    };
+  };
+  const engine = await createSourceStudioEngine({
+    root: resolve("."),
+    storageDir: dir,
+    stateFile: join(dir, "state.json"),
+    env: {
+      COHERE_API_KEY: "test-cohere-token",
+      COHERE_RERANK_MODEL: "rerank-v4.0-pro",
+      RERANK_PROVIDER: "cohere",
+      RERANK_WEIGHT: "1",
+      SOURCESTUDIO_VIDEO_TTS: "false",
+    },
+    fetchImpl,
+  });
+  try {
+    await fn(engine, calls);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -116,6 +154,43 @@ async function withArtifactProviderEngine(fn) {
   }
 }
 
+async function withYouTubeKitProviderEngine(fn, providerPayload) {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-youtube-provider-test-"));
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        content: [
+          {
+            text: JSON.stringify(providerPayload),
+          },
+        ],
+      }),
+    };
+  };
+  const engine = await createSourceStudioEngine({
+    root: resolve("."),
+    storageDir: dir,
+    stateFile: join(dir, "state.json"),
+    env: {
+      ANTHROPIC_API_KEY: "test-provider-token",
+      ANTHROPIC_MODEL: "test-claude-model",
+      ANTHROPIC_ARTIFACT_MODEL: "test-claude-artifact-model",
+      DEFAULT_ARTIFACT_PROVIDER: "anthropic",
+      SOURCESTUDIO_VIDEO_TTS: "false",
+    },
+    fetchImpl,
+  });
+  try {
+    await fn(engine, calls);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function withAudioEngine(fn) {
   const dir = await mkdtemp(join(tmpdir(), "sourcestudio-audio-test-"));
   const calls = [];
@@ -135,6 +210,35 @@ async function withAudioEngine(fn) {
       ELEVENLABS_VOICE_ID_HOST_A: "voice-a",
       ELEVENLABS_VOICE_ID_HOST_B: "voice-b",
       ELEVENLABS_MODEL: "eleven_v3",
+    },
+    fetchImpl,
+  });
+  try {
+    await fn(engine, calls);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function withVideoElevenLabsEngine(fn) {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-video-elevenlabs-test-"));
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(tinyWavBuffer(), {
+      status: 200,
+      headers: { "content-type": "audio/wav" },
+    });
+  };
+  const engine = await createSourceStudioEngine({
+    root: resolve("."),
+    storageDir: dir,
+    stateFile: join(dir, "state.json"),
+    env: {
+      ELEVENLABS_API_KEY: "test-provider-token",
+      ELEVENLABS_VOICE_ID_VIDEO: "voice-video",
+      ELEVENLABS_VIDEO_MODEL: "eleven_multilingual_v2",
+      SOURCESTUDIO_VIDEO_IMAGE_PROVIDER: "local",
     },
     fetchImpl,
   });
@@ -203,6 +307,41 @@ async function withAudioScriptProviderEngine(fn) {
   }
 }
 
+function tinyWavBuffer(seconds = 1, sampleRate = 8000) {
+  const sampleCount = Math.max(1, Math.floor(seconds * sampleRate));
+  const dataSize = sampleCount * 2;
+  const buffer = Buffer.alloc(44 + dataSize);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataSize, 40);
+  return buffer;
+}
+
+async function waitForCondition(predicate, { attempts = 80, intervalMs = 25, message = "Timed out waiting for condition." } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const result = await predicate();
+      if (result) return result;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  if (lastError) throw lastError;
+  assert.fail(message);
+}
+
 async function withAuthStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), "sourcestudio-auth-test-"));
   const store = createAuthStore({
@@ -263,6 +402,231 @@ test("ingests markdown into blocks, chunks, and knowledge objects", async () => 
   });
 });
 
+test("generates notebook-specific suggested questions instead of demo prompts", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Prop firm documents" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Payout rules",
+      body: "# Payout Rules\n\nProp firm challenge documents describe drawdown limits, payout timing, account verification, and execution evidence.",
+    });
+
+    const questions = engine.getNotebook(notebook.id).suggested_questions;
+    assert.ok(questions.length >= 3);
+    assert.match(questions.join(" "), /Payout rules|active sources|material/i);
+    assert.doesNotMatch(questions.join(" "), /Block Research AI|trading-bot|automation themes/i);
+
+    engine._state().knowledgeObjects.push({
+      id: "legacy-demo-suggestions",
+      notebook_id: notebook.id,
+      source_id: "",
+      type: "suggested_questions",
+      data: {
+        questions: [
+          "What does Block Research AI appear to offer across the website and blog sources?",
+          "Which trading-bot and automation themes appear most often in the sources?",
+        ],
+      },
+      created_at: new Date().toISOString(),
+    });
+
+    const migratedQuestions = engine.getNotebook(notebook.id).suggested_questions;
+    assert.doesNotMatch(migratedQuestions.join(" "), /Block Research AI|trading-bot|automation themes/i);
+    assert.match(migratedQuestions.join(" "), /Payout rules|active sources|material/i);
+  });
+});
+
+test("deferred source ingest returns before background indexing completes", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Deferred ingest test" });
+    const body = Array.from({ length: 220 }, (_, index) =>
+      `## Section ${index + 1}\n\nDeferred upload should create the source card first, then extract, chunk, embed, and build source knowledge in the background.`,
+    ).join("\n\n");
+    const source = await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Deferred source",
+      body,
+      defer_indexing: true,
+    });
+    assert.equal(source.status, "parsing");
+    assert.notEqual(source.metadata_json.ingest_stage, "indexed");
+
+    let indexedSource = null;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const current = engine.getNotebook(notebook.id).sources.find((item) => item.id === source.id);
+      if (current?.status === "indexed") {
+        indexedSource = current;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(indexedSource);
+    assert.equal(indexedSource.metadata_json.ingest_stage, "indexed");
+    assert.ok(indexedSource.chunk_count >= 1);
+  });
+});
+
+test("persists every deferred source in a concurrent upload batch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-concurrent-ingest-test-"));
+  const stateFile = join(dir, "state.json");
+  const env = {
+    SOURCESTUDIO_INGEST_CONCURRENCY: "3",
+    SOURCESTUDIO_VIDEO_TTS: "false",
+  };
+  try {
+    const engine = await createSourceStudioEngine({
+      root: resolve("."),
+      storageDir: dir,
+      stateFile,
+      env,
+    });
+    const notebook = await engine.createNotebook({ title: "Concurrent ingest test" });
+    const totalSources = 24;
+    const expectedTitles = Array.from({ length: totalSources }, (_, index) =>
+      `Batch upload source ${String(index + 1).padStart(2, "0")}`,
+    );
+
+    const accepted = await Promise.all(
+      expectedTitles.map((title, index) =>
+        engine.ingestSource(notebook.id, {
+          type: "markdown",
+          title,
+          body: [
+            `# ${title}`,
+            "Concurrent deferred uploads should keep every accepted source visible and persisted.",
+            `Source number ${index + 1} includes a unique persistence marker for reload verification.`,
+            "The indexing pipeline extracts blocks, chunks them, embeds them, and stores source knowledge.",
+          ].join("\n\n"),
+          defer_indexing: true,
+        }),
+      ),
+    );
+
+    assert.equal(accepted.length, totalSources);
+    assert.equal(engine.getNotebook(notebook.id).sources.length, totalSources);
+
+    await waitForCondition(
+      () => {
+        const sources = engine.getNotebook(notebook.id).sources;
+        return sources.length === totalSources && sources.every((source) => source.status === "indexed");
+      },
+      { attempts: 160, intervalMs: 25, message: "Concurrent sources did not finish indexing." },
+    );
+
+    const persistedSources = await waitForCondition(
+      async () => {
+        const saved = JSON.parse(await readFile(stateFile, "utf8"));
+        const sources = saved.sources.filter((source) => source.notebook_id === notebook.id);
+        return sources.length === totalSources && sources.every((source) => source.status === "indexed") ? sources : null;
+      },
+      { attempts: 160, intervalMs: 25, message: "Concurrent sources were not fully persisted." },
+    );
+    assert.deepEqual(
+      persistedSources.map((source) => source.title).sort(),
+      expectedTitles.slice().sort(),
+    );
+
+    const reloadedEngine = await createSourceStudioEngine({
+      root: resolve("."),
+      storageDir: dir,
+      stateFile,
+      env,
+    });
+    const reloadedNotebook = reloadedEngine.getNotebook(notebook.id);
+    assert.equal(reloadedNotebook.sources.length, totalSources);
+    assert.deepEqual(
+      reloadedNotebook.sources.map((source) => source.title).sort(),
+      expectedTitles.slice().sort(),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hybrid semantic chunking splits topic shifts before the token target", async () => {
+  await withEngine(async (engine) => {
+    const source = {
+      id: "source_semantic_chunking",
+      notebook_id: "notebook_semantic_chunking",
+      title: "Semantic chunking source",
+    };
+    const musicParagraph = [
+      "Acoustic guitar performance depends on rhythm, melody, live dynamics, percussion patterns, stage timing, and audience energy.",
+      "The duo layers bass notes, hi hat textures, chord accents, festival arrangements, and improvisational transitions without laptop loops.",
+      "Rehearsal focuses on tempo discipline, guitar technique, pickup balance, soundcheck routines, and expressive live phrasing.",
+    ].join(" ");
+    const contractParagraph = [
+      "Construction contract disputes depend on acceptance, defect notices, cure deadlines, evidentiary records, payment maturity, and damages limits.",
+      "The legal analysis tracks warranty rights, burden of proof, remediation periods, documented defects, and remuneration after refused acceptance.",
+      "Settlement planning focuses on written notices, inspection logs, contractual milestones, mitigation duties, and enforceable repair demands.",
+    ].join(" ");
+    const body = [
+      musicParagraph,
+      musicParagraph,
+      musicParagraph,
+      contractParagraph,
+      contractParagraph,
+      contractParagraph,
+    ].join("\n\n");
+    const blocks = engine._internals.parseMarkdownBlocks(source, body);
+    const chunks = engine._internals.chunkDocument(source.notebook_id, source, blocks);
+
+    assert.ok(chunks.length >= 2);
+    assert.equal(chunks[0].metadata_json.chunking_strategy, "hybrid_semantic");
+    assert.ok(chunks.some((chunk) => chunk.metadata_json.semantic_boundary_reason === "semantic_shift"));
+    assert.match(chunks[0].text, /Acoustic guitar performance/);
+    assert.doesNotMatch(chunks[0].text, /Construction contract disputes/);
+    assert.match(chunks.at(-1).text, /Construction contract disputes/);
+  }, { CHUNKING_STRATEGY: "hybrid" });
+});
+
+test("does not retrieve binary PDF fallback text", async () => {
+  await withEngine(async (engine) => {
+    const binaryPdfText = [
+      "%PDF-1.4",
+      "% created by Pillow 11.2.1 PDF driver",
+      "1 0 obj << /Type /XObject /Subtype /Image /Filter /DCTDecode /Length 9999 /ColorSpace /DeviceRGB >>",
+      "stream",
+      `${"\xff\xd8\xff\xe0JFIF\u0000".repeat(80)}${"A\u0001B\u0002C\u0003".repeat(120)}${"\u00c2\u00be".repeat(260)}`,
+      "endstream",
+      "endobj",
+      "xref",
+      "trailer << /Root 1 0 R >>",
+    ].join("\n");
+    assert.equal(engine._internals.isLikelyGarbledExtraction(binaryPdfText), true);
+
+    const extracted = await engine._internals.extractPdfText(Buffer.from(binaryPdfText, "latin1"));
+    assert.equal(extracted.parser, "pdf-unreadable");
+    assert.doesNotMatch(extracted.text, /DCTDecode|JFIF|%PDF|Pillow/);
+
+    const notebook = await engine.createNotebook({ title: "Bad PDF test" });
+    const source = await engine.ingestSource(notebook.id, {
+      type: "pdf",
+      title: "Scanned statement",
+      file_name: "statement.pdf",
+      mime_type: "application/pdf",
+      base64: Buffer.from(binaryPdfText, "latin1").toString("base64"),
+    }, { sync: true });
+    assert.equal(source.metadata_json.parser, "pdf-unreadable");
+    assert.equal(source.word_count, 0);
+
+    const evidencePack = await engine._internals.buildEvidencePack({
+      notebook_id: notebook.id,
+      question: "What does the scanned statement say?",
+    });
+    assert.equal(evidencePack.citations_available, false);
+    assert.equal(evidencePack.evidence_items.length, 0);
+
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "What does the scanned statement say?",
+    });
+    assert.equal(response.message.mode, "abstained");
+    assert.doesNotMatch(response.content, /DCTDecode|JFIF|%PDF|Pillow|\u00c2\u00be/);
+    assert.match(response.content, /cannot answer/i);
+  });
+});
+
 test("answers supported questions with citations and a citation ledger", async () => {
   await withEngine(async (engine) => {
     const notebook = await engine.createNotebook({ title: "Chat test" });
@@ -280,6 +644,69 @@ test("answers supported questions with citations and a citation ledger", async (
     assert.equal(response.grounding.unsupported, 0);
     const ledger = engine.getCitationLedger(response.message.id);
     assert.ok(ledger.entries.length >= 1);
+  });
+});
+
+test("reranks hybrid retrieval candidates through Cohere when configured", async () => {
+  await withRerankerEngine(async (engine, calls) => {
+    const notebook = await engine.createNotebook({ title: "Reranker test" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Hybrid retrieval source",
+      body: "# Hybrid Retrieval\n\nHybrid search first gathers BM25, keyword, entity, and vector candidates before evidence selection.",
+    });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Reranker source",
+      body: "# Reranking\n\nA reranker reads candidate passages and promotes the evidence that most directly answers the query before the Evidence Pack is built.",
+    });
+
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "How does the reranker improve hybrid search?",
+    });
+
+    assert.equal(engine.providerStatus().reranker.provider, "cohere");
+    assert.equal(engine.providerStatus().reranker.model, "rerank-v4.0-pro");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /cohere\.com\/v2\/rerank/);
+    assert.equal(calls[0].options.headers.authorization, "Bearer test-cohere-token");
+    const payload = JSON.parse(calls[0].options.body);
+    assert.equal(payload.model, "rerank-v4.0-pro");
+    assert.ok(payload.documents.length >= 1);
+    assert.ok(response.evidence_pack.retrieved_items.some((item) => item.ranking_signals.reranker_provider === "cohere"));
+    assert.ok(response.evidence_pack.evidence_items.some((item) => item.ranking_signals.reranker_model === "rerank-v4.0-pro"));
+  });
+});
+
+test("prints full active video transcript when explicitly requested", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Transcript test" });
+    await engine.ingestSource(notebook.id, {
+      type: "youtube",
+      title: "TradingView automation walkthrough",
+      original_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      body: [
+        "# YouTube transcript",
+        "",
+        "[0:00] Today we are saying goodbye to three commas in Europe.",
+        "[0:12] We have been building a better and simpler alternative.",
+        "[1:58] For automated trading strategies from a pine script you need an intermediate layer.",
+        "[5:41] The log is more detailed and does not stop after five entries.",
+        "[7:01] Go to settings and start with the Signal Pipe secret.",
+      ].join("\n"),
+    });
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Poste mir bitte das komplette Videoskript.",
+    });
+    assert.match(response.content, /Today we are saying goodbye to three commas/i);
+    assert.match(response.content, /Signal Pipe secret/i);
+    assert.doesNotMatch(response.content, /Based on the active sources/i);
+    assert.equal(response.provider, "local");
+    assert.equal(response.model, "local-source-text-v1");
+    assert.equal(response.grounding.unsupported, 0);
+    assert.ok(response.citations.length >= 1);
   });
 });
 
@@ -344,6 +771,13 @@ test("generates all required source-backed Studio artifacts", async () => {
       assert.ok(response.artifact.content_json.evidence_audit.source_coverage > 0, `${type} should cite at least one retrieved source`);
       assert.equal(response.artifact.content_json.evidence_audit.invalid_citation_count, 0, `${type} should not cite invalid evidence`);
       assert.ok(response.artifact.content_json.evidence_audit.top_sources.length >= 1, `${type} should expose source audit details`);
+      if (type === "report") {
+        assert.ok(response.artifact.content_json.executive_summary.length >= 3, "report should include an executive summary");
+        assert.ok(response.artifact.content_json.detailed_sections.length >= 5, "report should include long-form sections");
+        assert.match(response.artifact.text_content, /## Executive Summary/);
+        assert.match(response.artifact.text_content, /## Recommendations/);
+        assert.ok(response.artifact.text_content.length > 2500, "report export should be substantive");
+      }
       if (type === "slide-deck") {
         assert.equal(response.artifact.content_json.render_status, "rendered_svg_pptx");
         assert.ok(response.artifact.content_json.slides.every((slide) => /^<svg/.test(slide.svg_markup)));
@@ -355,6 +789,111 @@ test("generates all required source-backed Studio artifacts", async () => {
         assert.equal(pptxBytes.subarray(0, 2).toString("utf8"), "PK");
       }
     }
+  });
+});
+
+test("deletes Studio outputs individually and in batches", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Delete outputs test" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Delete source",
+      body: "# Delete Source\n\nEvidence Packs keep generated reports, quizzes, and flashcards grounded in active source evidence.",
+    });
+    const report = await engine.createArtifact({ notebook_id: notebook.id, type: "report", options: {} });
+    const flashcards = await engine.createArtifact({ notebook_id: notebook.id, type: "flashcards", options: { count: 6 } });
+    assert.equal(engine.getNotebook(notebook.id).artifacts.length, 2);
+
+    const single = await engine.deleteArtifact(report.artifact.id);
+    assert.equal(single.deleted, 1);
+    assert.equal(engine.getNotebook(notebook.id).artifacts.length, 1);
+    assert.throws(() => engine.getArtifact(report.artifact.id), /Artifact not found/);
+    await assert.rejects(() => stat(report.artifact.file_path));
+
+    const deckId = flashcards.artifact.content_json.deck_id;
+    assert.ok(engine._state().flashcardDecks.some((deck) => deck.id === deckId));
+    const batch = await engine.deleteNotebookArtifacts(notebook.id);
+    assert.equal(batch.deleted, 1);
+    assert.equal(engine.getNotebook(notebook.id).artifacts.length, 0);
+    assert.equal(engine._state().flashcardDecks.some((deck) => deck.id === deckId), false);
+    assert.equal(engine._state().flashcards.some((card) => card.artifact_id === flashcards.artifact.id), false);
+  });
+});
+
+test("generates synthesized multi-level mind maps instead of quote labels", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Werkvertrag Mängel und Vergütungsstreit" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Werkvertrag Fallnotizen",
+      body: [
+        "# Ausgangslage",
+        "",
+        "Der Besteller rügt Mängel an der Werkleistung und verweigert deshalb die Abnahme.",
+        "Die Vergütung wird erst fällig, wenn die Abnahme erfolgt oder rechtlich entbehrlich ist.",
+        "Vor einer Minderung oder einem Schadensersatzanspruch muss die Nacherfüllung mit angemessener Frist geprüft werden.",
+        "E-Mails, Abnahmeprotokolle und Fotos sichern die Beweisführung zum Mangel und zur Vergütung.",
+        "Offen bleibt, ob der Unternehmer die Mängel bestritten oder eine Nachbesserung angeboten hat.",
+      ].join("\n"),
+    });
+
+    const response = await engine.createArtifact({ notebook_id: notebook.id, type: "mindmap", options: {} });
+    const mindMap = response.artifact.content_json;
+    const labels = mindMap.nodes.map((node) => node.label);
+    const root = mindMap.nodes.find((node) => node.type === "notebook");
+    const firstLevel = mindMap.edges
+      .filter((edge) => edge.source === root.id)
+      .map((edge) => mindMap.nodes.find((node) => node.id === edge.target))
+      .filter(Boolean);
+    const childMap = new Map();
+    for (const edge of mindMap.edges) {
+      if (!childMap.has(edge.source)) childMap.set(edge.source, []);
+      childMap.get(edge.source).push(edge.target);
+    }
+    const depth = (nodeId, current = 0) => Math.max(current, ...(childMap.get(nodeId) || []).map((childId) => depth(childId, current + 1)));
+
+    assert.equal(response.job.status, "completed");
+    assert.ok(mindMap.nodes.length >= 8);
+    assert.ok(firstLevel.length >= 2);
+    assert.ok(depth(root.id) >= 2);
+    assert.ok(labels.some((label) => /Mängelrechte|Vergütung|Abnahme|Beweisführung/.test(label)));
+    assert.ok(labels.some((label) => /Abnahme steuert Fälligkeit|Nacherfüllung zuerst prüfen|Belege systematisch sichern|Klärungsbedarf markieren/.test(label)));
+    assert.ok(mindMap.nodes.every((node) => node.type === "notebook" || String(node.label).length <= 68));
+    assert.ok(mindMap.nodes.every((node) => !/\[\d+\]|\d{1,2}:\d{2}/.test(String(node.label))));
+    assert.ok(labels.every((label) => !/Der Besteller rügt Mängel an der Werkleistung/i.test(label)));
+  });
+});
+
+test("keeps mind maps focused on the notebook topic when sources are noisy", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "ENYP Guitar-Duo Live Techno" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "enypguitarduo.com",
+      body: [
+        "# ENYP Guitar-Duo Live Techno",
+        "",
+        "Das ENYP Guitar-Duo spielt Akustik-Techno live mit zwei Gitarren, ohne Laptop und ohne Loops.",
+        "Kick, Bass, Hi-Hat und Melodie entstehen über selbst gebaute Gitarrentechnik, 10 Tonabnehmer und große Pedalboards.",
+        "Das Duo ist buchbar für Festivals, Clubs, Corporate Events und private Veranstaltungen.",
+        "Veranstalter finden EPK, Technical Rider und Pressefotos als Booking-Unterlagen.",
+      ].join("\n"),
+    });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "format_pdf",
+      body: "SEC Chair Gary Gensler discussed Nasdaq approval, Bitcoin ETF comments, and market structure concerns.",
+    });
+
+    const response = await engine.createArtifact({ notebook_id: notebook.id, type: "mindmap", options: {} });
+    const mindMap = response.artifact.content_json;
+    const labels = mindMap.nodes.map((node) => node.label).join(" ");
+
+    assert.equal(response.job.status, "completed");
+    assert.ok(/Live-Konzept|Sound & Technik|Auftritte & Booking|Profil & Stil/.test(labels));
+    assert.ok(/Zwei Gitarren live|Gitarren erzeugen das Setup|Buchbar für Shows|Booking-Unterlagen verfügbar/.test(labels));
+    assert.equal(/SEC Chair|Nasdaq|Bitcoin|format[_\s-]pdf/i.test(labels), false);
+    assert.equal(mindMap.nodes.some((node) => node.type === "claim"), false);
   });
 });
 
@@ -380,6 +919,29 @@ test("renders Video Overview as playable MP4 media", async () => {
     assert.match(media.file_name, /\.mp4$/);
     const savedVideo = await stat(media.path);
     assert.ok(savedVideo.size > 1000);
+  });
+});
+
+test("renders Video Overview narration through ElevenLabs TTS", async () => {
+  await withVideoElevenLabsEngine(async (engine, calls) => {
+    const notebook = await engine.createNotebook({ title: "Video voice test" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Voice source",
+      body: "# Voice Source\n\nVideo overviews should use high-quality narration while the visual track stays image-led, cartoon-like, and free of dense text slides.",
+    });
+    const response = await engine.createArtifact({ notebook_id: notebook.id, type: "video", options: {} });
+    assert.equal(response.job.status, "completed");
+    assert.equal(response.artifact.content_json.video_status, "rendered");
+    assert.equal(response.artifact.content_json.video_narration_status, "rendered_elevenlabs");
+    assert.equal(response.artifact.content_json.video_tts_provider, "elevenlabs");
+    assert.equal(response.artifact.content_json.video_visual_status, "rendered_local_cartoon");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /elevenlabs\.io\/v1\/text-to-speech\/voice-video/);
+    const body = JSON.parse(calls[0].options.body);
+    assert.match(body.text, /Video voice test/i);
+    const media = engine.getArtifactMedia(response.artifact.id);
+    assert.equal(media.content_type, "video/mp4");
   });
 });
 
@@ -448,6 +1010,38 @@ test("creates interactive flashcard decks with reviews, missed practice, and sou
   });
 });
 
+test("builds flashcards as learning questions instead of quote-only cards", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Signal Pipe flashcards" });
+    await engine.ingestSource(notebook.id, {
+      type: "youtube",
+      title: "TradingView Signal Pipe setup",
+      body: [
+        "# Transcript",
+        "",
+        "And from there, you would create not a [10:35] watch list alert, but a single alert on Vin Premium 1 second time frame.",
+        "You cannot send TradingView strategy signals directly to your broker for automated trading, so you need an intermediate signal forwarder.",
+        "In the TradingView alert, paste the Signal Pipe webhook URL and the alert message.",
+      ].join("\n"),
+    });
+    const response = await engine.createArtifact({
+      notebook_id: notebook.id,
+      type: "flashcards",
+      options: {
+        topic: "Signal Pipe",
+        count: 4,
+        card_types: ["concept", "application", "caveat", "source-check"],
+      },
+    });
+    const deck = await engine.getFlashcardDeckForArtifact(response.artifact.id);
+    assert.ok(deck.cards.length >= 3);
+    assert.ok(deck.cards.every((card) => /\?$/.test(card.question)));
+    assert.ok(deck.cards.every((card) => !/And from there|watch list alert, but a single alert/.test(card.question)));
+    assert.ok(deck.cards.some((card) => /single alert|intermediate forwarder|webhook/i.test(card.answer)));
+    assert.ok(deck.cards.every((card) => !card.answer.startsWith("And from there")));
+  });
+});
+
 test("routes Studio artifact generation through a configured provider with local citation control", async () => {
   await withArtifactProviderEngine(async (engine, calls) => {
     const notebook = await engine.createNotebook({ title: "Artifact provider test" });
@@ -472,6 +1066,56 @@ test("routes Studio artifact generation through a configured provider with local
     assert.match(calls[0].url, /anthropic\.com\/v1\/messages/);
     const runs = engine.listModelRuns();
     assert.ok(runs.some((run) => run.provider === "anthropic" && run.role === "artifact_generation" && run.status === "completed"));
+  });
+});
+
+test("keeps YouTube publish kits in English and rejects off-topic provider drift", async () => {
+  await withYouTubeKitProviderEngine(async (engine, calls) => {
+    const notebook = await engine.createNotebook({ title: "Prop Firm Trading Challenges" });
+    await engine.ingestSource(notebook.id, {
+      type: "youtube",
+      title: "Prop firm risk workflow",
+      body: [
+        "# YouTube transcript",
+        "",
+        "[0:00] Prop firm traders must understand challenge rules before taking risk.",
+        "[1:30] The core workflow is maximum daily loss, drawdown limits, payout timing, and account verification.",
+        "[4:00] A trader should document executions, certificates, payout screenshots, and risk controls.",
+        "[7:00] Passing a challenge is not enough if the prop firm rules invalidate the payout later.",
+      ].join("\n"),
+    });
+
+    const response = await engine.createArtifact({
+      notebook_id: notebook.id,
+      type: "youtube-kit",
+      options: {},
+    });
+    const kit = response.artifact.content_json;
+    const combined = `${kit.titles.join(" ")} ${kit.description} ${kit.chapters.map((chapter) => chapter.label).join(" ")}`;
+
+    assert.equal(response.job.status, "completed");
+    assert.equal(kit.language, "English");
+    assert.match(kit.warning, /rejected because it did not match/i);
+    assert.match(combined, /Prop Firm Trading Challenges|prop firm|challenge|risk|drawdown/i);
+    assert.doesNotMatch(combined, /sérülés|futás|térded|bemelegítés|futó/i);
+    assert.equal(calls.length, 1);
+    const providerRequest = JSON.parse(calls[0].options.body);
+    assert.match(providerRequest.messages[0].content, /Write every title.*English/i);
+  }, {
+    titles: [
+      "10 sérülés, ami minden hobbifutót utolér",
+      "Futósérülések: ezt csináld, mielőtt fáj a térded",
+      "A futás rejtett veszélyei",
+      "Miért fáj futás után?",
+      "Kezdő futó vagy?",
+    ],
+    description: "Fáj a térded, a bokád vagy a lábszárad futás után? Ebben a videóban végigvesszük a futósérüléseket.",
+    chapters: [
+      { time: "0:00", label: "Bevezető" },
+      { time: "1:30", label: "A leggyakoribb futósérülések" },
+      { time: "4:00", label: "Miért alakulnak ki?" },
+    ],
+    tags: ["futás", "sérülés", "térd"],
   });
 });
 

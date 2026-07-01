@@ -9,15 +9,15 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;600&display=swap');
 
 :root{
-  --bg0:#06070c; --bg1:#0a0d16; --bg2:#0e1320;
-  --ink:#eef2fb; --ink-soft:#aeb7cd; --ink-dim:#737d96;
-  --line:rgba(255,255,255,.10);
-  --glass:rgba(255,255,255,.045);
-  --glass-2:rgba(255,255,255,.07);
-  --indigo:#6d7bff; --violet:#a78bfa; --cyan:#36e0f2; --teal:#2dd4bf;
+  --bg0:#0a0a0b; --bg1:#111113; --bg2:#161719;
+  --ink:#f4f5f6; --ink-soft:#c9ccd0; --ink-dim:#8a8d93;
+  --line:rgba(255,255,255,.09);
+  --glass:rgba(255,255,255,.04);
+  --glass-2:rgba(255,255,255,.065);
+  --indigo:#a794ff; --violet:#AA9FFF; --cyan:#0FD070; --teal:#34e2b0;
   --claude:#e08a5f; --openai:#19c37d; --supa:#3ecf8e; --deep:#15e6a0;
-  --eleven:#c4a7ff; --voyage:#7c8bff; --amber:#fbbf24; --rose:#fb7185; --green:#34d399;
-  --grad: linear-gradient(100deg,var(--indigo),var(--violet) 45%,var(--cyan));
+  --eleven:#c4a7ff; --voyage:#a794ff; --amber:#fbbf24; --rose:#fb7185; --green:#0FD070;
+  --grad: linear-gradient(100deg,#0FD070,#7fe6b3 38%,#AA9FFF);
   --shadow: 0 30px 80px -30px rgba(0,0,0,.8);
   --r: 18px;
   font-synthesis:none;
@@ -27,8 +27,8 @@
 html,body{height:100%}
 body{
   background:
-    radial-gradient(1200px 700px at 78% -8%, rgba(109,123,255,.16), transparent 60%),
-    radial-gradient(1000px 650px at 6% 108%, rgba(54,224,242,.12), transparent 55%),
+    radial-gradient(1200px 700px at 78% -8%, rgba(170,159,255,.15), transparent 60%),
+    radial-gradient(1000px 650px at 6% 108%, rgba(15,208,112,.14), transparent 55%),
     linear-gradient(160deg,var(--bg1),var(--bg0) 70%);
   color:var(--ink);
   font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
@@ -307,7 +307,8 @@ h1.title{
 .mfoot{margin-top:12px; display:flex; justify-content:center}
 
 /* ============ OUTPUTS radial ============ */
-.radial{position:relative; width:100%; height:100%; display:grid; place-items:center}
+.radial{position:relative; width:100%; height:100%; min-height:clamp(400px,56vh,560px); display:grid; place-items:center}
+#sats{position:absolute; inset:0; pointer-events:none}
 .core{width:clamp(110px,15vw,170px); aspect-ratio:1; border-radius:50%; display:grid;place-items:center; text-align:center;
   background:radial-gradient(circle at 50% 40%,rgba(54,224,242,.35),rgba(109,123,255,.15) 60%,transparent);
   border:1px solid rgba(54,224,242,.5); box-shadow:0 0 60px rgba(54,224,242,.25); z-index:3}
@@ -423,9 +424,9 @@ h1.title{
       <div class="wordmark" data-anim="scale" style="--i:0">
         <div class="logo">
           <div class="orbit"></div>
-          <svg viewBox="0 0 24 24" fill="none" stroke="url(#g1)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <defs><linearGradient id="g1" x1="0" y1="0" x2="24" y2="24"><stop offset="0" stop-color="#6d7bff"/><stop offset="1" stop-color="#36e0f2"/></linearGradient></defs>
-            <path d="M4 5a2 2 0 0 1 2-2h9l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M14 3v5h5"/><path d="M8 13h7M8 17h5"/>
+          <svg viewBox="-3 -2 61 66" fill="url(#g1)">
+            <defs><linearGradient id="g1" x1="0" y1="0" x2="54" y2="61"><stop offset="0" stop-color="#0FD070"/><stop offset="1" stop-color="#AA9FFF"/></linearGradient></defs>
+            <path d="M20.6557168,2.428 L17.6367168,5.176 C15.5077168,7.114 13.0067168,8.582 10.2937168,9.49 L10.2937168,9.49 L6.44671676,10.777 C1.91371676,12.293 -0.777283239,17.032 0.199716761,21.786 L0.199716761,21.786 L1.02771676,25.82 C1.61071676,28.664 1.61071676,31.602 1.02771676,34.447 L1.02771676,34.447 L0.199716761,38.482 C-0.777283239,43.233 1.91371676,47.973 6.44671676,49.492 L6.44671676,49.492 L10.2937168,50.777 C13.0067168,51.686 15.5077168,53.153 17.6367168,55.091 L17.6367168,55.091 L20.6557168,57.839 C24.2137168,61.077 29.5927168,61.077 33.1497168,57.839 L33.1497168,57.839 L36.1687168,55.091 C38.2977168,53.153 40.7987168,51.686 43.5127168,50.777 L43.5127168,50.777 L47.3597168,49.492 C51.8937168,47.973 54.5837168,43.233 53.6077168,38.482 L53.6077168,38.482 L52.7787168,34.447 C52.1937168,31.602 52.1937168,28.664 52.7787168,25.82 L52.7787168,25.82 L53.6077168,21.786 C54.5837168,17.032 51.8937168,12.293 47.3597168,10.777 L47.3597168,10.777 L43.5127168,9.49 C40.7987168,8.582 38.2977168,7.114 36.1687168,5.176 L36.1687168,5.176 L33.1497168,2.428 C31.3727168,0.811 29.1367168,0 26.9027168,0 L26.9027168,0 C24.6687168,0 22.4347168,0.811 20.6557168,2.428 L20.6557168,2.428 Z"/>
           </svg>
         </div>
         <div style="text-align:left">
@@ -568,11 +569,11 @@ h1.title{
         <div class="conn"></div>
         <div class="node"><div class="box" data-accent style="--ac:var(--violet)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><path d="M4 5h16M4 12h10M4 19h7"/></svg></div><div class="lbl">Chunker</div></div>
         <div class="conn"></div>
-        <div class="node"><div class="box" data-accent style="--ac:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><path d="M8 6h8M6 8v8M18 8v8M8 18h8"/></svg></div><div class="lbl">Embeddings</div><div class="sub">e5-small</div></div>
+        <div class="node"><div class="box" data-accent style="--ac:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><path d="M8 6h8M6 8v8M18 8v8M8 18h8"/></svg></div><div class="lbl">Embeddings</div><div class="sub">provider router</div></div>
         <div class="conn"></div>
-        <div class="node"><div class="box" data-accent style="--ac:var(--supa)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div><div class="lbl">pgvector</div><div class="sub">Supabase</div></div>
+        <div class="node"><div class="box" data-accent style="--ac:var(--supa)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div><div class="lbl">Vector<br/>index</div><div class="sub">local / pgvector</div></div>
         <div class="conn"></div>
-        <div class="node"><div class="box" data-accent style="--ac:var(--teal)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div><div class="lbl">Hybrid<br/>Retrieval</div></div>
+        <div class="node"><div class="box" data-accent style="--ac:var(--teal)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div><div class="lbl">Hybrid Search<br/>+ Rerank</div><div class="sub">BM25 + vector</div></div>
         <div class="conn"></div>
         <div class="node"><div class="box" data-accent style="--ac:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h4"/></svg></div><div class="lbl">Evidence<br/>Pack</div></div>
         <div class="conn"></div>
@@ -582,11 +583,11 @@ h1.title{
       </div>
       <div class="bullets" data-anim style="--i:3; justify-content:center; margin-top:30px">
         <span class="b"><span class="dot"></span>Sources → Blocks → Chunks</span>
-        <span class="b"><span class="dot"></span>Embed → pgvector</span>
-        <span class="b"><span class="dot"></span>Evidence Pack → Claude → cited</span>
+        <span class="b"><span class="dot"></span>Embed → local index / pgvector</span>
+        <span class="b"><span class="dot"></span>BM25 + semantic → rerank → Evidence Pack</span>
       </div>
     </div>
-    <div class="speaker">This is the heart of everything. Sources become <b>Source Blocks</b>, get chunked and embedded into vectors that live in <b>Supabase pgvector</b>. On a question, a hybrid retriever assembles an <b>Evidence Pack</b>; <b>Claude</b> answers strictly from it; every claim is verified into a <b>Citation Ledger</b>; and the same evidence powers all our Studio outputs. Let's break down each stage.</div>
+    <div class="speaker">This is the heart of everything. Sources become <b>Source Blocks</b>, then a hybrid semantic chunker splits them into retrievable units. Each chunk gets an embedding through a provider router — Voyage, OpenAI, local-model, or a deterministic local fallback. Locally, vectors live in the engine state and are searched with cosine similarity; when <b>SUPABASE_DB_URL</b> is configured, the same pipeline can also write compatible vectors into <b>Supabase pgvector</b>. On a question, we use <b>hybrid search</b>: BM25 and keyword signals for lexical recall, semantic vector search for meaning, and a reranker for precision. That produces the <b>Evidence Pack</b>; <b>Claude</b> answers strictly from it; every claim is verified into a <b>Citation Ledger</b>.</div>
   </section>
 
   <!-- ============ 7 · INGESTION ============ -->
@@ -629,8 +630,8 @@ h1.title{
   <!-- ============ 8 · CHUNK + EMBED ============ -->
   <section class="slide">
     <div class="head">
-      <div class="kicker" data-anim style="--i:0">Vectorization</div>
-      <h2 class="headline" data-anim style="--i:1">Chunk, embed, store in <span class="grad">pgvector</span></h2>
+      <div class="kicker" data-anim style="--i:0">Chunking · vectorization</div>
+      <h2 class="headline" data-anim style="--i:1">Semantic chunks → <span class="grad">vector retrieval</span></h2>
     </div>
     <div class="body">
       <div class="ce">
@@ -638,43 +639,44 @@ h1.title{
           <div class="chunk">…onboarding flow reduced <span class="o">⟂ overlap</span></div>
           <div class="chunk"><span class="o">⟂ overlap ⟂</span> churn to 3.1% in Q3…</div>
           <div class="chunk">…driven by activation <span class="o">⟂ overlap</span></div>
-          <span class="tag" style="--ac:var(--amber); margin-top:4px"><span class="pt"></span>~650 tokens · 2-block overlap</span>
+          <span class="tag" style="--ac:var(--amber); margin-top:4px"><span class="pt"></span>hybrid semantic · overlap-safe</span>
         </div>
         <div class="bigarrow" data-anim style="--i:3"><svg viewBox="0 0 40 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h34M28 5l8 7-8 7"/></svg></div>
         <div class="col" data-anim="scale" style="--i:4; align-items:center; gap:10px">
           <div class="vecgrid" id="vg"></div>
-          <span class="tag" style="--ac:var(--cyan)"><span class="pt"></span>multilingual-e5-small · 384-dim</span>
+          <span class="tag" style="--ac:var(--cyan)"><span class="pt"></span>Voyage / OpenAI / local embeddings</span>
         </div>
         <div class="bigarrow" data-anim style="--i:5"><svg viewBox="0 0 40 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h34M28 5l8 7-8 7"/></svg></div>
         <div class="db" data-anim="right" style="--i:6">
           <div class="cyl"><div class="bod"></div><div class="bot"></div><div class="top"></div></div>
-          <span class="tag" style="--ac:var(--supa)"><span class="pt"></span>Supabase · doc_chunks</span>
+          <span class="tag" style="--ac:var(--supa)"><span class="pt"></span>local state · optional pgvector</span>
         </div>
       </div>
     </div>
-    <div class="speaker">We chunk blocks into ~650-token pieces with a small overlap so context isn't lost at the seams. Each chunk becomes an embedding. In our live config the active embedder is a <b>local ONNX model — multilingual e5-small, 384-dim</b> — running right on the machine, free and offline. <b>Voyage voyage-3-large</b> and OpenAI embeddings are wired in as cloud fallbacks. The vectors are stored durably in <b>Supabase pgvector</b> for fast similarity search.</div>
+    <div class="speaker">Chunking is no longer just fixed token windows. The default safe path keeps structured headings and overlap; the new hybrid mode also looks for semantic topic shifts, so a new topic can become a new chunk before the normal token target. Then the embedder router creates vectors: Voyage if configured, OpenAI if configured, local-model if selected, otherwise a deterministic local hash vector. In local development we search those vectors directly from the engine state with cosine similarity. Supabase pgvector is optional: if <b>SUPABASE_DB_URL</b> is set and the vector dimensions match the chosen embedder, chunks can also be persisted into <b>doc_chunks</b> for scalable nearest-neighbor retrieval.</div>
   </section>
 
   <!-- ============ 9 · RETRIEVAL ============ -->
   <section class="slide">
     <div class="head">
       <div class="kicker" data-anim style="--i:0">Retrieval</div>
-      <h2 class="headline" data-anim style="--i:1">Hybrid retrieval → an <span class="grad">Evidence Pack</span></h2>
+      <h2 class="headline" data-anim style="--i:1">Hybrid search + reranker → <span class="grad">Evidence Pack</span></h2>
     </div>
     <div class="body">
       <div class="retr">
         <div class="signals" data-anim="left" style="--i:2">
           <div class="sig" style="--ac:var(--indigo)"><span class="d"></span>Keyword overlap</div>
           <div class="sig" style="--ac:var(--violet)"><span class="d"></span>BM25 <span class="w">k1·b</span></div>
-          <div class="sig" style="--ac:var(--cyan)"><span class="d"></span>Vector cosine <span class="w">e5</span></div>
+          <div class="sig" style="--ac:var(--cyan)"><span class="d"></span>Vector cosine <span class="w">dense</span></div>
           <div class="sig" style="--ac:var(--amber)"><span class="d"></span>Query rewrites</div>
           <div class="sig" style="--ac:var(--teal)"><span class="d"></span>Heading / entity</div>
+          <div class="sig" style="--ac:var(--claude)"><span class="d"></span>Reranker <span class="w">top-k</span></div>
         </div>
         <div class="bigarrow" data-anim style="--i:3"><svg viewBox="0 0 40 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h34M28 5l8 7-8 7"/></svg></div>
         <div class="scorer" data-anim="scale" style="--i:4">
           <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="5"/><path d="M10 12h4M12 10v4"/></svg>
-          <div class="t">Score + MMR<br/>diversify</div>
-          <div class="s">drop redundancy</div>
+          <div class="t">Rerank + MMR<br/>diversify</div>
+          <div class="s">precision after recall</div>
         </div>
         <div class="bigarrow" data-anim style="--i:5"><svg viewBox="0 0 40 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h34M28 5l8 7-8 7"/></svg></div>
         <div class="epack" data-anim="right" style="--i:6">
@@ -686,7 +688,7 @@ h1.title{
         </div>
       </div>
     </div>
-    <div class="speaker">Retrieval is <b>hybrid</b>, not just vector search. We rewrite the query into variants, then score every candidate chunk on five signals: keyword overlap, BM25, dense vector similarity, query-rewrite overlap, and a heading/entity match. We diversify with an MMR-style step to kill redundancy, then assemble an <b>Evidence Pack</b> — eight items for chat, twelve for artifacts, eighteen for audio — each with an ID like <b>E1</b> and an exact quote.</div>
+    <div class="speaker">Retrieval is <b>hybrid</b>, not just vector search. First-stage recall combines keyword overlap, BM25, dense vector similarity, query-rewrite overlap, and heading/entity signals. If pgvector is enabled, the database supplies nearest-neighbor similarities; otherwise the local engine computes cosine similarity over stored chunk vectors. Then we rerank the top candidates: the production option is <b>Cohere Rerank</b>; the local fallback keeps the hybrid score and MMR diversification. The reranker is a second-stage precision layer, not a replacement for BM25 or semantic search. Finally we assemble an <b>Evidence Pack</b> — eight items for chat, twelve for artifacts, eighteen for audio — each with an ID like <b>E1</b> and an exact quote.</div>
   </section>
 
   <!-- ============ 10 · GROUNDING ============ -->
@@ -735,16 +737,16 @@ h1.title{
       <div class="matrix">
         <div class="mrow hd" data-anim="fade" style="--i:2"><div>Domain</div><div>Our choice</div><div>Why it wins</div></div>
         <div class="mrow" data-anim="fade" style="--i:3"><div class="dom"><span class="sw" style="--ac:var(--claude)"></span>Reasoning &amp; grounding</div><div class="ch" style="--ac:var(--claude)">Anthropic Claude · <span class="m">opus-4-8</span></div><div class="wy">Most capable, 1M-context reasoning for source-only, fully-cited answers</div></div>
-        <div class="mrow" data-anim="fade" style="--i:4"><div class="dom"><span class="sw" style="--ac:var(--cyan)"></span>Embeddings</div><div class="ch" style="--ac:var(--cyan)">e5-small <span style="color:var(--ink-dim);font-weight:600">(active)</span> · <span class="m">Voyage</span> fallback</div><div class="wy">Local 384-dim ONNX = free, offline, multilingual; Voyage as cloud-grade option</div></div>
-        <div class="mrow" data-anim="fade" style="--i:5"><div class="dom"><span class="sw" style="--ac:var(--supa)"></span>Vector store</div><div class="ch" style="--ac:var(--supa)">Supabase · <span class="m">pgvector</span></div><div class="wy">Managed Postgres + standard cosine operator; in-memory fallback when unset</div></div>
-        <div class="mrow" data-anim="fade" style="--i:6"><div class="dom"><span class="sw" style="--ac:var(--openai)"></span>Vision (image → text)</div><div class="ch" style="--ac:var(--openai)">OpenAI · <span class="m">gpt-5.5</span></div><div class="wy">OCRs text verbatim &amp; describes charts so visuals become searchable evidence</div></div>
-        <div class="mrow" data-anim="fade" style="--i:7"><div class="dom"><span class="sw" style="--ac:var(--violet)"></span>Image generation</div><div class="ch" style="--ac:var(--violet)">OpenAI · <span class="m">gpt-image-2</span></div><div class="wy">Real 1536×1024 thumbnails returned as base64 for instant rendering</div></div>
+        <div class="mrow" data-anim="fade" style="--i:4"><div class="dom"><span class="sw" style="--ac:var(--cyan)"></span>Embeddings</div><div class="ch" style="--ac:var(--cyan)">Provider router · <span class="m">Voyage / OpenAI / local</span></div><div class="wy">Semantic when keys or local model are configured; deterministic local fallback always works</div></div>
+        <div class="mrow" data-anim="fade" style="--i:5"><div class="dom"><span class="sw" style="--ac:var(--supa)"></span>Vector store</div><div class="ch" style="--ac:var(--supa)">Local vectors · optional <span class="m">pgvector</span></div><div class="wy">Fast local iteration by default; Supabase pgvector for durable/scalable deployments</div></div>
+        <div class="mrow" data-anim="fade" style="--i:6"><div class="dom"><span class="sw" style="--ac:var(--claude)"></span>Reranking</div><div class="ch" style="--ac:var(--claude)">Cohere Rerank · <span class="m">optional</span></div><div class="wy">Second-stage precision after BM25 + semantic recall; local fallback remains deterministic</div></div>
+        <div class="mrow" data-anim="fade" style="--i:7"><div class="dom"><span class="sw" style="--ac:var(--openai)"></span>Vision (image → text)</div><div class="ch" style="--ac:var(--openai)">OpenAI · <span class="m">gpt-5.5</span></div><div class="wy">OCRs text verbatim &amp; describes charts so visuals become searchable evidence</div></div>
         <div class="mrow" data-anim="fade" style="--i:8"><div class="dom"><span class="sw" style="--ac:var(--deep)"></span>Speech-to-text</div><div class="ch" style="--ac:var(--deep)">Deepgram · <span class="m">nova-3</span></div><div class="wy">Diarized, multilingual, smart-formatted transcription for audio &amp; video</div></div>
         <div class="mrow" data-anim="fade" style="--i:9"><div class="dom"><span class="sw" style="--ac:var(--eleven)"></span>Text-to-speech</div><div class="ch" style="--ac:var(--eleven)">ElevenLabs · <span class="m">eleven_v3</span></div><div class="wy">Native multi-voice Text-to-Dialogue renders both hosts into one MP3</div></div>
       </div>
       <div class="mfoot" data-anim style="--i:10"><span class="tag" style="--ac:var(--green)"><span class="pt"></span>No vendor SDKs — plain HTTP + a deterministic local fallback for every one</span></div>
     </div>
-    <div class="speaker">Here's the part everyone asks about: which APIs and why. We picked a best-in-class provider for each distinct job — <b>Claude opus-4-8</b> for grounded reasoning, a <b>local e5</b> model for embeddings (Voyage as the cloud fallback), <b>Supabase pgvector</b> for storage, <b>OpenAI</b> for vision and image generation, <b>Deepgram nova-3</b> for speech-to-text, and <b>ElevenLabs</b> for the two-host audio. Every one is called over plain HTTP with no vendor SDK, and every one has a deterministic local fallback so the app never hard-fails.</div>
+    <div class="speaker">Here's the part everyone asks about: which APIs and why. We picked a best-in-class provider for each distinct job — <b>Claude opus-4-8</b> for grounded reasoning, an <b>embedding router</b> that can use Voyage, OpenAI, a local transformer model, or a deterministic fallback, <b>local vector search by default</b> with optional <b>Supabase pgvector</b> for production-scale persistence, and <b>Cohere Rerank</b> as the optional second-stage precision layer after BM25 and semantic search. Then OpenAI handles vision, Deepgram handles speech-to-text, and ElevenLabs handles the two-host audio. Every one is called over plain HTTP with no vendor SDK, and every one has a deterministic local fallback so the app never hard-fails.</div>
   </section>
 
   <!-- ============ 12 · OUTPUTS (radial) ============ -->
@@ -774,14 +776,14 @@ h1.title{
     <div class="body" style="margin-top:14px">
       <div class="tradeoffs">
         <div class="trow hd" data-anim="fade" style="--i:2"><div>Decision</div><div>I chose</div><div>Over</div><div>Why — &amp; the trade-off</div></div>
-        <div class="trow" data-anim="fade" style="--i:3; --ac:var(--cyan)"><div class="area"><span class="sw"></span>Embeddings</div><div class="chose">Local <span class="m">e5-small</span> · 384-dim</div><div class="over">Hosted (Voyage / OpenAI)</div><div class="why">Offline, free, EU-local, cross-lingual. <span class="to">Trade-off:</span> lower quality ceiling — Voyage is one env flag away.</div></div>
-        <div class="trow" data-anim="fade" style="--i:4; --ac:var(--supa)"><div class="area"><span class="sw"></span>Vector store</div><div class="chose">Supabase <span class="m">pgvector</span></div><div class="over">Dedicated vector DB</div><div class="why">One EU-hosted Postgres for rows <em>and</em> vectors; standard ops. <span class="to">Trade-off:</span> less specialised at massive scale.</div></div>
-        <div class="trow" data-anim="fade" style="--i:5; --ac:var(--violet)"><div class="area"><span class="sw"></span>Provider calls</div><div class="chose">Plain HTTP</div><div class="over">Vendor SDKs</div><div class="why">No lock-in, tiny dependency surface, one uniform fallback path. <span class="to">Trade-off:</span> I maintain the request shapes myself.</div></div>
+        <div class="trow" data-anim="fade" style="--i:3; --ac:var(--cyan)"><div class="area"><span class="sw"></span>Embeddings</div><div class="chose">Router: <span class="m">Voyage / OpenAI / local</span></div><div class="over">One hard-coded provider</div><div class="why">Quality can scale up, but local iteration still works offline. <span class="to">Trade-off:</span> production pgvector needs the table dimension to match the active embedder.</div></div>
+        <div class="trow" data-anim="fade" style="--i:4; --ac:var(--supa)"><div class="area"><span class="sw"></span>Vector store</div><div class="chose">Local first + optional <span class="m">pgvector</span></div><div class="over">Always external vector DB</div><div class="why">Fast demo/dev path without infrastructure; Supabase can take over when configured. <span class="to">Trade-off:</span> large production notebooks should run the durable pgvector path.</div></div>
+        <div class="trow" data-anim="fade" style="--i:5; --ac:var(--violet)"><div class="area"><span class="sw"></span>Reranking</div><div class="chose">Cohere optional</div><div class="over">Only MMR sorting</div><div class="why">Cross-encoder style precision after recall. <span class="to">Trade-off:</span> extra latency and API cost, so local hybrid rerank stays the default fallback.</div></div>
         <div class="trow" data-anim="fade" style="--i:6; --ac:var(--green)"><div class="area"><span class="sw"></span>Citation check</div><div class="chose">Token-overlap verifier</div><div class="over">An LLM-as-judge</div><div class="why">Deterministic, fast, free, unit-testable. <span class="to">Trade-off:</span> a lexical proxy that can miss paraphrase — documented.</div></div>
         <div class="trow" data-anim="fade" style="--i:7; --ac:var(--claude)"><div class="area"><span class="sw"></span>Generation</div><div class="chose">Anthropic <span class="m">Claude</span></div><div class="over">Gemini / GPT</div><div class="why">Best adherence to grounded JSON + abstention. <span class="to">Trade-off:</span> vendor risk — router keeps all three + local swappable.</div></div>
       </div>
     </div>
-    <div class="speaker">A panel asks <b>why</b>, not just what. Five decisions I'd defend: <b>local e5 embeddings</b> over hosted — offline, free, EU-local; the trade-off is a lower quality ceiling, so Voyage is one flag away. <b>Supabase pgvector</b> over a dedicated vector DB — one EU-hosted Postgres for rows and vectors. <b>Plain HTTP</b> over vendor SDKs — no lock-in and a single uniform fallback path. A <b>deterministic token-overlap verifier</b> over an LLM-judge — fast, free and unit-testable, at the cost of being a lexical proxy that can miss paraphrase, which I document. And <b>Claude</b> for generation because it adhered best to grounded JSON and abstention — but the router keeps Gemini, GPT and a local model swappable, so it's not a lock-in.</div>
+    <div class="speaker">A panel asks <b>why</b>, not just what. Five decisions I'd defend: an <b>embedding router</b> instead of one hard-coded provider — quality can scale up, but local iteration still works offline; the trade-off is that production pgvector dimensions must match the active embedder. <b>Local-first vector search with optional Supabase pgvector</b> instead of always requiring infrastructure — fast demos locally, durable search when configured. <b>Cohere Rerank as optional second-stage precision</b> instead of only MMR sorting — better relevance after recall, but with extra latency and API cost. A <b>deterministic token-overlap verifier</b> over an LLM-judge — fast, free and unit-testable, at the cost of being a lexical proxy that can miss paraphrase. And <b>Claude</b> for generation because it adhered best to grounded JSON and abstention — but the router keeps Gemini, GPT and a local model swappable, so it's not a lock-in.</div>
   </section>
 
   <!-- ============ 14 · DEPLOY ============ -->
@@ -798,7 +800,7 @@ h1.title{
         <div class="darrow" data-anim style="--i:5"><svg viewBox="0 0 26 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h20M16 6l6 6-6 6"/></svg></div>
         <div class="dn" data-anim style="--i:6; --ac:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h8v8H8z"/></svg><div class="dt">Cloud Run</div><div class="ds">Node 24 container · :8080</div></div>
         <div class="darrow" data-anim style="--i:7"><svg viewBox="0 0 26 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h20M16 6l6 6-6 6"/></svg></div>
-        <div class="dn" data-anim style="--i:8; --ac:var(--supa)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><div class="dt">Supabase</div><div class="ds">Postgres + pgvector</div></div>
+        <div class="dn" data-anim style="--i:8; --ac:var(--supa)"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><div class="dt">Supabase</div><div class="ds">optional state + pgvector</div></div>
       </div>
       <div class="bullets" data-anim style="--i:9; justify-content:center; margin-top:34px">
         <span class="b"><span class="dot"></span>ffmpeg + yt-dlp baked into the image</span>
@@ -867,9 +869,9 @@ h1.title{
     <div class="head" style="position:relative;z-index:2; gap:22px">
       <div class="wordmark" data-anim="scale" style="--i:0">
         <div class="logo"><div class="orbit"></div>
-          <svg viewBox="0 0 24 24" fill="none" stroke="url(#g2)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <defs><linearGradient id="g2" x1="0" y1="0" x2="24" y2="24"><stop offset="0" stop-color="#6d7bff"/><stop offset="1" stop-color="#36e0f2"/></linearGradient></defs>
-            <path d="M4 5a2 2 0 0 1 2-2h9l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M14 3v5h5"/><path d="M8 13h7M8 17h5"/></svg>
+          <svg viewBox="-3 -2 61 66" fill="url(#g2)">
+            <defs><linearGradient id="g2" x1="0" y1="0" x2="54" y2="61"><stop offset="0" stop-color="#0FD070"/><stop offset="1" stop-color="#AA9FFF"/></linearGradient></defs>
+            <path d="M20.6557168,2.428 L17.6367168,5.176 C15.5077168,7.114 13.0067168,8.582 10.2937168,9.49 L10.2937168,9.49 L6.44671676,10.777 C1.91371676,12.293 -0.777283239,17.032 0.199716761,21.786 L0.199716761,21.786 L1.02771676,25.82 C1.61071676,28.664 1.61071676,31.602 1.02771676,34.447 L1.02771676,34.447 L0.199716761,38.482 C-0.777283239,43.233 1.91371676,47.973 6.44671676,49.492 L6.44671676,49.492 L10.2937168,50.777 C13.0067168,51.686 15.5077168,53.153 17.6367168,55.091 L17.6367168,55.091 L20.6557168,57.839 C24.2137168,61.077 29.5927168,61.077 33.1497168,57.839 L33.1497168,57.839 L36.1687168,55.091 C38.2977168,53.153 40.7987168,51.686 43.5127168,50.777 L43.5127168,50.777 L47.3597168,49.492 C51.8937168,47.973 54.5837168,43.233 53.6077168,38.482 L53.6077168,38.482 L52.7787168,34.447 C52.1937168,31.602 52.1937168,28.664 52.7787168,25.82 L52.7787168,25.82 L53.6077168,21.786 C54.5837168,17.032 51.8937168,12.293 47.3597168,10.777 L47.3597168,10.777 L43.5127168,9.49 C40.7987168,8.582 38.2977168,7.114 36.1687168,5.176 L36.1687168,5.176 L33.1497168,2.428 C31.3727168,0.811 29.1367168,0 26.9027168,0 L26.9027168,0 C24.6687168,0 22.4347168,0.811 20.6557168,2.428 L20.6557168,2.428 Z"/></svg>
         </div>
       </div>
       <h2 class="title" data-anim style="--i:1">Source-grounded, <span class="grad">end to end</span></h2>
@@ -895,7 +897,7 @@ h1.title{
 
 <script>
 /* COMMITS_START — auto-generated by scripts/gen-commit-timeline.mjs; do not edit by hand */
-const COMMITS = [{"h":"85ad3c8","day":"2026-06-26","time":"19:52","s":"Initial NotebookLM-style research workspace","ins":9267,"del":0},{"h":"f3240ad","day":"2026-06-26","time":"19:53","s":"Use Node 24 GitHub Actions","ins":2,"del":4},{"h":"8e5a99e","day":"2026-06-26","time":"21:19","s":"Apply blockresearch visual identity","ins":851,"del":83},{"h":"4681209","day":"2026-06-26","time":"21:27","s":"Polish blockresearch research workspace UI","ins":590,"del":17},{"h":"b7fe1c7","day":"2026-06-28","time":"17:03","s":"Harden sourcestudio research pipeline","ins":16066,"del":4809},{"h":"a319c99","day":"2026-06-28","time":"17:04","s":"Wire answer mode controls","ins":29,"del":2},{"h":"4ed8010","day":"2026-06-29","time":"15:04","s":"Multimodal NotebookLM: real RAG, creator kit, vision, Cloud Run deploy","ins":3261,"del":252},{"h":"6917292","day":"2026-06-29","time":"15:09","s":"Add image source type, gpt-5.5 vision, gpt-image-2, Firebase Hosting + multimodal test kit","ins":48,"del":0},{"h":"a67e285","day":"2026-06-29","time":"16:33","s":"Fix Firebase auth cookie, rebrand to Block Research LM, NotebookLM add-source arrow","ins":116,"del":32},{"h":"1c1cd61","day":"2026-06-29","time":"17:06","s":"Move to dedicated project, portal menu fix, __session cookie, NotebookLM arrow","ins":909,"del":10},{"h":"0be71cf","day":"2026-06-29","time":"18:43","s":"Add-source modal: single reliable CTA + spacing; cold-start hardening","ins":93,"del":103},{"h":"519e33f","day":"2026-06-29","time":"18:53","s":"Fix website ingest 500: single-page by default + crawl cap + 500 logging","ins":7,"del":2},{"h":"efeb2b8","day":"2026-06-29","time":"19:36","s":"Async artifact generation + real YouTube titles","ins":51,"del":5},{"h":"aabd13c","day":"2026-06-29","time":"21:50","s":"Fix Studio global-lock, modal theming, thumbnail refs, flexible URLs","ins":137,"del":29},{"h":"0a44e1d","day":"2026-06-29","time":"21:54","s":"YouTube: full audio transcription (Deepgram) when captions are unavailable","ins":219,"del":6},{"h":"7af9de8","day":"2026-06-29","time":"22:29","s":"Async source ingestion, official logo, remove unused CI","ins":148,"del":86},{"h":"ca5adf7","day":"2026-06-29","time":"22:59","s":"Durable auth + state persistence (Supabase) — fixes logout/data loss on deploy","ins":178,"del":9},{"h":"82fb6b9","day":"2026-06-29","time":"23:28","s":"Podcast-style audio + UI fixes (modal lock, view-jump, toast, thumbnail download)","ins":124,"del":53},{"h":"66f129d","day":"2026-06-29","time":"23:39","s":"Fix audio falling back to formal local script (maxTokens truncation)","ins":296,"del":90},{"h":"80f1d01","day":"2026-06-30","time":"00:40","s":"Real designed infographic SVG (hero KPIs, icons, grounded panels)","ins":397,"del":96},{"h":"57b5b5a","day":"2026-06-30","time":"01:24","s":"Inline audio playback from the Outputs list","ins":109,"del":6},{"h":"1a082bc","day":"2026-06-30","time":"01:34","s":"Notebook overview message + topic-aware thinking indicator","ins":269,"del":19},{"h":"4d4ae69","day":"2026-06-30","time":"01:35","s":"Fix source ingestion: chunker dropped document body (prices, tables)","ins":200,"del":27},{"h":"cf4a8d7","day":"2026-06-30","time":"01:52","s":"Auto-generate an opening overview message (NotebookLM-style)","ins":141,"del":8},{"h":"18906a6","day":"2026-06-30","time":"02:21","s":"Infographic as AI-generated image (gpt-image-2) + larger artifact modal","ins":159,"del":5},{"h":"a15329b","day":"2026-06-30","time":"11:38","s":"Studio polish: designed slide deck + export, modal header, notepad, b.ai logo","ins":1569,"del":105}];
+const COMMITS = [{"h":"85ad3c8","day":"2026-06-26","time":"19:52","s":"Initial NotebookLM-style research workspace","ins":9267,"del":0},{"h":"f3240ad","day":"2026-06-26","time":"19:53","s":"Use Node 24 GitHub Actions","ins":2,"del":4},{"h":"8e5a99e","day":"2026-06-26","time":"21:19","s":"Apply blockresearch visual identity","ins":851,"del":83},{"h":"4681209","day":"2026-06-26","time":"21:27","s":"Polish blockresearch research workspace UI","ins":590,"del":17},{"h":"b7fe1c7","day":"2026-06-28","time":"17:03","s":"Harden sourcestudio research pipeline","ins":16066,"del":4809},{"h":"a319c99","day":"2026-06-28","time":"17:04","s":"Wire answer mode controls","ins":29,"del":2},{"h":"4ed8010","day":"2026-06-29","time":"15:04","s":"Multimodal NotebookLM: real RAG, creator kit, vision, Cloud Run deploy","ins":3261,"del":252},{"h":"6917292","day":"2026-06-29","time":"15:09","s":"Add image source type, gpt-5.5 vision, gpt-image-2, Firebase Hosting + multimodal test kit","ins":48,"del":0},{"h":"a67e285","day":"2026-06-29","time":"16:33","s":"Fix Firebase auth cookie, rebrand to Block Research LM, NotebookLM add-source arrow","ins":116,"del":32},{"h":"1c1cd61","day":"2026-06-29","time":"17:06","s":"Move to dedicated project, portal menu fix, __session cookie, NotebookLM arrow","ins":909,"del":10},{"h":"0be71cf","day":"2026-06-29","time":"18:43","s":"Add-source modal: single reliable CTA + spacing; cold-start hardening","ins":93,"del":103},{"h":"519e33f","day":"2026-06-29","time":"18:53","s":"Fix website ingest 500: single-page by default + crawl cap + 500 logging","ins":7,"del":2},{"h":"efeb2b8","day":"2026-06-29","time":"19:36","s":"Async artifact generation + real YouTube titles","ins":51,"del":5},{"h":"aabd13c","day":"2026-06-29","time":"21:50","s":"Fix Studio global-lock, modal theming, thumbnail refs, flexible URLs","ins":137,"del":29},{"h":"0a44e1d","day":"2026-06-29","time":"21:54","s":"YouTube: full audio transcription (Deepgram) when captions are unavailable","ins":219,"del":6},{"h":"7af9de8","day":"2026-06-29","time":"22:29","s":"Async source ingestion, official logo, remove unused CI","ins":148,"del":86},{"h":"ca5adf7","day":"2026-06-29","time":"22:59","s":"Durable auth + state persistence (Supabase) — fixes logout/data loss on deploy","ins":178,"del":9},{"h":"82fb6b9","day":"2026-06-29","time":"23:28","s":"Podcast-style audio + UI fixes (modal lock, view-jump, toast, thumbnail download)","ins":124,"del":53},{"h":"66f129d","day":"2026-06-29","time":"23:39","s":"Fix audio falling back to formal local script (maxTokens truncation)","ins":296,"del":90},{"h":"80f1d01","day":"2026-06-30","time":"00:40","s":"Real designed infographic SVG (hero KPIs, icons, grounded panels)","ins":397,"del":96},{"h":"57b5b5a","day":"2026-06-30","time":"01:24","s":"Inline audio playback from the Outputs list","ins":109,"del":6},{"h":"1a082bc","day":"2026-06-30","time":"01:34","s":"Notebook overview message + topic-aware thinking indicator","ins":269,"del":19},{"h":"4d4ae69","day":"2026-06-30","time":"01:35","s":"Fix source ingestion: chunker dropped document body (prices, tables)","ins":200,"del":27},{"h":"cf4a8d7","day":"2026-06-30","time":"01:52","s":"Auto-generate an opening overview message (NotebookLM-style)","ins":141,"del":8},{"h":"18906a6","day":"2026-06-30","time":"02:21","s":"Infographic as AI-generated image (gpt-image-2) + larger artifact modal","ins":159,"del":5},{"h":"a15329b","day":"2026-06-30","time":"11:38","s":"Studio polish: designed slide deck + export, modal header, notepad, b.ai logo","ins":1569,"del":105},{"h":"fa6aa9f","day":"2026-06-30","time":"11:40","s":"Update presentation build-journey timeline","ins":1,"del":1},{"h":"afcbfde","day":"2026-06-30","time":"15:03","s":"Declutter chat + infographic: drop source-card list, mute inline citations, hide image prompt","ins":16,"del":19},{"h":"c194812","day":"2026-06-30","time":"15:16","s":"YouTube: route yt-dlp through YTDLP_PROXY when set","ins":12,"del":2},{"h":"0ecf757","day":"2026-06-30","time":"15:33","s":"Show source overview before first chat","ins":665,"del":197},{"h":"ee68d7d","day":"2026-06-30","time":"15:39","s":"Render video overview artifacts","ins":955,"del":58},{"h":"5ed5478","day":"2026-07-01","time":"16:36","s":"Harden ingestion and studio workflows","ins":8379,"del":1488}];
 /* COMMITS_END */
 (function(){
   const host = document.getElementById('journey');
@@ -986,7 +988,7 @@ const COMMITS = [{"h":"85ad3c8","day":"2026-06-26","time":"19:52","s":"Initial N
       {n:'Data Table', t:'structured', ac:'var(--cyan)'},
       {n:'Video Story', t:'storyboard', ac:'var(--rose)'},
     ];
-    const N = items.length, R = 38; // percent radius
+    const N = items.length, R = 43; // percent radius
     items.forEach((it,k)=>{
       const ang = (-90 + k*(360/N)) * Math.PI/180;
       const x = 50 + R*Math.cos(ang), y = 50 + R*Math.sin(ang)*0.92;

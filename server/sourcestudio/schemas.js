@@ -1,12 +1,19 @@
 import { z } from "zod";
 
-const SourceTypeSchema = z.enum([
+export const MAX_SOURCE_UPLOAD_MB = 200;
+export const MAX_SOURCE_UPLOAD_BYTES = MAX_SOURCE_UPLOAD_MB * 1024 * 1024;
+export const MAX_SOURCE_UPLOAD_BASE64_CHARS = Math.ceil((MAX_SOURCE_UPLOAD_BYTES * 4) / 3) + 4096;
+export const MAX_SOURCE_REQUEST_BODY_BYTES = MAX_SOURCE_UPLOAD_BASE64_CHARS + (4 * 1024 * 1024);
+
+export const SourceTypeSchema = z.enum([
   "markdown",
   "text",
   "pdf",
   "url",
   "note",
   "docx",
+  "pptx",
+  "epub",
   "youtube",
   "audio",
   "google_doc",
@@ -39,10 +46,11 @@ export const CreateSourceSchema = z.object({
   original_url: z.string().trim().url().optional().or(z.literal("")),
   file_name: z.string().trim().max(260).optional(),
   mime_type: z.string().trim().max(120).optional(),
-  base64: z.string().max(12_000_000).optional(),
+  base64: z.string().max(MAX_SOURCE_UPLOAD_BASE64_CHARS, `Uploaded files can be up to ${MAX_SOURCE_UPLOAD_MB} MB.`).optional(),
   active: z.boolean().optional().default(true),
   crawl: z.boolean().optional().default(true),
   crawl_max_pages: z.number().int().min(1).max(200).optional(),
+  defer_indexing: z.boolean().optional().default(false),
 });
 
 export const ChatRequestSchema = z.object({
