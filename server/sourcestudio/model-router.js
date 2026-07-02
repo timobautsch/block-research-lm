@@ -470,8 +470,7 @@ export function createModelRouter({
       payload.edges = rebuildMindMapEdges(payload.nodes);
     }
     validateRequiredArtifactShape(type, payload);
-    validateArtifactCitationMarkers(payload, canonicalCitations.length);
-    return payload;
+    return sanitizeArtifactCitationMarkers(payload, canonicalCitations.length);
   }
 
   function finishRun(run, status, output = "", error = "") {
@@ -661,14 +660,34 @@ function validateRequiredArtifactShape(type, payload) {
   }
 }
 
-function validateArtifactCitationMarkers(payload, citationCount) {
+// A few stray out-of-range [n] markers must not discard an otherwise good
+// provider artifact for the weaker local generator (mirrors the chat path):
+// strip them and let the evidence audit cover the claims. Mostly-broken
+// citation sets still hard-fail.
+function sanitizeArtifactCitationMarkers(payload, citationCount) {
   const markers = collectJsonStrings(payload)
     .flatMap((text) => [...text.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
-  for (const marker of markers) {
-    if (!Number.isInteger(marker) || marker < 1 || marker > citationCount) {
-      throw new Error("Provider returned an artifact with a citation outside the Evidence Pack.");
-    }
+  const isValid = (marker) => Number.isInteger(marker) && marker >= 1 && marker <= citationCount;
+  const invalid = markers.filter((marker) => !isValid(marker));
+  if (!invalid.length) return payload;
+  const valid = markers.length - invalid.length;
+  if (!valid || invalid.length > valid) {
+    throw new Error("Provider returned an artifact with a citation outside the Evidence Pack.");
   }
+  return stripInvalidCitationMarkers(payload, isValid);
+}
+
+function stripInvalidCitationMarkers(value, isValid) {
+  if (typeof value === "string") {
+    return value.replace(/\s?\[(\d+)\]/g, (match, num) => (isValid(Number(num)) ? match : ""));
+  }
+  if (Array.isArray(value)) return value.map((item) => stripInvalidCitationMarkers(item, isValid));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, stripInvalidCitationMarkers(entry, isValid)]),
+    );
+  }
+  return value;
 }
 
 function collectJsonStrings(value) {
