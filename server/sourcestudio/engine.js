@@ -6726,9 +6726,12 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
 
   const workDir = await mkdtemp(join(tmpdir(), "ssai-yt-"));
   try {
+    // Fallback langs must be an EXPLICIT list: a glob like "en.*" also matches
+    // machine-TRANSLATED tracks (en-de-…), which YouTube 429-rate-limits hard —
+    // batch imports tripped this within a handful of videos.
     const subFlags = chosenLang
       ? [chosenIsAuto ? "--write-auto-subs" : "--write-subs", "--sub-langs", chosenLang]
-      : ["--write-auto-subs", "--write-subs", "--sub-langs", "en.*,de.*"];
+      : ["--write-auto-subs", "--write-subs", "--sub-langs", "en,en-orig,en-US,en-GB,de,de-orig"];
     await execFile(
       ytDlpPath,
       [

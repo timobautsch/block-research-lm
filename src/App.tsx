@@ -345,6 +345,20 @@ interface Citation {
   page_number?: number | null;
 }
 
+interface SourceBlock {
+  id: string;
+  text: string;
+  heading_path?: string[];
+  page_number?: number | null;
+}
+
+interface ConfirmRequest {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  resolve: (confirmed: boolean) => void;
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -702,6 +716,11 @@ export default function App() {
   // one go; each video still becomes its own transcribed source.
   const [youtubeImportMode, setYoutubeImportMode] = useState<"video" | "channel">("video");
   const [youtubeBatchCount, setYoutubeBatchCount] = useState(10);
+  // Citation chips open the cited source passage with its blocks highlighted.
+  const [citationViewer, setCitationViewer] = useState<{ citation: Citation; blocks: SourceBlock[] | null } | null>(null);
+  const citedScrolledRef = useRef(false);
+  // In-app replacement for window.confirm — the browser dialog looks foreign.
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [sourceFileQueue, setSourceFileQueue] = useState<QueuedSourceFile[]>([]);
   const [activeSourceId, setActiveSourceId] = useState("");
   const [, setHighlightedBlockIds] = useState<string[]>([]);
@@ -1021,7 +1040,12 @@ export default function App() {
 
   async function deleteNotebookById(item: Notebook) {
     const label = item.title || "Untitled notebook";
-    if (!window.confirm(`Delete notebook "${label}" with all its sources and outputs? This cannot be undone.`)) return;
+    const confirmed = await askConfirm({
+      title: "Delete notebook?",
+      message: `"${label}" will be deleted with all its sources and outputs. This cannot be undone.`,
+      confirmLabel: "Delete notebook",
+    });
+    if (!confirmed) return;
     setOpenMenu("");
     setError("");
     try {
@@ -1962,7 +1986,11 @@ export default function App() {
 
   async function deleteAllArtifactOutputs() {
     if (!notebook || !notebook.artifacts.length || isDeletingAllArtifacts) return;
-    const confirmed = window.confirm(`Delete all ${notebook.artifacts.length} outputs from this notebook? Sources and chat will stay.`);
+    const confirmed = await askConfirm({
+      title: "Clear all outputs?",
+      message: `All ${notebook.artifacts.length} outputs will be deleted from this notebook. Sources and chat will stay.`,
+      confirmLabel: "Delete outputs",
+    });
     if (!confirmed) return;
     const previousNotebook = notebook;
     inlineAudioRef.current?.pause();
@@ -1988,7 +2016,59 @@ export default function App() {
     setActiveSourceId(sourceId);
     setHighlightedBlockIds(citation.block_ids || []);
     setMobilePanel("sources");
+    // Open the passage viewer immediately (with the quote as fallback content)
+    // and pull the source's full blocks so the cited ones can be highlighted
+    // in their surrounding context.
+    citedScrolledRef.current = false;
+    setCitationViewer({ citation, blocks: null });
+    api<{ blocks: SourceBlock[] }>(`/api/sources/${sourceId}/blocks`)
+      .then((response) =>
+        setCitationViewer((current) =>
+          current && current.citation === citation ? { ...current, blocks: response.blocks || [] } : current,
+        ),
+      )
+      .catch(() =>
+        setCitationViewer((current) => (current && current.citation === citation ? { ...current, blocks: [] } : current)),
+      );
   }, []);
+
+  const scrollCitedBlockIntoView = useCallback((node: HTMLElement | null) => {
+    if (node && !citedScrolledRef.current) {
+      citedScrolledRef.current = true;
+      window.requestAnimationFrame(() => node.scrollIntoView({ block: "center", behavior: "smooth" }));
+    }
+  }, []);
+
+  function askConfirm(options: { title: string; message: string; confirmLabel?: string }) {
+    return new Promise<boolean>((resolve) => {
+      setConfirmRequest({
+        title: options.title,
+        message: options.message,
+        confirmLabel: options.confirmLabel || "Delete",
+        resolve,
+      });
+    });
+  }
+
+  function resolveConfirm(confirmed: boolean) {
+    confirmRequest?.resolve(confirmed);
+    setConfirmRequest(null);
+  }
+
+  useEffect(() => {
+    if (!confirmRequest && !citationViewer) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (confirmRequest) {
+        confirmRequest.resolve(false);
+        setConfirmRequest(null);
+      } else {
+        setCitationViewer(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [confirmRequest, citationViewer]);
 
   function openWorkspace(nextAuthMode?: unknown) {
     setShowLanding(false);
@@ -2385,6 +2465,81 @@ export default function App() {
           <button type="button" onClick={() => setToast("")} aria-label="Dismiss notification">
             <XCircle size={14} />
           </button>
+        </div>
+      ) : null}
+
+      {confirmRequest ? (
+        <div className="modal-backdrop confirm-backdrop" role="presentation" onClick={() => resolveConfirm(false)}>
+          <section
+            className="modal confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={confirmRequest.title}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <h2><Trash2 size={18} /> {confirmRequest.title}</h2>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => resolveConfirm(false)} aria-label="Close dialog">
+                <X size={18} />
+              </button>
+            </div>
+            <p className="confirm-modal-message">{confirmRequest.message}</p>
+            <div className="modal-actions">
+              <button className="secondary-button" type="button" onClick={() => resolveConfirm(false)}>Cancel</button>
+              <button className="danger-button" type="button" autoFocus onClick={() => resolveConfirm(true)}>
+                <Trash2 size={15} /> {confirmRequest.confirmLabel}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {citationViewer ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setCitationViewer(null)}>
+          <section
+            className="modal citation-viewer-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cited source passage"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <h2><FileText size={18} /> {citationViewer.citation.source_title || citationViewer.citation.sourceTitle || "Source"}</h2>
+                <p className="citation-viewer-meta">
+                  Citation [{citationViewer.citation.index}]
+                  {citationViewer.citation.heading_path?.length ? ` · ${citationViewer.citation.heading_path.join(" / ")}` : ""}
+                  {citationViewer.citation.page_number ? ` · page ${citationViewer.citation.page_number}` : ""}
+                </p>
+              </div>
+              <button className="icon-button subtle" type="button" onClick={() => setCitationViewer(null)} aria-label="Close citation viewer">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="citation-viewer-body">
+              {citationViewer.blocks === null ? (
+                <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
+              ) : citationViewer.blocks.length ? (
+                citationViewer.blocks.map((block) => {
+                  const cited = citationViewer.citation.block_ids?.includes(block.id);
+                  return (
+                    <p
+                      key={block.id}
+                      className={cited ? "citation-block cited" : "citation-block"}
+                      ref={cited ? scrollCitedBlockIntoView : undefined}
+                    >
+                      {block.text}
+                    </p>
+                  );
+                })
+              ) : (
+                <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
+              )}
+            </div>
+            <p className="citation-viewer-hint">Highlighted passages are the evidence this citation points to.</p>
+          </section>
         </div>
       ) : null}
 
@@ -3255,9 +3410,11 @@ export default function App() {
                       </button>
                       <button
                         type="button"
+                        className="youtube-channel-toggle"
                         aria-pressed={youtubeImportMode === "channel"}
                         onClick={() => setYoutubeImportMode("channel")}
                       >
+                        <Sparkles size={14} aria-hidden />
                         Whole channel
                         <span className="new-feature-badge">New</span>
                       </button>
@@ -3294,7 +3451,7 @@ export default function App() {
                   ) : null}
 
                   {sourceForm.type === "youtube" && youtubeImportMode === "channel" ? (
-                    <label className="modal-field">
+                    <label className="modal-field youtube-import-reveal">
                       <span>Latest videos to import</span>
                       <select
                         value={youtubeBatchCount}
@@ -4295,7 +4452,17 @@ const ChatBubble = memo(function ChatBubble({
       <div className="bubble-body">
         <div className="bubble-topline">
           <strong>{message.role === "assistant" ? ASSISTANT_NAME : "You"}</strong>
-          {message.role === "assistant" && message.provider ? <span>{providerMeta(message)}</span> : null}
+          {message.role === "assistant" && message.provider ? (
+            <span
+              title={
+                message.provider === "local"
+                  ? "The AI provider was unavailable for this reply, so it was assembled directly from quoted passages in your sources."
+                  : undefined
+              }
+            >
+              {providerMeta(message)}
+            </span>
+          ) : null}
           {message.mode === "abstained" ? <span>Abstained</span> : null}
         </div>
         <div className="answer-text">{body}</div>
@@ -4556,15 +4723,16 @@ function providerLabel(status: ProviderStatus | null) {
 }
 
 function providerMeta(message: ChatMessage) {
+  // The local path assembles the answer from source quotes without an LLM —
+  // say that in product language instead of leaking engine jargon.
+  if (message.provider === "local") return "Built from source quotes";
   const provider =
     {
       anthropic: "Anthropic",
       openai: "OpenAI",
       google: "Gemini",
-      local: "Deterministic fallback",
     }[message.provider || ""] || message.provider;
-  const model = message.model === "local-grounded-v1" ? "grounded-v1" : message.model;
-  return [provider, model].filter(Boolean).join(" · ");
+  return [provider, message.model].filter(Boolean).join(" · ");
 }
 
 function ArtifactPreview({

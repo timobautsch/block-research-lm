@@ -8,10 +8,12 @@ const GroundedCitationSchema = z.object({
   evidence_id: z.string().trim().min(1),
 });
 
+// Lenient on shape (missing citations array, empty answer): models drop these
+// occasionally and a recoverable response must not lose to the local fallback.
 const GroundedAnswerSchema = z.object({
-  abstained: z.boolean(),
-  answer_markdown: z.string().trim().min(1).max(9000),
-  citations: z.array(GroundedCitationSchema).max(8),
+  abstained: z.boolean().optional().default(false),
+  answer_markdown: z.string().trim().max(9000).optional().default(""),
+  citations: z.array(GroundedCitationSchema).max(8).optional().default([]),
 });
 
 const AudioScriptTurnSchema = z.object({
@@ -350,6 +352,28 @@ export function createModelRouter({
   function normalizeProviderAnswer(rawOutput, evidencePack) {
     const parsed = GroundedAnswerSchema.parse(JSON.parse(extractJson(rawOutput)));
     const allowedEvidence = new Map(evidencePack.evidence_items.map((item) => [item.evidence_id, item]));
+    if (!parsed.answer_markdown) {
+      // An empty answer is the model abstaining awkwardly; say so instead of
+      // discarding the run.
+      return {
+        content: "The active sources do not contain evidence that answers this question, so Source-only mode abstained.",
+        citations: [],
+        abstained: true,
+      };
+    }
+    if (!parsed.abstained && !parsed.citations.length) {
+      // Some responses carry valid [n] markers in the text but omit the
+      // citations array. The prompt numbers evidence 1..N, so markers within
+      // range identify their evidence items — rebuild the array from them.
+      const markerIndexes = [...new Set([...parsed.answer_markdown.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])))];
+      const withinRange = markerIndexes.filter((index) => index >= 1 && index <= evidencePack.evidence_items.length);
+      if (markerIndexes.length && withinRange.length === markerIndexes.length) {
+        parsed.citations = withinRange.map((index) => ({
+          index,
+          evidence_id: evidencePack.evidence_items[index - 1].evidence_id,
+        }));
+      }
+    }
     if (!parsed.abstained && !parsed.citations.length) {
       throw new Error("Provider returned a grounded answer without citations.");
     }
