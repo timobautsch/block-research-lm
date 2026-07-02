@@ -8801,7 +8801,110 @@ textarea::placeholder {
 .youtube-import-mode button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 14px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255, 255, 255, 0.035); color: var(--muted); font-size: 13px; font-weight: 700; }
 .youtube-import-mode button:hover { border-color: rgba(15, 208, 112, 0.4); color: var(--text); }
 .youtube-import-mode button[aria-pressed="true"] { border-color: rgba(15, 208, 112, 0.5); background: rgba(15, 208, 112, 0.12); color: var(--green); }
-.new-feature-badge { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(15, 208, 112, 0.16); border: 1px solid rgba(15, 208, 112, 0.45); color: var(--green); font-size: 10px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+
+/* The channel toggle is the demo surprise — a rotating gradient ring, a soft
+   breathing glow, and sparkle color make it impossible to miss. */
+@property --channel-ring-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+.youtube-import-mode button.youtube-channel-toggle {
+  position: relative;
+  border: 1px solid transparent;
+  color: var(--text);
+  background:
+    linear-gradient(var(--panel-3), var(--panel-3)) padding-box,
+    conic-gradient(
+      from var(--channel-ring-angle),
+      rgba(15, 208, 112, 0.95),
+      rgba(94, 234, 212, 0.55),
+      rgba(15, 208, 112, 0.15),
+      rgba(94, 234, 212, 0.55),
+      rgba(15, 208, 112, 0.95)
+    ) border-box;
+  box-shadow: 0 0 14px rgba(15, 208, 112, 0.22);
+}
+.youtube-import-mode button.youtube-channel-toggle svg { color: var(--green); }
+.youtube-import-mode button.youtube-channel-toggle[aria-pressed="true"] {
+  background:
+    linear-gradient(rgba(11, 44, 27, 0.96), rgba(11, 44, 27, 0.96)) padding-box,
+    conic-gradient(
+      from var(--channel-ring-angle),
+      rgba(15, 208, 112, 1),
+      rgba(94, 234, 212, 0.75),
+      rgba(15, 208, 112, 0.35),
+      rgba(94, 234, 212, 0.75),
+      rgba(15, 208, 112, 1)
+    ) border-box;
+  color: var(--green);
+  box-shadow: 0 0 22px rgba(15, 208, 112, 0.38);
+}
+
+.new-feature-badge { position: relative; overflow: hidden; display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(15, 208, 112, 0.16); border: 1px solid rgba(15, 208, 112, 0.45); color: var(--green); font-size: 10px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+/* Shine sweep across the badge. */
+.new-feature-badge::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 32%, rgba(255, 255, 255, 0.55) 50%, transparent 68%);
+  transform: translateX(-110%);
+}
+
 .youtube-import-hint { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.45; }
 .add-source-form .modal-field select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font-size: 13.5px; outline: 0; }
 .add-source-form .modal-field select:focus { border-color: rgba(15, 208, 112, 0.72); box-shadow: 0 0 0 3px rgba(15, 208, 112, 0.12); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .youtube-import-mode button.youtube-channel-toggle {
+    animation:
+      channel-ring-spin 3.2s linear infinite,
+      channel-glow-breathe 2.6s ease-in-out infinite,
+      channel-nudge 7s ease-in-out infinite;
+  }
+  .youtube-import-mode button.youtube-channel-toggle[aria-pressed="true"] {
+    /* Once selected the button stops nudging — the glow alone carries it. */
+    animation: channel-ring-spin 3.2s linear infinite, channel-glow-breathe 2.6s ease-in-out infinite;
+  }
+  .new-feature-badge { animation: new-badge-pulse 2.4s ease-out infinite; }
+  .new-feature-badge::after { animation: new-badge-shine 2.8s ease-in-out infinite; }
+  .youtube-import-reveal { animation: youtube-reveal 0.32s cubic-bezier(0.2, 0.9, 0.3, 1); }
+}
+
+@keyframes channel-ring-spin {
+  to { --channel-ring-angle: 360deg; }
+}
+@keyframes channel-glow-breathe {
+  0%, 100% { box-shadow: 0 0 10px rgba(15, 208, 112, 0.18); }
+  50% { box-shadow: 0 0 24px rgba(15, 208, 112, 0.45); }
+}
+@keyframes channel-nudge {
+  0%, 86%, 100% { transform: none; }
+  90% { transform: scale(1.05); }
+  94% { transform: scale(0.985); }
+  97% { transform: scale(1.02); }
+}
+@keyframes new-badge-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(15, 208, 112, 0.5); }
+  70%, 100% { box-shadow: 0 0 0 7px rgba(15, 208, 112, 0); }
+}
+@keyframes new-badge-shine {
+  0%, 18% { transform: translateX(-110%); }
+  60%, 100% { transform: translateX(110%); }
+}
+@keyframes youtube-reveal {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* In-app confirm dialog + citation passage viewer */
+.confirm-modal { max-width: 460px; }
+.confirm-modal-message { margin: 4px 0 18px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+.danger-button { display: inline-flex; align-items: center; gap: 7px; min-height: 38px; padding: 0 16px; border: 1px solid rgba(248, 113, 113, 0.5); border-radius: 999px; background: rgba(248, 113, 113, 0.14); color: #f87171; font-size: 13.5px; font-weight: 800; }
+.danger-button:hover { background: rgba(248, 113, 113, 0.24); border-color: rgba(248, 113, 113, 0.7); }
+.citation-viewer-modal { max-width: 720px; width: min(92vw, 720px); }
+.citation-viewer-meta { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
+.citation-viewer-body { max-height: 55vh; overflow-y: auto; display: grid; gap: 10px; padding-right: 6px; }
+.citation-block { margin: 0; padding: 10px 12px; border-radius: var(--radius); border: 1px solid transparent; color: var(--muted); font-size: 13.5px; line-height: 1.6; }
+.citation-block.cited { border-color: rgba(15, 208, 112, 0.55); background: rgba(15, 208, 112, 0.1); color: var(--text); box-shadow: 0 0 0 3px rgba(15, 208, 112, 0.08); }
+.citation-viewer-hint { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
