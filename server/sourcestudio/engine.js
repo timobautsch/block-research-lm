@@ -69,6 +69,7 @@ export async function createSourceStudioEngine(options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const expandYouTubeChannel = options.expandYouTubeChannelImpl || fetchYouTubeChannelVideos;
   const logger = options.logger || noopLogger();
+  const mediaStore = createSupabaseMediaStore({ env, logger });
   const modelRouter = createModelRouter({
     env,
     fetchImpl,
@@ -1212,6 +1213,10 @@ export async function createSourceStudioEngine(options = {}) {
         return { job, artifact: null, evidence_pack: evidencePack };
       }
       state.artifacts.push(artifact);
+      // Cloud Run's disk is ephemeral — every deploy/instance swap drops the
+      // rendered MP3/MP4/PPTX while the artifact metadata survives in the
+      // durable store, leaving players with a 404. Mirror media durably.
+      await persistArtifactMediaDurably(artifact, context);
       job.status = "completed";
       job.progress = 100;
       job.result_artifact_id = artifact.id;
@@ -1453,14 +1458,13 @@ export async function createSourceStudioEngine(options = {}) {
     return decorateFlashcardDeck(deck.id, context);
   }
 
-  function getArtifactMedia(artifactId, context = {}) {
-    const artifact = getArtifact(artifactId, context);
+  function artifactMediaDescriptor(artifact) {
     const mediaPath = artifact.type === "slide-deck"
       ? artifact.content_json?.pptx_file_path || ""
       : artifact.type === "video"
         ? artifact.content_json?.video_file_path || ""
         : artifact.content_json?.audio_file_path || "";
-    if (!mediaPath) throw statusError(404, "Artifact has no rendered media file.");
+    if (!mediaPath) return null;
     return {
       path: resolve(root, mediaPath),
       content_type: artifact.type === "slide-deck"
@@ -1474,6 +1478,54 @@ export async function createSourceStudioEngine(options = {}) {
           ? artifact.content_json?.video_file_name || `${artifact.id}.mp4`
         : artifact.content_json?.audio_file_name || `${artifact.id}.mp3`,
     };
+  }
+
+  function getArtifactMedia(artifactId, context = {}) {
+    const artifact = getArtifact(artifactId, context);
+    const media = artifactMediaDescriptor(artifact);
+    if (!media) throw statusError(404, "Artifact has no rendered media file.");
+    return media;
+  }
+
+  async function persistArtifactMediaDurably(artifact, context = {}) {
+    if (!mediaStore.enabled) return;
+    const media = artifactMediaDescriptor(artifact);
+    if (!media) return;
+    try {
+      if (!existsSync(media.path)) return;
+      const buffer = await readFile(media.path);
+      const ok = await mediaStore.upload(`${artifact.id}/${media.file_name}`, buffer, media.content_type);
+      logger[ok ? "info" : "warn"]("artifact.media.durable_upload", {
+        request_id: context.requestId,
+        artifact_id: artifact.id,
+        ok,
+        bytes: buffer.length,
+      });
+    } catch (error) {
+      logger.warn("artifact.media.durable_upload_failed", {
+        request_id: context.requestId,
+        artifact_id: artifact.id,
+        error: String(error?.message || error).slice(0, 160),
+      });
+    }
+  }
+
+  // Serve path for media: restore from the durable store when the local copy
+  // fell victim to an instance swap, then hand back the descriptor.
+  async function ensureArtifactMediaLocal(artifactId, context = {}) {
+    const media = getArtifactMedia(artifactId, context);
+    if (!existsSync(media.path) && mediaStore.enabled) {
+      const buffer = await mediaStore.download(`${artifactId}/${media.file_name}`);
+      if (buffer) {
+        await mkdir(dirname(media.path), { recursive: true });
+        await writeFile(media.path, buffer);
+        logger.info("artifact.media.durable_restore", { artifact_id: artifactId, bytes: buffer.length });
+      }
+    }
+    if (!existsSync(media.path)) {
+      throw statusError(404, "The rendered media file is no longer available. Regenerate this artifact to re-render it.");
+    }
+    return media;
   }
 
   function getJob(jobId, context = {}) {
@@ -1564,6 +1616,7 @@ export async function createSourceStudioEngine(options = {}) {
     getSourceBlocks,
     getArtifact,
     getArtifactForClient,
+    ensureArtifactMediaLocal,
     getFlashcardDeckForArtifact,
     recordFlashcardReview,
     deleteFlashcard,
@@ -6416,6 +6469,63 @@ async function normalizeAudioForAsr(buffer) {
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+// Durable artifact-media mirror (Supabase Storage). Rendered MP3/MP4/PPTX live
+// on the instance disk, which Cloud Run wipes on every deploy/scale event —
+// this keeps them retrievable across instances. No-op without Supabase env.
+function createSupabaseMediaStore({ env, logger }) {
+  const baseUrl = String(env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  const serviceKey = String(env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  const bucket = String(env.SUPABASE_MEDIA_BUCKET || "artifact-media").trim();
+  const enabled = Boolean(baseUrl && serviceKey);
+  const authHeaders = { authorization: `Bearer ${serviceKey}`, apikey: serviceKey };
+  let bucketReady = null;
+  async function ensureBucket() {
+    if (!bucketReady) {
+      bucketReady = globalThis
+        .fetch(`${baseUrl}/storage/v1/bucket`, {
+          method: "POST",
+          headers: { ...authHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ id: bucket, name: bucket, public: false }),
+        })
+        .then((response) => response.ok || response.status === 409 || response.status === 400)
+        .catch((error) => {
+          logger?.warn("media_store.bucket_failed", { error: String(error?.message || error).slice(0, 160) });
+          return false;
+        });
+    }
+    return bucketReady;
+  }
+  return {
+    enabled,
+    async upload(objectPath, buffer, contentType) {
+      if (!enabled) return false;
+      await ensureBucket();
+      const response = await globalThis.fetch(`${baseUrl}/storage/v1/object/${bucket}/${objectPath}`, {
+        method: "POST",
+        headers: { ...authHeaders, "content-type": contentType || "application/octet-stream", "x-upsert": "true" },
+        body: buffer,
+      });
+      if (!response.ok) {
+        logger?.warn("media_store.upload_failed", { object: objectPath, status: response.status });
+      }
+      return response.ok;
+    },
+    async download(objectPath) {
+      if (!enabled) return null;
+      try {
+        const response = await globalThis.fetch(`${baseUrl}/storage/v1/object/${bucket}/${objectPath}`, {
+          headers: authHeaders,
+        });
+        if (!response.ok) return null;
+        return Buffer.from(await response.arrayBuffer());
+      } catch (error) {
+        logger?.warn("media_store.download_failed", { object: objectPath, error: String(error?.message || error).slice(0, 160) });
+        return null;
+      }
+    },
+  };
 }
 
 const YOUTUBE_UA =
