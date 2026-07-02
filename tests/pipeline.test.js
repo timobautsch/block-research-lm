@@ -739,6 +739,40 @@ test("keeps translated provider answers instead of nuking them as unsupported", 
   }
 });
 
+test("repeated-text sources cannot flood the evidence pack with duplicates", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Flood test" });
+    // A degenerate source: one sentence repeated thousands of times produces
+    // hundreds of near-identical chunks that all score identically.
+    await engine.ingestSource(notebook.id, {
+      type: "text",
+      title: "Riesen-Dokument",
+      body: "Die Nordlicht Consulting GmbH analysiert Energiemaerkte. ".repeat(4000),
+    });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Werft-Dossier",
+      body: "# Werft\n\nDie Silbermond Werft in Kiel lieferte 2025 genau 314 Segelyachten aus. Die Werft wurde 1962 gegruendet.",
+    });
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Wie viele Segelyachten lieferte die Silbermond Werft aus?",
+    });
+    const items = response.evidence_pack.evidence_items;
+    const quotes = items.map((item) => item.quote);
+    // No more than two near-identical quotes may occupy the pack…
+    const duplicateCount = quotes.filter((quote) => quote === quotes[0]).length;
+    assert.ok(duplicateCount <= 2, `evidence flooded with ${duplicateCount} identical quotes`);
+    // …and the source that actually answers the question must be present.
+    assert.ok(
+      items.some((item) => item.source_title === "Werft-Dossier"),
+      "targeted source missing from evidence pack",
+    );
+    assert.equal(response.message.mode, "grounded");
+    assert.ok(response.message.content.includes("314"));
+  });
+});
+
 test("collection questions expose every source via overview evidence", async () => {
   await withEngine(async (engine) => {
     const notebook = await engine.createNotebook({ title: "Podcast collection" });
