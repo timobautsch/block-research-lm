@@ -291,10 +291,24 @@ export function createModelRouter({
 
   async function callProvider(provider, model, prompt, options = {}) {
     if (!fetchImpl) throw new Error("Fetch is not available in this Node runtime.");
-    if (provider === "anthropic") return callAnthropic(model, prompt, options);
-    if (provider === "openai") return callOpenAI(model, prompt, options);
-    if (provider === "google") return callGoogle(model, prompt, options);
-    throw new Error(`Unsupported provider for ${options.role || "model generation"}: ${provider}`);
+    const dispatch = () => {
+      if (provider === "anthropic") return callAnthropic(model, prompt, options);
+      if (provider === "openai") return callOpenAI(model, prompt, options);
+      if (provider === "google") return callGoogle(model, prompt, options);
+      throw new Error(`Unsupported provider for ${options.role || "model generation"}: ${provider}`);
+    };
+    try {
+      return await dispatch();
+    } catch (error) {
+      // Transient network faults ("fetch failed", resets, timeouts) hit bursts
+      // of concurrent generations and silently degraded artifacts to the local
+      // generator (live: mindmap/quiz/flashcards all lost to one blip). One
+      // retry recovers them; real API errors (4xx bodies) rethrow immediately.
+      const message = String(error?.message || error);
+      if (!/fetch failed|network|socket|ECONNRESET|ETIMEDOUT|EAI_AGAIN|timed out/i.test(message)) throw error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 800));
+      return dispatch();
+    }
   }
 
   async function callAnthropic(model, prompt, options = {}) {
@@ -621,7 +635,7 @@ function artifactExamplePayload(localPayload) {
 function artifactShapeInstructions(type) {
   const instructions = {
     report: 'Report: {"title": string, "abstract": string[] (2-3 substantial cited paragraphs), "scope": string[] (what this report covers and excludes), "methodology": string[] (how evidence was selected and cited), "executive_summary": string[] (3 substantial paragraphs, each 2-4 sentences and cited), "key_points": [{"text": string (full finding sentence + citation), "citation": "[1]"}], "key_findings": [{"heading": string (specific, never "Finding 1"), "text": string, "analysis": string (2-4 cited analytical sentences), "citation": "[1]"}], "detailed_sections": [{"heading": string (formal report section heading), "body": string[] (3-5 cited analytical paragraphs, not bullets)}], "recommendations": [{"action": string, "text": string (actionable cited recommendation), "citation": "[1]"}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}. Make it a formal long-form report, not a briefing note, blog post, compressed summary, or key-point list. Do not include any compressed-summary field or section. Use paragraphs for the main body. Include at least 5 detailed sections and at least 900 words when evidence allows.',
-    mindmap: 'Mind map (hierarchical, NotebookLM-style): {"title": string, "nodes": [{"id": string, "label": string (a SHORT noun phrase, 2-5 words, NO citation markers and NO full sentences), "type": "notebook|topic|subtopic|claim|entity", "source_refs": []}], "edges": [{"id": string, "source": string (parent id), "target": string (child id), "label": string}]}. Build a TREE, not a star: exactly ONE root node (type "notebook", the central subject); 4-7 first-level category nodes (type "topic") each connected FROM the root; under EACH category 3-6 child nodes (type "subtopic"|"claim"|"entity") connected FROM that category; optionally add a third level beneath the richest categories. Every non-root node must have exactly ONE parent edge so the graph forms a clean tree. Labels read like clickable topic chips ("Automated Grid Trading", "GDPR Compliance", "Architecture Layers") — never paragraphs and never with [n] markers.',
+    mindmap: 'Mind map (hierarchical, NotebookLM-style): {"title": string, "nodes": [{"id": string, "label": string (a SHORT noun phrase, 2-5 words, NO citation markers and NO full sentences), "type": "notebook|topic|subtopic|claim|entity", "source_refs": []}], "edges": [{"id": string, "source": string (parent id), "target": string (child id), "label": string}]}. Build a TREE, not a star: exactly ONE root node (type "notebook", the central subject); first-level category nodes (type "topic") each connected FROM the root; under EACH category child nodes (type "subtopic"|"claim"|"entity") connected FROM that category; add a third level beneath every category rich enough to support it. SCALE WITH THE COLLECTION: with up to 5 sources build 4-7 categories and ~20-35 nodes total; with 6-15 sources build 6-10 categories and ~40-60 nodes; with more sources build 8-12 categories and 60-90 nodes. COVER EVERYTHING: every source in the Evidence Pack (including the "Source overview" items) must have its core topic represented somewhere in the map — no source may be silently dropped. CONNECT ACROSS SOURCES, but only where it genuinely makes sense: categories are THEMES that merge related material from different sources (e.g. two talks about creativity share one category); unrelated subjects get their own separate branches instead of being forced together. Every non-root node must have exactly ONE parent edge so the graph forms a clean tree. Labels read like clickable topic chips ("Automated Grid Trading", "GDPR Compliance", "Architecture Layers") — never paragraphs and never with [n] markers.',
     flashcards: 'Flashcards: {"title": string, "cards": [{"question": string (a real study question ending with "?"; never a quote), "answer": string (a concise conceptual answer in the learner\'s own words plus citation marker; never just a copied evidence sentence), "explanation": string (why this answer follows from the cited evidence), "difficulty": "easy|medium|hard", "tags": string[], "source_refs": []}]}. Build learning cards from the meaning of the evidence: ask what the learner should understand, decide, avoid, compare, or apply. Do not use cloze quote blanks unless the user explicitly asks for cloze drills.',
     quiz: 'Quiz: {"title": string, "questions": [{"type": "multiple_choice", "question": string, "options": string[], "correct_index": number, "explanation": string, "difficulty": "easy|medium|hard", "source_refs": []}]}',
     "data-table": 'Data table: {"title": string, "columns": string[], "rows": [{"cells": object, "source_refs": []}]}',
@@ -715,9 +729,10 @@ function artifactMaxTokens(type) {
   if (type === "report") return 16000;
   if (["slide-deck", "audio", "video"].includes(type)) return 6000;
   if (["infographic"].includes(type)) return 4096;
-  // Mind maps carry two arrays (nodes + edges) and many chip labels, so they
-  // need the most headroom of the structured types to finish the JSON.
-  if (type === "mindmap") return 8000;
+  // Mind maps carry two arrays (nodes + edges) and many chip labels, and now
+  // scale to 60-90 nodes on large notebooks — they need the most headroom of
+  // the structured types to finish the JSON.
+  if (type === "mindmap") return 14000;
   if (["quiz", "data-table", "flashcards"].includes(type)) return 6000;
   return 2400;
 }
