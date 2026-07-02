@@ -111,7 +111,9 @@ export function createModelRouter({
     const providerRun = startRun("grounded_answer", selected.provider, selected.model, prompt);
 
     try {
-      const rawOutput = await callProvider(selected.provider, selected.model, prompt);
+      // Long syntheses (top-N lists, comparisons over many sources) truncated
+      // at the old 1200-token cap and leaned on the JSON repairer.
+      const rawOutput = await callProvider(selected.provider, selected.model, prompt, { maxTokens: 2400, role: "grounded_answer" });
       const answer = normalizeProviderAnswer(rawOutput, evidencePack);
       finishRun(providerRun, "completed", answer.content);
       return { answer, model_runs: [providerRun], active_run: providerRun };
@@ -283,7 +285,7 @@ export function createModelRouter({
       if (groundedRole) return env.OPENAI_GROUNDED_MODEL || env.OPENAI_MODEL || "gpt-4o";
       return env.OPENAI_MODEL || "gpt-4o-mini";
     }
-    if (provider === "google") return (artifactRole && env.GOOGLE_ARTIFACT_MODEL) || env.GOOGLE_MODEL || "gemini-1.5-flash";
+    if (provider === "google") return (artifactRole && env.GOOGLE_ARTIFACT_MODEL) || env.GOOGLE_MODEL || "gemini-2.5-flash";
     return LOCAL_MODEL;
   }
 
@@ -306,6 +308,9 @@ export function createModelRouter({
       body: JSON.stringify({
         model,
         max_tokens: options.maxTokens || 1200,
+        // Grounded work needs deterministic extraction, not creative variance —
+        // OpenAI/Google calls already pin temperature 0.
+        temperature: 0,
         system: options.systemPrompt || groundedSystemPrompt(),
         messages: [{ role: "user", content: prompt }],
       }),

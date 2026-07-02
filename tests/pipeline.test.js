@@ -610,27 +610,27 @@ test("does not retrieve binary PDF fallback text", async () => {
     ].join("\n");
     assert.equal(engine._internals.isLikelyGarbledExtraction(binaryPdfText), true);
 
-    const extracted = await engine._internals.extractPdfText(Buffer.from(binaryPdfText, "latin1"));
-    assert.equal(extracted.parser, "pdf-unreadable");
-    assert.doesNotMatch(extracted.text, /DCTDecode|JFIF|%PDF|Pillow/);
+    // Unreadable PDFs now fail HONESTLY instead of settling as "indexed" with
+    // placeholder text that pretends to be a healthy source.
+    await assert.rejects(
+      engine._internals.extractPdfText(Buffer.from(binaryPdfText, "latin1")),
+      /Could not read this PDF/,
+    );
 
     const notebook = await engine.createNotebook({ title: "Bad PDF test" });
-    const source = await engine.ingestSource(notebook.id, {
-      type: "pdf",
-      title: "Scanned statement",
-      file_name: "statement.pdf",
-      mime_type: "application/pdf",
-      base64: Buffer.from(binaryPdfText, "latin1").toString("base64"),
-    }, { sync: true });
-    assert.equal(source.metadata_json.parser, "pdf-unreadable");
-    assert.equal(source.word_count, 0);
-
-    const evidencePack = await engine._internals.buildEvidencePack({
-      notebook_id: notebook.id,
-      question: "What does the scanned statement say?",
-    });
-    assert.equal(evidencePack.citations_available, false);
-    assert.equal(evidencePack.evidence_items.length, 0);
+    await assert.rejects(
+      engine.ingestSource(notebook.id, {
+        type: "pdf",
+        title: "Scanned statement",
+        file_name: "statement.pdf",
+        mime_type: "application/pdf",
+        base64: Buffer.from(binaryPdfText, "latin1").toString("base64"),
+      }, { sync: true }),
+      /Could not read this PDF/,
+    );
+    // Synchronous 4xx rejections must not leave a residual failed source row.
+    const view = engine.getNotebook(notebook.id);
+    assert.equal(view.sources.length, 0);
 
     const response = await engine.askChat({
       notebook_id: notebook.id,
@@ -638,7 +638,6 @@ test("does not retrieve binary PDF fallback text", async () => {
     });
     assert.equal(response.message.mode, "abstained");
     assert.doesNotMatch(response.content, /DCTDecode|JFIF|%PDF|Pillow|\u00c2\u00be/);
-    assert.match(response.content, /cannot answer/i);
   });
 });
 
