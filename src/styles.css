@@ -8795,3 +8795,13 @@ textarea::placeholder {
   .notepad-panel { width: 100vw; padding: 18px; }
   .notepad-title { font-size: 22px; }
 }
+
+/* Batch YouTube channel import (source uploader) */
+.youtube-import-mode { display: flex; gap: 8px; }
+.youtube-import-mode button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 14px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255, 255, 255, 0.035); color: var(--muted); font-size: 13px; font-weight: 700; }
+.youtube-import-mode button:hover { border-color: rgba(15, 208, 112, 0.4); color: var(--text); }
+.youtube-import-mode button[aria-pressed="true"] { border-color: rgba(15, 208, 112, 0.5); background: rgba(15, 208, 112, 0.12); color: var(--green); }
+.new-feature-badge { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(15, 208, 112, 0.16); border: 1px solid rgba(15, 208, 112, 0.45); color: var(--green); font-size: 10px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+.youtube-import-hint { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.45; }
+.add-source-form .modal-field select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font-size: 13.5px; outline: 0; }
+.add-source-form .modal-field select:focus { border-color: rgba(15, 208, 112, 0.72); box-shadow: 0 0 0 3px rgba(15, 208, 112, 0.12); }

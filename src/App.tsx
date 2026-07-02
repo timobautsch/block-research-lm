@@ -698,6 +698,10 @@ export default function App() {
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => workspacePreferredLayoutRef.current);
   const [workspaceResizeTarget, setWorkspaceResizeTarget] = useState<WorkspaceResizeTarget | "">("");
   const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
+  // Batch channel import: "channel" pulls the newest N uploads of a channel in
+  // one go; each video still becomes its own transcribed source.
+  const [youtubeImportMode, setYoutubeImportMode] = useState<"video" | "channel">("video");
+  const [youtubeBatchCount, setYoutubeBatchCount] = useState(10);
   const [sourceFileQueue, setSourceFileQueue] = useState<QueuedSourceFile[]>([]);
   const [activeSourceId, setActiveSourceId] = useState("");
   const [, setHighlightedBlockIds] = useState<string[]>([]);
@@ -1434,6 +1438,27 @@ export default function App() {
     setSourceFormNotice("");
     setSourceFormNoticeTone("error");
     try {
+      if (sourceForm.type === "youtube" && youtubeImportMode === "channel") {
+        const batch = await api<{
+          channel_title: string;
+          queued: number;
+          skipped_existing: number;
+          sources: Source[];
+        }>(`/api/notebooks/${notebook.id}/sources/youtube-batch`, {
+          method: "POST",
+          body: JSON.stringify({ channel_url: originalUrl, count: youtubeBatchCount }),
+        });
+        setActiveSourceId(batch.sources[0]?.id || "");
+        setSourceForm(emptySourceForm);
+        setIsAddSourceOpen(false);
+        await refreshNotebook();
+        const channelLabel = batch.channel_title ? `${batch.channel_title}: ` : "";
+        const skippedLabel = batch.skipped_existing ? ` (${batch.skipped_existing} already imported)` : "";
+        setToast(`${channelLabel}${batch.queued} video${batch.queued === 1 ? "" : "s"} queued — transcribing in the background…${skippedLabel}`);
+        refreshDebugSilently();
+        void pollSourcesUntilReady(batch.sources.map((item) => item.id), notebook.id);
+        return;
+      }
       const response = await api<{ source: Source }>(`/api/notebooks/${notebook.id}/sources`, {
         method: "POST",
         body: JSON.stringify({
@@ -3214,13 +3239,40 @@ export default function App() {
                       >
                         {tab.icon}
                         {tab.label}
+                        {tab.type === "youtube" ? <span className="new-feature-badge">New</span> : null}
                       </button>
                     ))}
                   </div>
 
+                  {sourceForm.type === "youtube" ? (
+                    <div className="youtube-import-mode" role="radiogroup" aria-label="YouTube import mode">
+                      <button
+                        type="button"
+                        aria-pressed={youtubeImportMode === "video"}
+                        onClick={() => setYoutubeImportMode("video")}
+                      >
+                        Single video
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={youtubeImportMode === "channel"}
+                        onClick={() => setYoutubeImportMode("channel")}
+                      >
+                        Whole channel
+                        <span className="new-feature-badge">New</span>
+                      </button>
+                    </div>
+                  ) : null}
+
                   {sourceNeedsUrl(sourceForm.type) ? (
                     <label className="modal-field">
-                      <span>{sourceForm.type === "youtube" ? "YouTube URL" : "Website URL"}</span>
+                      <span>
+                        {sourceForm.type === "youtube"
+                          ? youtubeImportMode === "channel"
+                            ? "YouTube channel URL"
+                            : "YouTube URL"
+                          : "Website URL"}
+                      </span>
                       <input
                         value={sourceForm.original_url}
                         onChange={(event) => setSourceForm((current) => ({ ...current, original_url: event.target.value }))}
@@ -3230,10 +3282,33 @@ export default function App() {
                             event.currentTarget.form?.requestSubmit();
                           }
                         }}
-                        placeholder={sourceUrlPlaceholder(sourceForm.type)}
+                        placeholder={
+                          sourceForm.type === "youtube" && youtubeImportMode === "channel"
+                            ? "https://www.youtube.com/@channel"
+                            : sourceUrlPlaceholder(sourceForm.type)
+                        }
                         inputMode="url"
                         autoFocus
                       />
+                    </label>
+                  ) : null}
+
+                  {sourceForm.type === "youtube" && youtubeImportMode === "channel" ? (
+                    <label className="modal-field">
+                      <span>Latest videos to import</span>
+                      <select
+                        value={youtubeBatchCount}
+                        onChange={(event) => setYoutubeBatchCount(Number(event.target.value))}
+                      >
+                        {[5, 10, 25, 50].map((count) => (
+                          <option key={count} value={count}>
+                            Last {count} videos
+                          </option>
+                        ))}
+                      </select>
+                      <small className="youtube-import-hint">
+                        Every video is transcribed and indexed as its own source. Already-imported videos are skipped.
+                      </small>
                     </label>
                   ) : null}
 

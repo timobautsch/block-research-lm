@@ -16,6 +16,7 @@ import {
   CreateNotebookSchema,
   CreateSourceSchema,
   FlashcardReviewSchema,
+  YouTubeChannelBatchSchema,
 } from "./schemas.js";
 import { createModelRouter } from "./model-router.js";
 import { createDurableStore } from "./durable-store.js";
@@ -66,6 +67,7 @@ export async function createSourceStudioEngine(options = {}) {
   const artifactDir = join(storageDir, "artifacts");
   const env = options.env || process.env;
   const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const expandYouTubeChannel = options.expandYouTubeChannelImpl || fetchYouTubeChannelVideos;
   const logger = options.logger || noopLogger();
   const modelRouter = createModelRouter({
     env,
@@ -624,6 +626,77 @@ export async function createSourceStudioEngine(options = {}) {
     if (["markdown", "text", "note"].includes(parsed.type)) return true;
     if (parsed.body && parsed.type === "url" && parsed.crawl === false) return true;
     return false;
+  }
+
+  // Batch import: expand a channel (or playlist) URL into its newest videos and
+  // queue each one as a regular async YouTube source. Listing is cheap (~1s for
+  // 50 entries via --flat-playlist); the bounded ingest queue then transcribes
+  // the videos a few at a time, so 50 sources never stampede yt-dlp/Deepgram.
+  async function ingestYouTubeChannel(notebookId, input = {}, context = {}) {
+    assertNotebookAccess(notebookId, context);
+    const parsed = YouTubeChannelBatchSchema.parse(input);
+    logger.info("youtube.batch.start", {
+      request_id: context.requestId,
+      notebook_id: notebookId,
+      channel_url: parsed.channel_url,
+      count: parsed.count,
+    });
+    let listing;
+    try {
+      listing = await expandYouTubeChannel(parsed.channel_url, parsed.count);
+    } catch (error) {
+      logger.warn("youtube.batch.expand_failed", {
+        request_id: context.requestId,
+        notebook_id: notebookId,
+        channel_url: parsed.channel_url,
+        error: noteYouTubeBotCheck(null, externalToolErrorSummary(error)),
+      });
+      throw statusError(
+        422,
+        "Could not list the channel's videos. Check that the URL points to a YouTube channel or playlist, then try again.",
+      );
+    }
+    const videos = (listing?.videos || []).slice(0, parsed.count);
+    if (!videos.length) {
+      throw statusError(422, "The channel listing returned no videos. Check the URL — it should point to a YouTube channel or playlist.");
+    }
+    const existingUrls = new Set(
+      state.sources
+        .filter((source) => source.notebook_id === notebookId)
+        .map((source) => normalizedYouTubeUrl(source.original_url))
+        .filter(Boolean),
+    );
+    const sources = [];
+    let skipped = 0;
+    for (const video of videos) {
+      if (existingUrls.has(normalizedYouTubeUrl(video.url))) {
+        skipped += 1;
+        continue;
+      }
+      const source = await ingestSource(
+        notebookId,
+        { type: "youtube", title: video.title || undefined, original_url: video.url, active: parsed.active },
+        context,
+      );
+      sources.push(source);
+    }
+    logger.info("youtube.batch.queued", {
+      request_id: context.requestId,
+      notebook_id: notebookId,
+      channel_title: listing.channel_title || "",
+      listed: videos.length,
+      queued: sources.length,
+      skipped_existing: skipped,
+    });
+    return {
+      channel_title: listing.channel_title || "",
+      channel_url: parsed.channel_url,
+      requested: parsed.count,
+      listed: videos.length,
+      queued: sources.length,
+      skipped_existing: skipped,
+      sources,
+    };
   }
 
   async function renameNotebook(notebookId, input = {}, context = {}) {
@@ -1478,6 +1551,7 @@ export async function createSourceStudioEngine(options = {}) {
     getNotebook,
     renameNotebook,
     ingestSource,
+    ingestYouTubeChannel,
     setSourceActive,
     deleteSource,
     deleteNotebook,
@@ -6381,6 +6455,66 @@ function youtubeEgressFetch(fetchImpl) {
   }
   const { dispatcher } = youtubeProxyState;
   return (url, init = {}) => undiciFetch(url, { ...init, dispatcher });
+}
+
+// List a channel's (or playlist's) newest videos without downloading anything.
+// --flat-playlist on a channel's /videos tab returns uploads newest-first and
+// takes about a second for 50 entries.
+async function fetchYouTubeChannelVideos(channelUrl, count) {
+  const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
+  const boundedCount = Math.max(1, Math.min(50, Number(count) || 10));
+  const { stdout } = await execFile(
+    ytDlpPath,
+    [
+      ...ytDlpNetworkArgs(),
+      "--flat-playlist",
+      "-J",
+      "--playlist-items",
+      `1:${boundedCount}`,
+      "--no-warnings",
+      youtubeChannelListUrl(channelUrl),
+    ],
+    { timeout: 90_000, maxBuffer: 1024 * 1024 * 64 },
+  );
+  const info = JSON.parse(stdout);
+  const entries = Array.isArray(info?.entries) ? info.entries : [];
+  return {
+    channel_title: String(info?.channel || info?.uploader || info?.title || "").trim(),
+    videos: entries
+      .filter((entry) => entry?.id)
+      .slice(0, boundedCount)
+      .map((entry) => ({
+        video_id: entry.id,
+        title: String(entry.title || "").trim().slice(0, 220),
+        url: `https://www.youtube.com/watch?v=${entry.id}`,
+      })),
+  };
+}
+
+// Pin channel-shaped URLs to their /videos tab so flat-playlist lists uploads
+// (newest first) instead of the channel's featured/home layout. Playlist and
+// already-tabbed URLs pass through untouched.
+function youtubeChannelListUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (!/(^|\.)youtube\.com$/i.test(parsed.hostname)) return url;
+    if (parsed.pathname.includes("/playlist")) return url;
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (/\/(videos|shorts|streams)$/i.test(path)) return url;
+    if (/^\/(@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)$/i.test(path)) {
+      return `https://www.youtube.com${path}/videos`;
+    }
+    return url;
+  } catch {
+    return url;
+  }
+}
+
+// Dedupe key for "is this video already a source in the notebook": all URL
+// variants (youtu.be, /shorts/, watch?v=…&t=…) collapse to the video id.
+function normalizedYouTubeUrl(url) {
+  const videoId = youtubeVideoId(url);
+  return videoId ? `youtube:${videoId}` : String(url || "").trim();
 }
 
 async function fetchYouTubeTitle(videoId) {
