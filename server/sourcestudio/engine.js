@@ -4701,7 +4701,7 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   function normalizeAudioOptions(options = {}) {
-    const mode = normalizeAudioMode(options.format || options.mode || "deep_dive");
+    const mode = normalizeAudioMode(options.format || options.mode || "debate");
     const length = ["short", "default", "long"].includes(String(options.length || "").toLowerCase())
       ? String(options.length).toLowerCase()
       : "default";
@@ -4722,7 +4722,7 @@ export async function createSourceStudioEngine(options = {}) {
     const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
     if (["brief", "critique", "debate", "deep_dive"].includes(normalized)) return normalized;
     if (normalized === "podcast") return "deep_dive";
-    return "deep_dive";
+    return "debate";
   }
 
   function audioModeLabel(mode) {
@@ -5125,7 +5125,10 @@ export async function createSourceStudioEngine(options = {}) {
     }
 
     const dialogue = transcript.slice(0, 22).map((turn) => ({
-      text: spokenAudioText(turn.text),
+      // eleven_v3 reads bracketed audio tags ([heated], [interrupting]) as
+      // delivery directions — feed the script's voice_direction through so a
+      // debate sounds like one instead of two calm narrators.
+      text: [audioDeliveryTag(turn.voice_direction), spokenAudioText(turn.text)].filter(Boolean).join(" "),
       voice_id: turn.host === "Host B" ? hostBVoiceId : hostAVoiceId,
     }));
     const inputText = dialogue.map((turn) => turn.text).join("\n");
@@ -7777,6 +7780,17 @@ function stripCitations(text) {
 
 function spokenAudioText(text) {
   return truncate(stripCitations(text).replace(/\bSourceStudio\b/g, "Source Studio"), 900);
+}
+
+function audioDeliveryTag(direction) {
+  const cleaned = String(direction || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[[\]]/g, "")
+    .replace(/[^a-z0-9 ,-]/g, "")
+    .slice(0, 60)
+    .trim();
+  return cleaned ? `[${cleaned}]` : "";
 }
 
 function safeProviderError(error) {
