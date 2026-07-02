@@ -409,6 +409,14 @@ export function createModelRouter({
       title: typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : localPayload.title,
       citations: canonicalCitations,
     };
+    // Mind maps put edges after nodes, so a response truncated at max_tokens can
+    // arrive with rich nodes but a missing/empty edges array. Rather than discard
+    // the model's good nodes for the local fallback, rebuild the tree edges from
+    // the node hierarchy (root → topics → the rest).
+    if (type === "mindmap" && Array.isArray(payload.nodes) && payload.nodes.length >= 3
+      && (!Array.isArray(payload.edges) || !payload.edges.length)) {
+      payload.edges = rebuildMindMapEdges(payload.nodes);
+    }
     validateRequiredArtifactShape(type, payload);
     validateArtifactCitationMarkers(payload, canonicalCitations.length);
     return payload;
@@ -562,6 +570,26 @@ function artifactShapeInstructions(type) {
   return instructions[type] || 'Artifact: {"title": string, "panels": [{"panel": number, "headline": string, "copy": string, "source_refs": []}]}';
 }
 
+// Reconstruct a clean tree of edges from mind-map nodes when the provider's
+// edges array was lost to truncation. Root = the "notebook" node (or first);
+// "topic" nodes hang off the root; everything else attaches to the most recent
+// topic so the map stays a connected tree instead of failing validation.
+function rebuildMindMapEdges(nodes) {
+  const withId = nodes.filter((node) => node && node.id != null);
+  if (withId.length < 2) return [];
+  const root = withId.find((node) => node.type === "notebook") || withId[0];
+  const edges = [];
+  let currentTopic = root;
+  let edgeIndex = 0;
+  for (const node of withId) {
+    if (node.id === root.id) continue;
+    const parent = node.type === "topic" ? root : currentTopic;
+    edges.push({ id: `edge-${edgeIndex += 1}`, source: parent.id, target: node.id, label: "" });
+    if (node.type === "topic") currentTopic = node;
+  }
+  return edges;
+}
+
 function validateRequiredArtifactShape(type, payload) {
   const requiredArrays = ARTIFACT_REQUIRED_ARRAYS[type] || [];
   for (const key of requiredArrays) {
@@ -597,10 +625,17 @@ function positiveProviderTimeout(value, fallback) {
 }
 
 function artifactMaxTokens(type) {
-  if (type === "report") return 8192;
-  if (["slide-deck", "audio", "video"].includes(type)) return 4096;
+  // Raised after observing provider JSON truncated mid-object at max_tokens (which
+  // fell back to the local generator): a long report's JSON exceeded 8192, and
+  // mind maps/quizzes/tables overran 3200. Give each type enough headroom to
+  // finish the JSON so the richer provider output survives.
+  if (type === "report") return 16000;
+  if (["slide-deck", "audio", "video"].includes(type)) return 6000;
   if (["infographic"].includes(type)) return 4096;
-  if (["mindmap", "quiz", "data-table", "flashcards"].includes(type)) return 3200;
+  // Mind maps carry two arrays (nodes + edges) and many chip labels, so they
+  // need the most headroom of the structured types to finish the JSON.
+  if (type === "mindmap") return 8000;
+  if (["quiz", "data-table", "flashcards"].includes(type)) return 6000;
   return 2400;
 }
 
@@ -648,10 +683,54 @@ function hasRealKey(value) {
 function extractJson(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) throw new Error("Provider returned an empty response.");
-  if (trimmed.startsWith("{")) return trimmed;
-  const match = trimmed.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error("Provider did not return JSON.");
-  return match[0];
+  const candidate = trimmed.startsWith("{")
+    ? trimmed
+    : (trimmed.match(/\{[\s\S]*\}/)?.[0] ?? null);
+  if (!candidate) throw new Error("Provider did not return JSON.");
+  try {
+    JSON.parse(candidate);
+    return candidate;
+  } catch {
+    // Providers hit max_tokens mid-object, leaving valid-but-truncated JSON
+    // (an unterminated string / unclosed arrays+objects). Repairing the tail
+    // keeps the model's real output instead of discarding it for the local
+    // fallback. If repair still doesn't parse, the caller's catch handles it.
+    return repairTruncatedJson(candidate);
+  }
+}
+
+// Best-effort repair of JSON truncated at max_tokens: close an open string,
+// drop a dangling trailing comma / partial key, then balance open brackets.
+function repairTruncatedJson(input) {
+  const chars = [...input];
+  let inString = false;
+  let escaped = false;
+  const stack = [];
+  let lastValidEnd = -1;
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") { stack.pop(); lastValidEnd = i; }
+    else if ((ch === "," || /\S/.test(ch)) && stack.length) lastValidEnd = Math.max(lastValidEnd, i);
+  }
+  let repaired = input;
+  if (inString) repaired += '"';
+  // Remove a trailing partial token / dangling comma before closing brackets.
+  repaired = repaired.replace(/,\s*$/, "").replace(/:\s*$/, ": null");
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    repaired += stack[i] === "{" ? "}" : "]";
+  }
+  // A trailing comma just inside a closer is invalid JSON; strip those too.
+  repaired = repaired.replace(/,(\s*[}\]])/g, "$1");
+  void lastValidEnd;
+  return repaired;
 }
 
 async function safeJson(response) {

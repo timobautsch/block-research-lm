@@ -6082,10 +6082,22 @@ async function parsePlainTextUploadFallback(filePath, payload = {}) {
   if (!filePath || !isPlainTextUpload(payload)) return "";
   try {
     const text = await readFile(filePath, "utf8");
+    // Strip markup from uploaded HTML files (and any body that clearly contains
+    // HTML tags) so raw <p>/<body>/</html> tags don't leak into chat answers and
+    // generated artifacts.
+    if (isHtmlUpload(payload) || /<\/?(?:html|body|div|p|h[1-6]|span|table|article)\b[^>]*>/i.test(text)) {
+      return normalizeWhitespace(cleanHtml(text));
+    }
     return normalizeWhitespace(text);
   } catch {
     return "";
   }
+}
+
+function isHtmlUpload(payload = {}) {
+  const name = String(payload.file_name || "").toLowerCase();
+  const mime = String(payload.mime_type || "").toLowerCase();
+  return /\.html?$/.test(name) || mime.includes("html");
 }
 
 function uploadedTextParser(payload = {}) {
@@ -8176,13 +8188,30 @@ function reportTitleFromNotebook(notebook) {
   return title ? `${title}: Research Report` : "Research Report";
 }
 
+// The artifact "question" is an internal prompt ("Create a source-backed
+// Report. Include citations, risks..."). Strip that boilerplate so the rendered
+// report describes its subject, not the instruction that produced it.
+function reportSubjectPhrase(evidencePack) {
+  const raw = String(evidencePack?.user_question || "").trim();
+  const cleaned = raw
+    .replace(/create a source-backed[^.]*\.?/gi, "")
+    .replace(/include citations[^.]*\.?/gi, "")
+    .replace(/create a formal[^.]*\.?/gi, "")
+    .replace(/with (?:an? )?(?:abstract|title|executive summary)[^.]*\.?/gi, "")
+    .replace(/\.{2,}|…/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length >= 8) return truncate(cleaned, 140);
+  return "the active notebook sources";
+}
+
 function reportExecutiveSummary(findings, citations, evidencePack) {
   const sourceCount = new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size || citations.length;
   const primary = findings[0]?.text || `The active sources provide the evidence base for this report. ${citations[0]?.citation || "[1]"}`;
   const secondary = findings[1]?.text || findings[0]?.text || primary;
   const caveat = findings.find((finding) => /risk|limit|caveat|unclear|open|failed|not yield|requires?/i.test(finding.text)) || findings.at(-1) || findings[0];
   return [
-    `This report evaluates the active notebook evidence for the research question "${truncate(evidencePack.user_question, 140)}" and draws conclusions only from the ${sourceCount} retrieved source${sourceCount === 1 ? "" : "s"} available in the Evidence Pack. The strongest supported starting point is that ${sentenceLower(primary)}`,
+    `This report evaluates the active notebook evidence on ${reportSubjectPhrase(evidencePack)} and draws conclusions only from the ${sourceCount} retrieved source${sourceCount === 1 ? "" : "s"} available in the Evidence Pack. The strongest supported starting point is that ${sentenceLower(primary)}`,
     `The evidence also indicates that ${sentenceLower(secondary)} The report therefore treats the source set as a bounded dossier: each conclusion remains tied to cited passages and unsupported extrapolation is excluded.`,
     caveat
       ? `The main limitation is that ${sentenceLower(caveat.text)} This should be treated as a constraint on interpretation before the report is used for decisions or external communication.`
@@ -8194,7 +8223,7 @@ function reportScopeParagraphs(citations, evidencePack) {
   const sourceCount = new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size || citations.length;
   const evidenceCount = citations.length;
   return [
-    `Scope: this report covers the active notebook evidence retrieved for "${truncate(evidencePack.user_question, 140)}" and does not incorporate external facts, background assumptions, or uncited model memory. The source base contains ${sourceCount} source${sourceCount === 1 ? "" : "s"} and ${evidenceCount} cited evidence item${evidenceCount === 1 ? "" : "s"}.`,
+    `Scope: this report covers the active notebook evidence on ${reportSubjectPhrase(evidencePack)} and does not incorporate external facts, background assumptions, or uncited model memory. The source base contains ${sourceCount} source${sourceCount === 1 ? "" : "s"} and ${evidenceCount} cited evidence item${evidenceCount === 1 ? "" : "s"}.`,
   ];
 }
 
