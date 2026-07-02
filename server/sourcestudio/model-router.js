@@ -308,9 +308,9 @@ export function createModelRouter({
       body: JSON.stringify({
         model,
         max_tokens: options.maxTokens || 1200,
-        // Grounded work needs deterministic extraction, not creative variance —
-        // OpenAI/Google calls already pin temperature 0.
-        temperature: 0,
+        // NOTE: no `temperature` — claude-opus-4-8 rejects the parameter as
+        // deprecated (400), which silently pushed every call to the local
+        // fallback when we tried pinning it to 0.
         system: options.systemPrompt || groundedSystemPrompt(),
         messages: [{ role: "user", content: prompt }],
       }),
