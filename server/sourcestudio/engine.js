@@ -3750,9 +3750,19 @@ export async function createSourceStudioEngine(options = {}) {
     const strict = /strict/i.test(answerStyle);
     const exploratory = /explor/i.test(answerStyle);
     const concise = strict || /concise|brief/i.test(answerStyle);
-    const evidenceSentences = citations.map((citation) => bestSentenceForQuestion(citation.quote, question));
+    const evidenceSentences = citations.map((citation) =>
+      // Leading "[163:50]" transcript timestamps read as broken output in a
+      // bullet list — drop them; the citation chip still anchors the passage.
+      bestSentenceForQuestion(citation.quote, question).replace(/^\[?\d{1,3}:\d{2}(?::\d{2})?\]?\s*/, ""),
+    );
     const lines = [];
-    if (evidencePack.intent === "compare") {
+    if (OTHER_LANGUAGE_REQUEST_PATTERN.test(question)) {
+      // The offline engine cannot translate. Say so instead of dumping
+      // source-language fragments as if they were the requested answer.
+      lines.push(
+        "The AI model that handles translations is briefly unavailable — please ask again in a moment for the translated version. Until then, these are the most relevant passages in the source language:",
+      );
+    } else if (evidencePack.intent === "compare") {
       lines.push("The active sources frame the comparison around evidence quality, reuse, and operational maturity.");
     } else if (evidencePack.intent === "summary") {
       lines.push("The active sources support this synthesis:");
