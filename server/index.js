@@ -153,6 +153,10 @@ app.post("/api/notebooks/:id/sources", asyncHandler(async (req, res) => {
   res.status(201).json({ source: await engine.ingestSource(req.params.id, req.body, userContext(req)) });
 }));
 
+app.post("/api/notebooks/:id/sources/youtube-batch", asyncHandler(async (req, res) => {
+  res.status(201).json(await engine.ingestYouTubeChannel(req.params.id, req.body, userContext(req)));
+}));
+
 app.patch("/api/sources/:id/active", asyncHandler(async (req, res) => {
   res.json({ source: await engine.setSourceActive(req.params.id, req.body, userContext(req)) });
 }));

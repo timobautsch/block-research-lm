@@ -39,6 +39,12 @@ export const CreateNotebookSchema = z.object({
   description: z.string().trim().max(1000).optional().default(""),
 });
 
+export const YouTubeChannelBatchSchema = z.object({
+  channel_url: z.string().trim().url(),
+  count: z.coerce.number().int().min(1).max(50).default(10),
+  active: z.boolean().optional().default(true),
+});
+
 export const CreateSourceSchema = z.object({
   type: SourceTypeSchema,
   title: z.string().trim().min(1).max(220).optional(),

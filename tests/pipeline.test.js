@@ -694,6 +694,76 @@ test("reranks hybrid retrieval candidates through Cohere when configured", async
   });
 });
 
+test("imports the latest channel videos as individual YouTube sources", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-youtube-batch-test-"));
+  const channelVideos = [
+    { video_id: "vid00000001", title: "Grid bots explained", url: "https://www.youtube.com/watch?v=vid00000001" },
+    { video_id: "vid00000002", title: "Backtesting deep dive", url: "https://www.youtube.com/watch?v=vid00000002" },
+    { video_id: "vid00000003", title: "Portfolio rebalancing", url: "https://www.youtube.com/watch?v=vid00000003" },
+  ];
+  // Serves the two fetch shapes the caption path needs: a watch page whose
+  // captionTracks point at timedtext, and the json3 track itself.
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/api/timedtext")) {
+      const videoId = /v=([^&]+)/.exec(target)?.[1] || "unknown";
+      const words = `Transcript for ${videoId}: grid trading strategies, backtests, and portfolio risk in practice.`;
+      return new Response(JSON.stringify({ events: [{ segs: [{ utf8: words }] }] }), { status: 200 });
+    }
+    const videoId = /v=([^&]+)/.exec(target)?.[1] || "unknown";
+    const html = `<html>"captionTracks":[{"baseUrl":"https://www.youtube.com/api/timedtext?v=${videoId}\\u0026lang=en","languageCode":"en"}],"audioTracks"</html>`;
+    return new Response(html, { status: 200 });
+  };
+  const engine = await createSourceStudioEngine({
+    root: resolve("."),
+    storageDir: dir,
+    stateFile: join(dir, "state.json"),
+    env: { SOURCESTUDIO_VIDEO_TTS: "false", SOURCESTUDIO_DISABLE_YTDLP: "1" },
+    fetchImpl,
+    expandYouTubeChannelImpl: async (channelUrl, count) => ({
+      channel_title: "Test Channel",
+      videos: channelVideos.slice(0, count),
+    }),
+  });
+  try {
+    const notebook = await engine.createNotebook({ title: "Channel batch" });
+    const batch = await engine.ingestYouTubeChannel(notebook.id, {
+      channel_url: "https://www.youtube.com/@testchannel",
+      count: 3,
+    });
+    assert.equal(batch.channel_title, "Test Channel");
+    assert.equal(batch.queued, 3);
+    assert.equal(batch.skipped_existing, 0);
+    assert.equal(batch.sources.length, 3);
+    // Sources index asynchronously through the bounded ingest queue.
+    for (let i = 0; i < 100; i += 1) {
+      const view = engine.getNotebook(notebook.id);
+      const youtubeSources = view.sources.filter((source) => source.type === "youtube");
+      if (youtubeSources.length === 3 && youtubeSources.every((source) => source.status === "indexed")) break;
+      assert.ok(!youtubeSources.some((source) => source.status === "failed"), "no batch source should fail");
+      await new Promise((resolvePoll) => setTimeout(resolvePoll, 100));
+    }
+    const view = engine.getNotebook(notebook.id);
+    const titles = view.sources.map((source) => source.title);
+    assert.ok(titles.includes("Grid bots explained"));
+    assert.ok(titles.includes("Backtesting deep dive"));
+    assert.ok(view.sources.every((source) => source.status === "indexed"));
+    // Re-importing the same channel must dedupe against existing video sources.
+    const rerun = await engine.ingestYouTubeChannel(notebook.id, {
+      channel_url: "https://www.youtube.com/@testchannel",
+      count: 3,
+    });
+    assert.equal(rerun.queued, 0);
+    assert.equal(rerun.skipped_existing, 3);
+    // The schema caps the batch size at 50.
+    await assert.rejects(
+      engine.ingestYouTubeChannel(notebook.id, { channel_url: "https://www.youtube.com/@testchannel", count: 99 }),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("prints full active video transcript when explicitly requested", async () => {
   await withEngine(async (engine) => {
     const notebook = await engine.createNotebook({ title: "Transcript test" });
