@@ -767,6 +767,42 @@ test("abstains when active sources do not support the question", async () => {
   });
 });
 
+test("abstains on off-topic questions even when retrieval returns evidence", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Off-topic abstention" });
+    // Content-rich source: top-k retrieval WILL return evidence items for any
+    // question, so this exercises the relevance gate in the local answer path
+    // instead of the empty-evidence-pack abstention.
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Aurora Hydrogen Dossier",
+      body: [
+        "# Aurora Hydrogen GmbH",
+        "",
+        "Aurora Hydrogen GmbH wurde 2019 in Hamburg gegründet und beschäftigt 42 Mitarbeiter.",
+        "Der Elektrolyseur des Unternehmens erreicht eine Effizienz von 74 Prozent im Dauerbetrieb.",
+        "Die Series B über 38 Millionen Euro wurde 2025 von Verdane angeführt.",
+        "Das Unternehmen plant den Ausbau der Produktionskapazität auf 200 Megawatt bis 2027.",
+        "Wichtige Kunden kommen aus der Stahl- und Chemieindustrie in Norddeutschland.",
+      ].join("\n"),
+    });
+    const offTopic = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Was ist die Hauptstadt von Australien?",
+    });
+    assert.equal(offTopic.message.mode, "abstained");
+    assert.equal(offTopic.citations.length, 0);
+    // A genuinely grounded question must still pass the relevance gate.
+    const grounded = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Wie effizient ist der Elektrolyseur von Aurora Hydrogen?",
+    });
+    assert.equal(grounded.message.mode, "grounded");
+    assert.ok(grounded.message.content.includes("74"));
+    assert.ok(grounded.citations.length >= 1);
+  });
+});
+
 test("generates all required source-backed Studio artifacts", async () => {
   await withEngine(async (engine) => {
     const notebook = await engine.createNotebook({ title: "Artifact test" });

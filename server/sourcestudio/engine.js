@@ -3563,6 +3563,39 @@ export async function createSourceStudioEngine(options = {}) {
       heading_path: item.heading_path,
       page_number: item.page_number,
     }));
+    // Top-k retrieval always returns SOMETHING, so citations_available alone
+    // cannot distinguish "answerable" from "off-topic question vs unrelated
+    // sources" — without this gate the fallback happily answers "capital of
+    // Australia" with electrolyzer bullets. Measure question↔evidence token
+    // relevance on meaningful tokens (>=4 chars; short German stopwords like
+    // "ist"/"die" survive tokenize and substring-match everything). Summary and
+    // compare intents legitimately share no tokens with the evidence.
+    if (!["summary", "compare"].includes(evidencePack.intent)) {
+      const meaningful = tokenize(question).filter((token) => token.length >= 4);
+      const relevance = meaningful.length
+        ? Math.max(
+            ...citations.map((citation) => {
+              const quoteTokens = tokenize(citation.quote);
+              const matched = meaningful.filter((token) =>
+                quoteTokens.some(
+                  (quoteToken) =>
+                    quoteToken === token ||
+                    (quoteToken.length >= 4 && (quoteToken.includes(token) || token.includes(quoteToken))),
+                ),
+              );
+              return matched.length / meaningful.length;
+            }),
+          )
+        : 1;
+      if (relevance < 0.2) {
+        return {
+          content:
+            "I cannot answer that from the active sources. The Evidence Pack did not contain a passage that supports the requested claim, so Source-only mode abstained.",
+          citations: [],
+          abstained: true,
+        };
+      }
+    }
     const strict = /strict/i.test(answerStyle);
     const exploratory = /explor/i.test(answerStyle);
     const concise = strict || /concise|brief/i.test(answerStyle);
@@ -7767,7 +7800,18 @@ function dataTableProfile({ notebook, citations, evidencePack, options = {} }) {
     options.prompt || "",
     ...citations.map((citation) => `${citation.source_title || ""} ${citation.quote || ""}`),
   ].join("\n");
-  if (/werkvertrag|mängel?|mangel|vergütung|abnahme|mahnbescheid|bgb|zpo|litigation|legal|court|contract|termination|damages?|remuneration|acceptance/i.test(context)) {
+  // The legal_dispute profile is a very specific German-contract-dispute template
+  // (Werkvertrag/§§ BGB/Mahnbescheid). Single generic words like "legal",
+  // "contract" or "regulatory" also appear in unrelated topics (e.g. crypto
+  // compliance), so require a real cluster of dispute-specific signals before
+  // switching to it — otherwise fall through to the generic research table.
+  const strongLegalSignals = [
+    /werkvertrag|mängel?|mangel|vergütung|abnahme|mahnbescheid|\bbgb\b|\bzpo\b|kündigung/i,
+    /§\s*\d+|\b6(?:31|32|40|41|48|88)\b|\b287\b|\b404\b/,
+    /litigation|lawsuit|plaintiff|defendant|counterclaim|summary proceedings|default summons/i,
+  ];
+  const legalHits = strongLegalSignals.filter((re) => re.test(context)).length;
+  if (legalHits >= 2) {
     return {
       id: "legal_dispute",
       maxRows: 8,
