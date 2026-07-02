@@ -725,10 +725,14 @@ function hasRealKey(value) {
 function extractJson(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) throw new Error("Provider returned an empty response.");
-  const candidate = trimmed.startsWith("{")
-    ? trimmed
-    : (trimmed.match(/\{[\s\S]*\}/)?.[0] ?? null);
-  if (!candidate) throw new Error("Provider did not return JSON.");
+  const start = trimmed.indexOf("{");
+  if (start === -1) throw new Error("Provider did not return JSON.");
+  // Models sometimes append prose AFTER the closing brace ("Hope this helps!"),
+  // which makes a whole-text JSON.parse fail on trailing characters — take the
+  // first balanced object instead.
+  const balanced = firstBalancedJsonObject(trimmed, start);
+  if (balanced) return balanced;
+  const candidate = trimmed.slice(start);
   try {
     JSON.parse(candidate);
     return candidate;
@@ -743,6 +747,38 @@ function extractJson(text) {
 
 // Best-effort repair of JSON truncated at max_tokens: close an open string,
 // drop a dangling trailing comma / partial key, then balance open brackets.
+// String-aware brace matching: returns the first balanced {...} block that
+// parses, or null (e.g. the object never closes because of truncation).
+function firstBalancedJsonObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const candidate = text.slice(start, i + 1);
+        try {
+          JSON.parse(candidate);
+          return candidate;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function repairTruncatedJson(input) {
   const chars = [...input];
   let inString = false;

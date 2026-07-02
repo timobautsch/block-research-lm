@@ -6442,7 +6442,7 @@ const COLLECTION_REFERENTIAL_FRAMING =
 // Question scaffolding around collection asks ("what is talked about in the
 // podcasts") — these words carry no retrievable content of their own.
 const COLLECTION_SCAFFOLDING_PATTERN =
-  /^(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|topics?|overview|überblick|worüber|interviews?|gesprochen|besprochen|geredet|behandelt|erzählt|discussed|talked|covered|spoken|about|inhalt|contents?|über|welche|which|what|does|gibt|sagt|sagen|wird|werden|sprechen|spricht)$/i;
+  /^(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|topics?|overview|überblick|worüber|interviews?|gesprochen|besprochen|geredet|behandelt|erzählt|discussed|talked|covered|spoken|about|inhalt|contents?|über|welche[mnrs]?|which|what|does|gibt|sagt|sagen|wird|werden|sprechen|spricht|dies\w*|jene[mnrs]?|einem|einen|einer|eines|alle[mnrs]?|jede[mnrs]?|these|those|there|nochmal|bitte|gerne|auch|noch|dann|denn|kann|kannst|können|sollte?n?|wollen|würde\w*|would|could|please)$/i;
 
 function isCollectionLevelQuestion(text) {
   const cleaned = String(text || "").replace(COLLECTION_REFERENTIAL_FRAMING, " ");
