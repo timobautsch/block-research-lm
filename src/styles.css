@@ -1956,6 +1956,8 @@ select:focus-visible {
   flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
+  max-height: 168px;
+  overflow-y: auto;
 }
 
 .flashcard-token-row button,
@@ -7041,6 +7043,36 @@ textarea::placeholder {
 }
 
 .menu-item[data-active="true"] svg:last-child { color: var(--green); }
+
+.menu-item-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.menu-item-row .menu-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.menu-item-delete {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.menu-item-delete:hover {
+  border-color: rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.12);
+  color: #ff6b6b;
+}
 
 .menu-pill {
   flex: 0 0 auto;

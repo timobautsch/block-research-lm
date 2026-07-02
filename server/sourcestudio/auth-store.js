@@ -301,27 +301,57 @@ export function createAuthStore(options = {}) {
 
   function restoreSnapshot(data) {
     if (!data || typeof data !== "object") return;
-    try {
-      const insertUser = db.prepare(
-        "INSERT OR REPLACE INTO users (id, email, name, password_hash, password_salt, created_at, updated_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      );
-      for (const u of data.users || []) {
+    // ON CONFLICT DO UPDATE instead of INSERT OR REPLACE: REPLACE deletes the row
+    // first, which cascade-deletes every local session/reset for that user that is
+    // not in the snapshot. Each row is restored independently so one bad row does
+    // not abort the rest.
+    const insertUser = db.prepare(`
+      INSERT INTO users (id, email, name, password_hash, password_salt, created_at, updated_at, last_login_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        email = excluded.email, name = excluded.name,
+        password_hash = excluded.password_hash, password_salt = excluded.password_salt,
+        created_at = excluded.created_at, updated_at = excluded.updated_at,
+        last_login_at = excluded.last_login_at
+      WHERE excluded.updated_at >= users.updated_at
+    `);
+    for (const u of data.users || []) {
+      try {
         insertUser.run(u.id, u.email, u.name, u.password_hash, u.password_salt, u.created_at, u.updated_at, u.last_login_at ?? null);
+      } catch {
+        // best-effort restore
       }
-      const insertSession = db.prepare(
-        "INSERT OR REPLACE INTO sessions (id, user_id, token_hash, user_agent, ip_hash, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      );
-      for (const s of data.sessions || []) {
+    }
+    const insertSession = db.prepare(`
+      INSERT INTO sessions (id, user_id, token_hash, user_agent, ip_hash, created_at, expires_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        user_id = excluded.user_id, token_hash = excluded.token_hash,
+        user_agent = excluded.user_agent, ip_hash = excluded.ip_hash,
+        created_at = excluded.created_at, expires_at = excluded.expires_at,
+        revoked_at = excluded.revoked_at
+    `);
+    for (const s of data.sessions || []) {
+      try {
         insertSession.run(s.id, s.user_id, s.token_hash, s.user_agent || "", s.ip_hash || "", s.created_at, s.expires_at, s.revoked_at ?? null);
+      } catch {
+        // best-effort restore
       }
-      const insertReset = db.prepare(
-        "INSERT OR REPLACE INTO password_resets (id, user_id, token_hash, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, ?)",
-      );
-      for (const r of data.password_resets || []) {
+    }
+    const insertReset = db.prepare(`
+      INSERT INTO password_resets (id, user_id, token_hash, created_at, expires_at, used_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        user_id = excluded.user_id, token_hash = excluded.token_hash,
+        created_at = excluded.created_at, expires_at = excluded.expires_at,
+        used_at = excluded.used_at
+    `);
+    for (const r of data.password_resets || []) {
+      try {
         insertReset.run(r.id, r.user_id, r.token_hash, r.created_at, r.expires_at, r.used_at ?? null);
+      } catch {
+        // best-effort restore
       }
-    } catch {
-      // best-effort restore
     }
   }
 
@@ -342,11 +372,21 @@ export function parseCookies(header = "") {
     .reduce((cookies, part) => {
       const separator = part.indexOf("=");
       if (separator === -1) return cookies;
-      const key = decodeURIComponent(part.slice(0, separator).trim());
-      const value = decodeURIComponent(part.slice(separator + 1).trim());
+      const key = safeDecodeURIComponent(part.slice(0, separator).trim());
+      const value = safeDecodeURIComponent(part.slice(separator + 1).trim());
       cookies[key] = value;
       return cookies;
     }, {});
+}
+
+// Malformed percent-encoding in a cookie (e.g. "%zz") must not turn every
+// request from that client into a 500.
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function cookieIsSecure(env) {

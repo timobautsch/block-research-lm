@@ -1,11 +1,14 @@
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import PptxGenJS from "pptxgenjs";
+import { fetch as undiciFetch, ProxyAgent as UndiciProxyAgent } from "undici";
 import {
   ActiveSourceSchema,
   ArtifactRequestSchema,
@@ -45,6 +48,9 @@ const FLASHCARD_CARD_TYPES = ["concept", "application", "cloze", "caveat", "sour
 const FLASHCARD_CONTENT_VERSION = 4;
 const DEFAULT_CRAWL_MAX_PAGES = 12;
 const MAX_CRAWL_TEXT_CHARS = 2_200_000;
+// Same cap for direct uploads: a 50 MB text file would otherwise produce tens of
+// thousands of chunks, minutes of local embedding work, and an unpersistable state.
+const MAX_SOURCE_TEXT_CHARS = MAX_CRAWL_TEXT_CHARS;
 const PRODUCT_NAME = "Block Research LM";
 // Keep in sync with the legacy OVERVIEW_PROMPT in src/App.tsx. Earlier builds
 // auto-fired this question; it is filtered out so it never skews retrieval.
@@ -98,6 +104,13 @@ export async function createSourceStudioEngine(options = {}) {
   let durablePersistTimer = null;
   let durablePersistChain = Promise.resolve();
   let activeIngestJobs = 0;
+  // Only strip embeddings from the durable snapshot once pgvector has actually
+  // accepted at least one upsert this process — guards against silent dimension
+  // mismatches that would otherwise drop every row and lose vectors on restart.
+  let pgVectorsAccepted = false;
+  // Source ids deleted while their async ingest is still in flight, so runIngest
+  // can bail instead of resurrecting orphaned derived rows.
+  const deletedSourceIds = new Set();
   const ingestQueue = [];
   const recoveredInterruptedJobs = recoverInterruptedArtifactJobs();
   if (recoveredInterruptedJobs) await persist();
@@ -226,12 +239,23 @@ export async function createSourceStudioEngine(options = {}) {
     durablePersistTimer = null;
   }
 
+  function durableSnapshotState() {
+    // pgvector already stores every chunk vector; shipping the raw float arrays
+    // in the KV snapshot multiplies its size and times out the write on big
+    // corpora. Retrieval after a restore falls back to BM25 + pgvector.
+    // Only strip when pgvector has actually accepted vectors — otherwise (e.g.
+    // dimension mismatch dropping every row) we would delete the sole copy and
+    // lose semantic retrieval permanently across the restart.
+    if (!pgStore.enabled || !pgVectorsAccepted || !Array.isArray(state.embeddings) || !state.embeddings.length) return state;
+    return { ...state, embeddings: [] };
+  }
+
   function enqueueDurablePersist() {
     durablePersistChain = durablePersistChain
       .catch(() => undefined)
       .then(async () => {
         const startedAt = Date.now();
-        const persisted = await durable.set("engine_state", state);
+        const persisted = await durable.set("engine_state", durableSnapshotState());
         if (!persisted) {
           logger.warn("durable.snapshot.persist.failed", { duration_ms: Date.now() - startedAt });
         }
@@ -273,6 +297,21 @@ export async function createSourceStudioEngine(options = {}) {
       job.status = "failed";
       job.error = "Generation was interrupted by a server restart. Please start it again.";
       job.updated_at = now();
+      recovered += 1;
+    }
+    // Async ingestion (uploads/URLs/YouTube) persists source.status = "pending"/
+    // "parsing" while running in the in-memory queue. A restart loses the queue
+    // but the durable snapshot keeps the source, so without this sweep it would
+    // spin on "parsing" forever, excluded from retrieval and never completable.
+    for (const source of state.sources) {
+      if (!["pending", "parsing"].includes(source.status)) continue;
+      source.status = "failed";
+      source.metadata_json = {
+        ...source.metadata_json,
+        ingest_stage: "failed",
+        error: "Ingestion was interrupted by a server restart. Please re-add the source.",
+      };
+      source.updated_at = now();
       recovered += 1;
     }
     if (recovered) {
@@ -455,6 +494,18 @@ export async function createSourceStudioEngine(options = {}) {
       }
 
       const document = await parseSource(source, parsed, context);
+      capDocumentText(document);
+      // The user can delete the source (or its notebook) while parsing/embedding
+      // is still awaiting. If it's gone, bail before inserting derived rows so we
+      // don't resurrect orphaned blocks/chunks/embeddings/pgvector rows.
+      if (deletedSourceIds.has(sourceId) || !state.sources.some((item) => item.id === sourceId)) {
+        removeSourceDerivedRows(sourceId);
+        if (pgStore.enabled) {
+          await pgStore.deleteBySource(sourceId).catch(() => undefined);
+        }
+        deletedSourceIds.delete(sourceId);
+        return null;
+      }
       markSourceStage("chunking");
       source.title = document.title || source.title;
       source.raw_text = document.raw_text;
@@ -469,9 +520,16 @@ export async function createSourceStudioEngine(options = {}) {
       }
       state.blocks.push(...document.blocks);
       const chunks = chunkDocument(notebookId, source, document.blocks);
-      state.chunks.push(...chunks);
       markSourceStage("embedding");
       const chunkVectors = await embedder.embed(chunks.map((chunk) => chunk.normalized_text), "document");
+      // Re-check after the embedding await — deletion could have landed here too.
+      if (deletedSourceIds.has(sourceId) || !state.sources.some((item) => item.id === sourceId)) {
+        removeSourceDerivedRows(sourceId);
+        if (pgStore.enabled) await pgStore.deleteBySource(sourceId).catch(() => undefined);
+        deletedSourceIds.delete(sourceId);
+        return null;
+      }
+      state.chunks.push(...chunks);
       state.embeddings.push(
         ...chunks.map((chunk, index) => ({
           id: id("embedding"),
@@ -485,7 +543,7 @@ export async function createSourceStudioEngine(options = {}) {
       if (pgStore.enabled) {
         markSourceStage("vector_indexing");
         try {
-          await pgStore.upsertChunks(
+          const upserted = await pgStore.upsertChunks(
             chunks.map((chunk, index) => ({
               chunk_id: chunk.id,
               notebook_id: notebookId,
@@ -499,6 +557,7 @@ export async function createSourceStudioEngine(options = {}) {
               embedding_model: embedder.model,
             })),
           );
+          if (upserted > 0) pgVectorsAccepted = true;
         } catch (error) {
           logger.warn("pgvector.upsert.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) });
         }
@@ -647,6 +706,8 @@ export async function createSourceStudioEngine(options = {}) {
       systemPrompt: "You generate short, specific notebook titles. Output only the title text, nothing else.",
       prompt,
       maxTokens: 24,
+      // Plain text: forcing JSON mode here 400s on OpenAI and wraps the title on Google.
+      format: "text",
       startRun: startModelRun,
     });
     if (result?.run) state.modelRuns.push(result.run);
@@ -673,12 +734,18 @@ export async function createSourceStudioEngine(options = {}) {
   async function deleteSource(sourceId, context = {}) {
     const source = findSource(sourceId);
     assertSourceAccess(source, context);
+    // Signal any in-flight ingest for this source to bail before inserting rows.
+    deletedSourceIds.add(sourceId);
     state.sources = state.sources.filter((item) => item.id !== sourceId);
     removeSourceDerivedRows(sourceId);
     if (pgStore.enabled) {
       await pgStore.deleteBySource(sourceId).catch((error) =>
         logger.warn("pgvector.delete.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) }),
       );
+    }
+    // Free the uploaded original file (up to 200 MB) instead of leaking it on disk.
+    if (source.file_path) {
+      await unlink(source.file_path).catch(() => undefined);
     }
     rebuildNotebookKnowledge(source.notebook_id);
     await persist({ waitForDurable: false });
@@ -705,6 +772,38 @@ export async function createSourceStudioEngine(options = {}) {
     state.artifactJobs = state.artifactJobs.filter((job) => job.notebook_id !== notebookId);
     if (state.artifactJobs.length !== jobCountBefore) await persist({ waitForDurable: false });
     return { ok: true, deleted: removed.length };
+  }
+
+  async function deleteNotebook(notebookId, context = {}) {
+    assertNotebookAccess(notebookId, context);
+    const notebook = state.notebooks.find((item) => item.id === notebookId);
+    const sources = state.sources.filter((source) => source.notebook_id === notebookId);
+    for (const source of sources) {
+      deletedSourceIds.add(source.id);
+      removeSourceDerivedRows(source.id);
+      if (pgStore.enabled) {
+        await pgStore.deleteBySource(source.id).catch((error) =>
+          logger.warn("pgvector.delete.failed", { source_id: source.id, error: String(error?.message || error).slice(0, 160) }),
+        );
+      }
+      if (source.file_path) {
+        await unlink(source.file_path).catch(() => undefined);
+      }
+    }
+    state.sources = state.sources.filter((source) => source.notebook_id !== notebookId);
+    await removeArtifacts(state.artifacts.filter((artifact) => artifact.notebook_id === notebookId), context);
+    for (const key of ["artifactJobs", "chatSessions", "chatMessages", "retrievalRuns", "evidencePacks", "citationLedgers", "knowledgeObjects", "flashcardDecks", "flashcards", "flashcardReviews"]) {
+      state[key] = state[key].filter((item) => item.notebook_id !== notebookId);
+    }
+    state.notebooks = state.notebooks.filter((item) => item.id !== notebookId);
+    await persist({ waitForDurable: false });
+    logger.warn("notebook.delete.complete", {
+      request_id: context.requestId,
+      notebook_id: notebookId,
+      title: notebook?.title || "",
+      sources: sources.length,
+    });
+    return { ok: true };
   }
 
   async function askChat(input = {}, context = {}) {
@@ -810,8 +909,12 @@ export async function createSourceStudioEngine(options = {}) {
       state.retrievalRuns.push(evidencePack.retrieval_run);
       state.evidencePacks.push(evidencePack);
       state.citationLedgers.push(verification.ledger);
-      state.modelRuns.push(...generation.model_runs);
-      await persist({ waitForDurable: false });
+      state.modelRuns.push(...tagModelRunOwners(generation.model_runs, context));
+      // Persist off the response path: JSON.stringify of the whole (multi-MB)
+      // state is synchronous and would block the event loop before returning the
+      // answer. The message is already in memory and in the response body, and
+      // the queued write still runs — so returning first is safe and much faster.
+      persistInBackground({ waitForDurable: false });
       logger.info("chat.ask.complete", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -951,6 +1054,9 @@ export async function createSourceStudioEngine(options = {}) {
         if (parsed.type === "video") {
           artifactPayload = finalizeVideoPayload(artifactPayload, localPayload);
         }
+        if (parsed.type === "report") {
+          artifactPayload = finalizeReportPayload(artifactPayload, localPayload);
+        }
         if (parsed.type === "slide-deck") {
           artifactPayload = attachSlideSvgs(artifactPayload);
           await renderSlideDeckPptx({
@@ -965,7 +1071,7 @@ export async function createSourceStudioEngine(options = {}) {
           artifactPayload.generation_fallback_reason = generation.fallback_reason || "";
           artifactPayload.evidence_audit = buildArtifactEvidenceAudit(evidencePack, artifactPayload);
         }
-        state.modelRuns.push(...generation.model_runs, ...artifactModelRuns);
+        state.modelRuns.push(...tagModelRunOwners([...generation.model_runs, ...artifactModelRuns], context));
         modelRunIds = [...generation.model_runs.map((run) => run.id), ...artifactModelRuns.map((run) => run.id)];
       }
       job.progress = parsed.type === "audio" || parsed.type === "video" ? 70 : 85;
@@ -978,7 +1084,7 @@ export async function createSourceStudioEngine(options = {}) {
           payload: artifactPayload,
         });
         if (audioRun) {
-          state.modelRuns.push(audioRun);
+          state.modelRuns.push(...tagModelRunOwners([audioRun], context));
           modelRunIds.push(audioRun.id);
         }
       }
@@ -1166,6 +1272,10 @@ export async function createSourceStudioEngine(options = {}) {
     return artifact;
   }
 
+  function getArtifactForClient(artifactId, context = {}) {
+    return decorateArtifactForClient(getArtifact(artifactId, context));
+  }
+
   async function getFlashcardDeckForArtifact(artifactId, context = {}) {
     const artifact = getArtifact(artifactId, context);
     if (artifact.type !== "flashcards") throw statusError(400, "Artifact is not a flashcard deck.");
@@ -1300,8 +1410,23 @@ export async function createSourceStudioEngine(options = {}) {
     return job;
   }
 
-  function listModelRuns() {
-    return state.modelRuns.slice(-80).reverse();
+  function tagModelRunOwners(runs, context = {}) {
+    const owner = context.ownerUserId || "";
+    for (const run of runs) {
+      if (run && !run.owner_user_id) run.owner_user_id = owner;
+    }
+    return runs;
+  }
+
+  function listModelRuns(context = {}) {
+    // Model runs are pure telemetry (provider/model/tokens/latency, no prompts),
+    // but timing still shouldn't leak across users. Scope to the caller's runs;
+    // legacy untagged runs are hidden rather than shown to everyone.
+    const owner = context.ownerUserId || "";
+    return state.modelRuns
+      .filter((run) => (run.owner_user_id || "") === owner)
+      .slice(-80)
+      .reverse();
   }
 
   function debugSnapshot(context = {}) {
@@ -1325,7 +1450,11 @@ export async function createSourceStudioEngine(options = {}) {
         .slice(0, 8)
         .map(debugJob),
       recent_jobs: jobs.slice(0, 12).map(debugJob),
-      recent_model_runs: state.modelRuns.slice(-16).reverse().map(debugModelRun),
+      recent_model_runs: state.modelRuns
+        .filter((run) => (run.owner_user_id || "") === (context.ownerUserId || ""))
+        .slice(-16)
+        .reverse()
+        .map(debugModelRun),
       recent_messages: messages.slice(0, 10).map((message) => ({
         id: message.id,
         role: message.role,
@@ -1351,6 +1480,7 @@ export async function createSourceStudioEngine(options = {}) {
     ingestSource,
     setSourceActive,
     deleteSource,
+    deleteNotebook,
     askChat,
     createArtifact,
     deleteArtifact,
@@ -1359,6 +1489,7 @@ export async function createSourceStudioEngine(options = {}) {
     getCitationLedger,
     getSourceBlocks,
     getArtifact,
+    getArtifactForClient,
     getFlashcardDeckForArtifact,
     recordFlashcardReview,
     deleteFlashcard,
@@ -1602,7 +1733,8 @@ export async function createSourceStudioEngine(options = {}) {
       .map((source) => decorateSource(source.id));
     const artifacts = state.artifacts
       .filter((artifact) => artifact.notebook_id === notebookId)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .map(decorateArtifactForClient);
     const jobs = state.artifactJobs
       .filter((job) => job.notebook_id === notebookId)
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -1635,6 +1767,32 @@ export async function createSourceStudioEngine(options = {}) {
     return questions.some((question) =>
       /Block Research AI appear|trading-bot|automation themes appear most often/i.test(String(question || "")),
     );
+  }
+
+  function decorateArtifactForClient(artifact) {
+    if (!artifact) return artifact;
+    const base = stripServerPathsFromArtifact(artifact);
+    if (base.type !== "report") return base;
+    const contentJson = finalizeReportPayload(base.content_json || {});
+    return {
+      ...base,
+      content_json: contentJson,
+      text_content: renderArtifactText("report", contentJson),
+    };
+  }
+
+  // Absolute server filesystem paths must never reach the client — media is
+  // served through /api/artifacts/:id/media, so drop the raw paths and the
+  // engine-only file_path from the payload.
+  function stripServerPathsFromArtifact(artifact) {
+    const content = artifact.content_json;
+    if ((!content || typeof content !== "object")
+      && !artifact.file_path) return artifact;
+    const { audio_file_path, video_file_path, pptx_file_path, ...safeContent } = content || {};
+    void audio_file_path; void video_file_path; void pptx_file_path;
+    const { file_path, ...rest } = artifact;
+    void file_path;
+    return { ...rest, content_json: content ? safeContent : content };
   }
 
   function buildNotebookSuggestedQuestions(sources = []) {
@@ -2003,11 +2161,15 @@ export async function createSourceStudioEngine(options = {}) {
 
   function removeSourceDerivedRows(sourceId) {
     state.blocks = state.blocks.filter((item) => item.source_id !== sourceId);
+    // Collect this source's chunk ids BEFORE filtering chunks: the old code
+    // looked each embedding's chunk up in the already-filtered chunks array, so
+    // it (a) ran O(embeddings × chunks) and (b) kept the source's embeddings as
+    // orphans because their chunk was already gone. Set membership fixes both.
+    const removedChunkIds = new Set(
+      state.chunks.filter((item) => item.source_id === sourceId).map((item) => item.id),
+    );
     state.chunks = state.chunks.filter((item) => item.source_id !== sourceId);
-    state.embeddings = state.embeddings.filter((embedding) => {
-      const chunk = state.chunks.find((item) => item.id === embedding.chunk_id);
-      return chunk && chunk.source_id !== sourceId;
-    });
+    state.embeddings = state.embeddings.filter((embedding) => !removedChunkIds.has(embedding.chunk_id));
     state.knowledgeObjects = state.knowledgeObjects.filter((item) => item.source_id !== sourceId);
   }
 
@@ -2016,9 +2178,13 @@ export async function createSourceStudioEngine(options = {}) {
       const videoId = youtubeVideoId(source.original_url);
       const hasUserTranscript = Boolean(payload.body?.trim());
       const deepgramKey = realProviderKey(env.DEEPGRAM_API_KEY);
+      // Tracks whether any fetch path hit YouTube's datacenter-IP bot check, so
+      // the final error can name the real cause instead of "no captions".
+      const ytDiag = { botCheck: false };
+      void maybeCheckProxyTrafficBalance(logger, context.requestId);
       let rawText = hasUserTranscript
         ? payload.body
-        : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId });
+        : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId, diag: ytDiag });
       let parser = hasUserTranscript ? "youtube-user-transcript" : "youtube-transcript-fetcher";
       // No captions available? Transcribe the audio track with Deepgram so the
       // video is still fully transcribed instead of left as a short placeholder.
@@ -2034,6 +2200,7 @@ export async function createSourceStudioEngine(options = {}) {
           fetchImpl,
           logger,
           requestId: context.requestId,
+          diag: ytDiag,
         });
         const audioWords = audioText ? audioText.split(/\s+/).filter(Boolean).length : 0;
         if (audioWords > 30) {
@@ -2049,8 +2216,29 @@ export async function createSourceStudioEngine(options = {}) {
           request_id: context.requestId,
           video_id: videoId,
           has_deepgram: Boolean(deepgramKey),
+          bot_check: ytDiag.botCheck,
           words: rawText.split(/\s+/).filter(Boolean).length,
         });
+        if (ytDiag.proxyFailure) {
+          logger.warn("youtube.proxy.unreachable", { request_id: context.requestId, video_id: videoId });
+          throw statusError(
+            422,
+            "The YouTube egress proxy rejected connections — its traffic balance may be exhausted or the credentials expired. Check the proxy account (IPRoyal) and top it up, then retry. Pasting the transcript into the source body works immediately.",
+          );
+        }
+        if (ytDiag.botCheck) {
+          logger.warn("youtube.blocked_ip", { request_id: context.requestId, video_id: videoId });
+          throw statusError(
+            422,
+            "YouTube blocked this server's requests (cloud-IP bot check), so captions and audio transcription could not be fetched. Paste the video transcript into the source body to import it now — or configure a residential egress proxy (YTDLP_PROXY) to restore automatic YouTube ingestion.",
+          );
+        }
+        if (ytDiag.audioDownloaded) {
+          throw statusError(
+            422,
+            "This video has no captions and its audio contains no recognizable speech (music-only video?), so there is no transcript to index. Paste your own notes or a transcript into the source body to import it anyway.",
+          );
+        }
         throw statusError(
           422,
           "Could not load the YouTube transcript. Captions and automatic audio transcription were unavailable; paste the transcript manually or retry with a working YouTube transcript path.",
@@ -2357,8 +2545,15 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   function parseMarkdownLikeDocument(source, { rawText, cleanedText, parser, fallback, metadata = {} }) {
-    const text = cleanedText.trim();
+    // Cap BEFORE block-parsing: a 50 MB text file would otherwise be fully
+    // line-split and block-parsed (seconds of blocked event loop) only to be
+    // truncated afterward. Truncating the input keeps parse cost bounded.
+    const truncated = String(cleanedText || "").length > MAX_SOURCE_TEXT_CHARS;
+    const text = (truncated ? cleanedText.slice(0, MAX_SOURCE_TEXT_CHARS) : cleanedText).trim();
     if (!text) throw statusError(400, "Source does not contain readable text.");
+    const cappedRawText = String(rawText || "").length > MAX_SOURCE_TEXT_CHARS
+      ? String(rawText).slice(0, MAX_SOURCE_TEXT_CHARS)
+      : rawText;
     const blocks = parseMarkdownBlocks(source, text);
     return {
       title: source.title || firstHeading(text) || inferTitle({ body: text, type: source.type }),
@@ -2370,9 +2565,10 @@ export async function createSourceStudioEngine(options = {}) {
         fallback,
         block_count: blocks.length,
         cleaned_characters: text.length,
+        ...(truncated ? { truncated: true, truncated_at_chars: MAX_SOURCE_TEXT_CHARS } : {}),
         ...metadata,
       },
-      raw_text: rawText,
+      raw_text: cappedRawText,
       cleaned_text: text,
     };
   }
@@ -2553,6 +2749,10 @@ export async function createSourceStudioEngine(options = {}) {
     let tokenCount = 0;
     let currentHeading = [];
     let carriedOverlap = 0;
+    // Cache the accumulating chunk's embedding + tokens: without this,
+    // semanticBoundaryBetween re-tokenizes and re-hashes the entire growing
+    // buffer for every block, i.e. O(blocks²) work during large ingests.
+    const currentEmbedCache = { key: "", vector: null, tokens: null };
 
     const pushChunk = (reason = "target_tokens") => {
       const text = current.map((block) => block.text).join("\n\n").trim();
@@ -2612,7 +2812,7 @@ export async function createSourceStudioEngine(options = {}) {
 
       const blockTokens = estimateTokens(block.text);
       const semanticBoundary = current.length > carriedOverlap
-        ? semanticBoundaryBetween(current.slice(carriedOverlap), block, tokenCount)
+        ? semanticBoundaryBetween(current.slice(carriedOverlap), block, tokenCount, currentEmbedCache)
         : null;
       if (semanticBoundary?.break) {
         pushChunk("semantic_shift");
@@ -2643,15 +2843,27 @@ export async function createSourceStudioEngine(options = {}) {
     return chunks;
   }
 
-  function semanticBoundaryBetween(currentBlocks, nextBlock, tokenCount) {
+  function semanticBoundaryBetween(currentBlocks, nextBlock, tokenCount, cache = null) {
     if (tokenCount < CHUNK_SEMANTIC_MIN || nextBlock.type === "heading") return { break: false, weak: false };
     const currentText = currentBlocks.map((block) => block.text).join("\n\n");
     const nextText = nextBlock.text || "";
-    const currentTokens = tokenize(currentText);
+    // Reuse the accumulating buffer's tokens/embedding across blocks — only the
+    // appended block changes it, so recomputing per block is quadratic.
+    const cacheKey = `${currentBlocks.length}:${currentBlocks.at(-1)?.block_id || ""}:${currentText.length}`;
+    let currentTokens;
+    let currentVector;
+    if (cache && cache.key === cacheKey) {
+      currentTokens = cache.tokens;
+      currentVector = cache.vector;
+    } else {
+      currentTokens = tokenize(currentText);
+      currentVector = embedText(currentText);
+      if (cache) { cache.key = cacheKey; cache.tokens = currentTokens; cache.vector = currentVector; }
+    }
     const nextTokens = tokenize(nextText);
     if (currentTokens.length < 20 || nextTokens.length < 8) return { break: false, weak: false };
     const lexicalOverlap = overlapScore(nextTokens, currentTokens);
-    const vectorSimilarity = cosineSimilarity(embedText(currentText), embedText(nextText));
+    const vectorSimilarity = cosineSimilarity(currentVector, embedText(nextText));
     const breakOnSemanticShift =
       vectorSimilarity < CHUNK_SEMANTIC_BREAK_SIMILARITY &&
       lexicalOverlap < CHUNK_SEMANTIC_BREAK_OVERLAP;
@@ -2842,7 +3054,16 @@ export async function createSourceStudioEngine(options = {}) {
     const queryTokens = tokenize(retrievalText);
     const rewrites = rewriteQuery(retrievalText, notebook_id, queryTokens);
     const candidateChunks = state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id) && isRetrievableChunk(chunk));
-    const corpusStats = buildRetrievalCorpusStats(sourceIds, candidateChunks);
+    // Per-query caches: tokenize each candidate chunk once, and index embeddings
+    // by chunk_id once, instead of re-tokenizing and linearly scanning per chunk.
+    const chunkTokenCache = new globalThis.Map();
+    const candidateChunkIds = new Set(candidateChunks.map((chunk) => chunk.id));
+    const embeddingByChunkId = new globalThis.Map();
+    for (const embedding of state.embeddings) {
+      if (candidateChunkIds.has(embedding.chunk_id)) embeddingByChunkId.set(embedding.chunk_id, embedding);
+    }
+    const corpusStats = buildRetrievalCorpusStats(sourceIds, candidateChunks, chunkTokenCache);
+    const rewriteTokenLists = rewrites.map((query) => tokenize(query));
     const queryVector = (await embedder.embed([rewrites.join(" ") || retrievalText], "query"))[0] || [];
     const candidateLimit = Math.max(evidenceLimit * RETRIEVAL_CANDIDATE_MULTIPLIER, RETRIEVAL_MIN_CANDIDATES);
     let pgSimMap = null;
@@ -2854,7 +3075,7 @@ export async function createSourceStudioEngine(options = {}) {
       }
     }
     let scored = candidateChunks
-      .map((chunk) => scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector, pgSimMap))
+      .map((chunk) => scoreChunkForQuery(chunk, rewriteTokenLists, queryTokens, intent, corpusStats, queryVector, pgSimMap, chunkTokenCache, embeddingByChunkId))
       .filter((result) => result.include)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateLimit);
@@ -3065,12 +3286,18 @@ export async function createSourceStudioEngine(options = {}) {
     return sources.filter((source) => source.active).map((source) => source.id);
   }
 
-  function buildRetrievalCorpusStats(sourceIds, candidateChunks = null) {
+  function buildRetrievalCorpusStats(sourceIds, candidateChunks = null, tokenCache = null) {
     const chunks = candidateChunks || state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id));
     const documentFrequency = new Map();
     let totalTokenCount = 0;
     for (const chunk of chunks) {
-      const tokens = tokenize(chunk.normalized_text);
+      // Reuse the per-query token cache so each chunk is tokenized exactly once
+      // per request instead of here AND again inside scoreChunkForQuery.
+      let tokens = tokenCache?.get(chunk.id);
+      if (!tokens) {
+        tokens = tokenize(chunk.normalized_text);
+        tokenCache?.set(chunk.id, tokens);
+      }
       totalTokenCount += tokens.length;
       for (const token of new Set(tokens)) documentFrequency.set(token, (documentFrequency.get(token) || 0) + 1);
     }
@@ -3081,8 +3308,12 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
-  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector = [], pgSimMap = null) {
-    const chunkTokens = tokenize(chunk.normalized_text);
+  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector = [], pgSimMap = null, tokenCache = null, embeddingByChunkId = null) {
+    let chunkTokens = tokenCache?.get(chunk.id);
+    if (!chunkTokens) {
+      chunkTokens = tokenize(chunk.normalized_text);
+      tokenCache?.set(chunk.id, chunkTokens);
+    }
     const keywordScore = queryTokens.reduce((sum, token) => {
       const exact = chunkTokens.filter((chunkToken) => chunkToken === token).length;
       const partial = chunkTokens.filter((chunkToken) => chunkToken.includes(token) || token.includes(chunkToken)).length;
@@ -3090,8 +3321,14 @@ export async function createSourceStudioEngine(options = {}) {
     }, 0);
     const keywordNorm = keywordScore / Math.max(1, queryTokens.length);
     const bm25Score = bm25QueryScore(queryTokens, chunkTokens, corpusStats);
-    const rewriteScore = rewrites.reduce((sum, query) => sum + overlapScore(tokenize(query), chunkTokens), 0);
-    const stored = state.embeddings.find((item) => item.chunk_id === chunk.id);
+    // rewrites arrive pre-tokenized (array of token arrays) so each rewrite is
+    // tokenized once per query, not once per (query × chunk).
+    const rewriteScore = rewrites.reduce((sum, rewriteTokens) => sum + overlapScore(rewriteTokens, chunkTokens), 0);
+    // O(1) embedding lookup via the per-query map instead of a linear scan of
+    // the whole embeddings array for every candidate chunk (was O(chunks²)).
+    const stored = embeddingByChunkId
+      ? embeddingByChunkId.get(chunk.id)
+      : state.embeddings.find((item) => item.chunk_id === chunk.id);
     const chunkVector = stored?.vector;
     const semantic = embedder.isSemantic;
     let vectorScore = 0;
@@ -3230,31 +3467,46 @@ export async function createSourceStudioEngine(options = {}) {
   function diversifyScoredChunks(scored, limit) {
     const selected = [];
     const pool = [...scored];
+    // Tokenize each chunk once up front, not O(pool × selected) times inside the
+    // selection loop (was effectively O(n³) tokenization on large candidate sets).
+    const tokensByChunkId = new globalThis.Map();
+    const tokensFor = (chunk) => {
+      let tokens = tokensByChunkId.get(chunk.id);
+      if (!tokens) {
+        tokens = tokenize(chunk.text);
+        tokensByChunkId.set(chunk.id, tokens);
+      }
+      return tokens;
+    };
     while (pool.length && selected.length < limit) {
       let bestIndex = 0;
-      let bestScore = Number.NEGATIVE_INFINITY;
+      let bestDiversityScore = Number.NEGATIVE_INFINITY;
       for (let index = 0; index < pool.length; index += 1) {
         const candidate = pool[index];
+        const candidateTokens = tokensFor(candidate.chunk);
         const redundancy = selected.length
-          ? Math.max(...selected.map((item) => overlapScore(tokenize(candidate.chunk.text), tokenize(item.chunk.text))))
+          ? Math.max(...selected.map((item) => overlapScore(candidateTokens, tokensFor(item.chunk))))
           : 0;
         const sameSourceCount = selected.filter((item) => item.chunk.source_id === candidate.chunk.source_id).length;
         const headingNovelty = selected.some((item) => (item.chunk.heading_path || []).join("/") === (candidate.chunk.heading_path || []).join("/"))
           ? 0
           : 0.08;
-        const rerankScore = candidate.score - redundancy * 0.22 - sameSourceCount * 0.04 + headingNovelty;
-        if (rerankScore > bestScore) {
-          bestScore = rerankScore;
+        const diversityScore = candidate.score - redundancy * 0.22 - sameSourceCount * 0.04 + headingNovelty;
+        if (diversityScore > bestDiversityScore) {
+          bestDiversityScore = diversityScore;
           bestIndex = index;
         }
       }
       const [picked] = pool.splice(bestIndex, 1);
       selected.push({
         ...picked,
-        rerank_score: bestScore,
+        // Preserve the real reranker relevance; record the diversity-adjusted
+        // selection score separately instead of clobbering rerank_score.
+        rerank_score: typeof picked.rerank_score === "number" ? picked.rerank_score : picked.score,
+        diversity_score: Number(bestDiversityScore.toFixed(4)),
         ranking_signals: {
           ...(picked.ranking_signals || {}),
-          diversity: Number(bestScore.toFixed(4)),
+          diversity: Number(bestDiversityScore.toFixed(4)),
         },
       });
     }
@@ -3375,10 +3627,17 @@ export async function createSourceStudioEngine(options = {}) {
   function verifyAnswer(answer, evidencePack) {
     const ledgerId = id("ledger");
     const claims = splitClaims(answer.content);
+    // Resolve [n] markers by the citation's own `index` field, not by array
+    // position: provider citations can be sparse/non-contiguous (e.g. only [2]
+    // and [4]), so positional lookup would attribute the wrong quote and silently
+    // drop correctly-cited claims.
+    const citationByIndex = new globalThis.Map(
+      (answer.citations || []).map((citation) => [Number(citation.index), citation]),
+    );
     const entries = claims.map((claim, claimIndex) => {
       const citationIndexes = [...claim.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
       const citedEvidence = citationIndexes
-        .map((index) => answer.citations[index - 1])
+        .map((index) => citationByIndex.get(index) ?? answer.citations[index - 1])
         .filter(Boolean)
         .map((citation) => evidencePack.evidence_items.find((item) => item.evidence_id === citation.evidence_id))
         .filter(Boolean);
@@ -3718,7 +3977,11 @@ export async function createSourceStudioEngine(options = {}) {
     if (outputTokens.length < 10 || sourceTokens.length < 8) return false;
     const sourceSet = new Set(sourceTokens);
     const matches = outputTokens.filter((token) => sourceSet.has(token)).length;
-    return matches / Math.max(outputTokens.length, 1) < 0.02;
+    // 2% let hallucinated kits through: generic tokens ("research", "testing")
+    // alone clear that bar even when the model invents an unrelated product
+    // pitch. On-topic kits repeat source terminology far above 12%, and a
+    // rejected kit still gets the deterministic source-grounded fallback.
+    return matches / Math.max(outputTokens.length, 1) < 0.12;
   }
 
   async function buildYouTubeKit(notebook, evidencePack, options = {}) {
@@ -5029,13 +5292,48 @@ export async function createSourceStudioEngine(options = {}) {
     }
     const svgPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.svg`);
     await writeFile(svgPath, renderVideoCartoonFallbackSvg(scene, { index, total }));
-    await execFile(env.SIPS_PATH || "sips", ["-s", "format", "png", svgPath, "--out", pngPath], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
+    await rasterizeSvgToPng(svgPath, pngPath, { index, total });
     scene.image_prompt = prompt;
     scene.visual_status = "rendered_local_cartoon";
     scene.visual_fallback_reason = result.error || "";
+  }
+
+  // Turn the fallback SVG into a PNG in a way that works on Linux/Cloud Run, not
+  // just macOS. sips is macOS-only, so try it, then ffmpeg (which can rasterize
+  // via its SVG demuxer when built with librsvg), then a plain solid-color PNG
+  // via ffmpeg's lavfi color source — so a single scene can never fail the whole
+  // video artifact regardless of platform.
+  async function rasterizeSvgToPng(svgPath, pngPath, { index = 0 } = {}) {
+    const ffmpegPath = env.FFMPEG_PATH || "ffmpeg";
+    // 1) macOS sips, only when explicitly present.
+    if (env.SIPS_PATH || process.platform === "darwin") {
+      try {
+        await execFile(env.SIPS_PATH || "sips", ["-s", "format", "png", svgPath, "--out", pngPath], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+        return;
+      } catch {
+        // fall through to ffmpeg
+      }
+    }
+    // 2) ffmpeg SVG demux (works when ffmpeg is built with librsvg).
+    try {
+      await execFile(ffmpegPath, ["-y", "-loglevel", "error", "-i", svgPath, "-vf", "scale=1536:1024", pngPath], {
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024,
+      });
+      return;
+    } catch {
+      // fall through to a solid-color placeholder frame
+    }
+    // 3) Last resort: a solid branded frame so the video still renders.
+    const palette = ["#0f766e", "#1d4ed8", "#7c3aed", "#b45309", "#0891b2", "#be123c"];
+    const color = palette[index % palette.length];
+    await execFile(ffmpegPath, ["-y", "-loglevel", "error", "-f", "lavfi", "-i", `color=c=${color}:s=1536x1024:d=1`, "-frames:v", "1", pngPath], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
   }
 
   async function writeDataUriFile(dataUri, filePath) {
@@ -5064,20 +5362,26 @@ export async function createSourceStudioEngine(options = {}) {
 
   function renderArtifactText(type, payload) {
     if (type === "report") {
+      const introduction = reportTextItems(payload.abstract).length
+        ? reportTextItems(payload.abstract)
+        : reportTextItems(payload.executive_summary);
+      const scope = reportTextItems(payload.scope);
+      const methodology = reportTextItems(payload.methodology);
       const lines = [
         `# ${payload.title}`,
         "",
         "## Executive Summary",
-        ...reportTextItems(payload.executive_summary).map((item) => `${item}`),
+        ...introduction.map((item) => `${item}`),
         "",
-        "## TL;DR",
-        ...reportTextItems(payload.tldr).map((item) => `- ${item}`),
+        "## Scope and Method",
+        ...(scope.length ? scope : ["This report is limited to the active source evidence retrieved for the notebook."]).map((item) => `${item}`),
+        ...methodology.map((item) => `${item}`),
         "",
-        "## Key Findings",
+        "## Principal Findings",
         ...reportTextItems(payload.key_findings || payload.key_points).map((item) => `- ${item}`),
         "",
       ];
-      for (const section of Array.isArray(payload.detailed_sections) ? payload.detailed_sections : []) {
+      for (const section of Array.isArray(payload.detailed_sections) ? payload.detailed_sections.filter((item) => !isReportAuditSection(item)) : []) {
         lines.push(`## ${section.heading || "Section"}`, "");
         lines.push(...reportTextItems(section.body).map((item) => `${item}`), "");
         const evidence = reportTextItems(section.evidence);
@@ -5090,11 +5394,11 @@ export async function createSourceStudioEngine(options = {}) {
         lines.push("## Recommendations", "", ...recommendations.map((item) => `- ${item}`), "");
       }
       lines.push(
+        "## Limitations and Open Questions",
+        ...reportTextItems(payload.risks_limitations).map((item) => `- ${item}`),
+        "",
         "## Open Questions",
         ...reportTextItems(payload.open_questions).map((item) => `- ${item}`),
-        "",
-        "## Risks / Limitations",
-        ...reportTextItems(payload.risks_limitations).map((item) => `- ${item}`),
         "",
         "## Bibliography",
         ...reportTextItems(payload.bibliography).map((item) => `- ${item}`),
@@ -5104,7 +5408,12 @@ export async function createSourceStudioEngine(options = {}) {
     if (type === "data-table") {
       const columns = payload.columns || [];
       const rows = payload.rows || [];
-      return [columns.join(","), ...rows.map((row) => columns.map((column) => csvCell(row.cells?.[column] || "")).join(","))].join("\n");
+      // Escape the header row too: a provider-generated column label with a comma
+      // or quote would otherwise corrupt column alignment for every row.
+      return [
+        columns.map((column) => csvCell(column)).join(","),
+        ...rows.map((row) => columns.map((column) => csvCell(row.cells?.[column] || "")).join(",")),
+      ].join("\n");
     }
     if (type === "infographic" && payload.svg_markup) {
       return payload.svg_markup;
@@ -5148,6 +5457,12 @@ export async function createSourceStudioEngine(options = {}) {
           .join("; ");
       })
       .filter(Boolean);
+  }
+
+  function isReportAuditSection(section) {
+    if (!section || typeof section !== "object") return false;
+    const heading = String(section.heading || section.title || "").trim();
+    return /^(evidence\s+audit|citation\s+audit|source\s+audit|audit)$/i.test(heading);
   }
 
   function startModelRun(role, provider, model, input) {
@@ -5260,7 +5575,11 @@ function stateFreshness(state) {
     ...(state.sources || []).flatMap((item) => [item.created_at, item.updated_at]),
     ...(state.artifacts || []).map((item) => item.created_at),
     ...(state.artifactJobs || []).flatMap((item) => [item.created_at, item.updated_at]),
-    ...(state.messages || []).map((item) => item.created_at),
+    // The state key is chatMessages, not messages — reading the wrong key meant
+    // chat activity never counted toward freshness, so a snapshot with newer
+    // chats could be judged stale and overwritten by an older local copy.
+    ...(state.chatMessages || []).map((item) => item.created_at),
+    ...(state.flashcardReviews || []).map((item) => item.created_at),
   ];
   return dates.reduce((freshest, value) => {
     const time = Date.parse(value || "");
@@ -5314,44 +5633,126 @@ function hasConfiguredValue(value) {
   return Boolean(text && !/^replace-with-/i.test(text));
 }
 
+// SSRF guard: only allow fetching public http(s) URLs. Blocks private/loopback/
+// link-local ranges and the cloud metadata endpoint so a signed-in user can't
+// pivot the server into fetching internal services or 169.254.169.254.
+function ipIsBlocked(ip) {
+  const v = isIP(ip);
+  if (v === 4) {
+    const p = ip.split(".").map(Number);
+    if (p[0] === 10) return true;
+    if (p[0] === 127) return true;
+    if (p[0] === 0) return true;
+    if (p[0] === 169 && p[1] === 254) return true; // link-local + metadata
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT
+    if (p[0] >= 224) return true; // multicast/reserved
+    return false;
+  }
+  if (v === 6) {
+    const lower = ip.toLowerCase();
+    if (lower === "::1" || lower === "::") return true;
+    if (lower.startsWith("fe80") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
+    // IPv4-mapped (::ffff:a.b.c.d) — re-check the embedded v4 address.
+    const mapped = lower.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return ipIsBlocked(mapped[1]);
+    return false;
+  }
+  return false;
+}
+
+async function assertPublicUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw statusError(400, "URL source is not a valid URL.");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw statusError(400, "Only http(s) URLs can be ingested.");
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal")) {
+    throw statusError(400, "That URL is not reachable for security reasons.");
+  }
+  let addresses = [];
+  if (isIP(host)) {
+    addresses = [host];
+  } else {
+    try {
+      const resolved = await dnsLookup(host, { all: true });
+      addresses = resolved.map((entry) => entry.address);
+    } catch {
+      throw statusError(400, "That URL's host could not be resolved.");
+    }
+  }
+  if (!addresses.length || addresses.some((address) => ipIsBlocked(address))) {
+    throw statusError(400, "That URL resolves to a non-public address and cannot be ingested.");
+  }
+}
+
 async function fetchUrlText(url, fetchImpl = globalThis.fetch) {
   const page = await fetchUrlPage(url, fetchImpl);
   return page.cleanedText;
 }
 
 async function fetchUrlPage(url, fetchImpl = globalThis.fetch) {
+  await assertPublicUrl(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
     const response = await fetchImpl(url, {
       signal: controller.signal,
+      redirect: "manual",
       headers: {
         "user-agent": "SourceStudioAI/1.0 local demo crawler",
         accept: "text/html, text/plain;q=0.9, */*;q=0.5",
       },
     });
-    if (!response.ok) throw statusError(400, `URL fetch failed with ${response.status}.`);
-    const contentType = response.headers.get("content-type") || "";
-    const text = await response.text();
-    if (contentType.includes("html")) {
-      return {
-        url: response.url || url,
-        title: extractHtmlTitle(text) || readableUrlTitle(response.url || url),
-        cleanedText: cleanHtml(text),
-        links: extractHtmlLinks(text, response.url || url),
-        contentType,
-      };
+    // A redirect could point at an internal address that bypassed the initial
+    // SSRF check; re-validate the target and follow it once manually.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw statusError(400, "URL fetch failed with an empty redirect.");
+      const nextUrl = new URL(location, url).toString();
+      await assertPublicUrl(nextUrl);
+      const followed = await fetchImpl(nextUrl, {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: {
+          "user-agent": "SourceStudioAI/1.0 local demo crawler",
+          accept: "text/html, text/plain;q=0.9, */*;q=0.5",
+        },
+      });
+      return buildUrlPageResult(followed, nextUrl);
     }
-    return {
-      url: response.url || url,
-      title: readableUrlTitle(response.url || url),
-      cleanedText: normalizeWhitespace(text),
-      links: [],
-      contentType,
-    };
+    return buildUrlPageResult(response, url);
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function buildUrlPageResult(response, url) {
+  if (!response.ok) throw statusError(400, `URL fetch failed with ${response.status}.`);
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (contentType.includes("html")) {
+    return {
+      url: response.url || url,
+      title: extractHtmlTitle(text) || readableUrlTitle(response.url || url),
+      cleanedText: cleanHtml(text),
+      links: extractHtmlLinks(text, response.url || url),
+      contentType,
+    };
+  }
+  return {
+    url: response.url || url,
+    title: readableUrlTitle(response.url || url),
+    cleanedText: normalizeWhitespace(text),
+    links: [],
+    contentType,
+  };
 }
 
 async function discoverSitemapUrls(startUrl, fetchImpl = globalThis.fetch) {
@@ -5566,6 +5967,13 @@ function isLikelyGarbledExtraction(text) {
   if (quality.pdf_syntax_hits >= 2 && quality.mojibake_ratio > 0.05) return true;
   if (quality.mojibake_ratio > 0.16 && quality.alpha_numeric_ratio < 0.62) return true;
   if (quality.pdf_syntax_hits >= 1 && quality.alpha_numeric_ratio < 0.35) return true;
+  // Random byte runs that survive the byte-scan fallback are alphanumeric but
+  // not language: real prose has vowels in nearly every word.
+  const proseWords = sample.slice(0, 6000).match(/\b[\p{L}][\p{L}'-]{2,}\b/gu) || [];
+  if (proseWords.length >= 20) {
+    const voweled = proseWords.filter((word) => /[aeiouyäöüáéíóúà]/i.test(word)).length;
+    if (voweled / proseWords.length < 0.72) return true;
+  }
   return false;
 }
 
@@ -5649,15 +6057,18 @@ async function parsePlainTextUploadFallback(filePath, payload = {}) {
 
 function uploadedTextParser(payload = {}) {
   const name = String(payload.file_name || "").toLowerCase();
-  if (name.endsWith(".csv")) return "csv-text-parser";
-  if (name.endsWith(".txt")) return "text-file-parser";
+  if (name.endsWith(".csv") || name.endsWith(".tsv")) return "csv-text-parser";
+  if (name.endsWith(".txt") || name.endsWith(".log")) return "text-file-parser";
+  if (/\.(json|jsonl|ndjson|xml|ya?ml)$/.test(name)) return "structured-text-parser";
   return "markdown-parser";
 }
 
 function isPlainTextUpload(payload = {}) {
   const name = String(payload.file_name || "").toLowerCase();
   const mime = String(payload.mime_type || "").toLowerCase();
-  return /\.(md|markdown|txt|csv)$/.test(name) || mime.startsWith("text/");
+  return /\.(md|markdown|txt|csv|tsv|json|jsonl|ndjson|xml|ya?ml|log|html?)$/.test(name)
+    || mime.startsWith("text/")
+    || ["application/json", "application/xml", "application/yaml", "application/x-yaml"].includes(mime);
 }
 
 async function listZipEntries(filePath) {
@@ -5807,12 +6218,124 @@ function externalToolErrorSummary(error, maxLength = 300) {
     .slice(0, maxLength);
 }
 
-// Optional egress proxy for yt-dlp. YouTube blocks caption/audio downloads from
-// datacenter IPs (Cloud Run), so route yt-dlp through a (residential) proxy when
-// YTDLP_PROXY is set. No-op locally / when unset.
-function ytDlpNetworkArgs() {
+// YouTube rejects unauthenticated requests from datacenter IPs (Cloud Run) with a
+// "confirm you're not a bot" check. Two escape hatches, both optional:
+//  - YTDLP_PROXY: residential egress proxy — the reliable fix; also used for the
+//    direct caption fetches below so all YouTube traffic shares one egress IP.
+//  - YTDLP_COOKIES_B64 / YTDLP_COOKIES_FILE: Netscape cookies from a logged-in
+//    session. Works but cookies expire unpredictably and carry account risk.
+const YOUTUBE_BOT_CHECK_PATTERN = /sign in to confirm|confirm you.{0,3}re not a bot|login_required/i;
+// The egress proxy rejecting/failing connections looks different from a YouTube
+// bot check — usually an exhausted traffic balance or bad proxy credentials.
+const YOUTUBE_PROXY_FAILURE_PATTERN =
+  /tunnel connection failed|unable to connect to proxy|proxy authentication|proxyerror|407 proxy|error connecting to proxy/i;
+
+function noteYouTubeBotCheck(diag, errorText) {
+  const text = String(errorText || "");
+  if (diag && YOUTUBE_BOT_CHECK_PATTERN.test(text)) diag.botCheck = true;
+  if (diag && String(process.env.YTDLP_PROXY || "").trim() && YOUTUBE_PROXY_FAILURE_PATTERN.test(text)) {
+    diag.proxyFailure = true;
+  }
+  return errorText;
+}
+
+// Throttled IPRoyal traffic-balance check, piggybacked on YouTube ingests (the
+// only thing that consumes proxy traffic). Emits youtube.proxy.traffic_low so a
+// Cloud Monitoring log-based alert can email the operator before the balance
+// runs dry. Requires IPROYAL_API_TOKEN (dashboard -> Settings -> API); threshold
+// via IPROYAL_ALERT_THRESHOLD_GB (default 0.2 GB = 10% of a 2 GB purchase).
+let proxyBalanceCheckLastAt = 0;
+async function maybeCheckProxyTrafficBalance(logger, requestId) {
+  const token = String(process.env.IPROYAL_API_TOKEN || "").trim();
+  if (!token || !String(process.env.YTDLP_PROXY || "").trim()) return;
+  const now = Date.now();
+  if (now - proxyBalanceCheckLastAt < 60 * 60 * 1000) return;
+  proxyBalanceCheckLastAt = now;
+  try {
+    const response = await globalThis.fetch("https://resi-api.iproyal.com/v1/me", {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      logger?.warn("youtube.proxy.balance_check_failed", { request_id: requestId, status: response.status });
+      return;
+    }
+    const body = await response.json();
+    const availableGb = Number(body?.available_traffic ?? 0);
+    const thresholdGb = Number(process.env.IPROYAL_ALERT_THRESHOLD_GB || "") || 0.2;
+    if (availableGb <= thresholdGb) {
+      logger?.warn("youtube.proxy.traffic_low", {
+        request_id: requestId,
+        available_gb: availableGb,
+        threshold_gb: thresholdGb,
+      });
+    } else {
+      logger?.info("youtube.proxy.traffic_ok", { request_id: requestId, available_gb: availableGb });
+    }
+  } catch (error) {
+    logger?.warn("youtube.proxy.balance_check_failed", {
+      request_id: requestId,
+      error: externalToolErrorSummary(error),
+    });
+  }
+}
+
+// YTDLP_PROXY may contain a "{session}" placeholder (rotating-proxy sticky
+// sessions, e.g. IPRoyal's password_session-XXX_lifetime-30m). Each yt-dlp
+// invocation gets a fresh session token so one download sticks to ONE egress
+// IP — YouTube binds media URLs to the requesting IP, so per-request rotation
+// breaks/stalls audio downloads — while separate downloads still rotate.
+function ytDlpProxyUrl(sessionToken = "") {
   const proxy = String(process.env.YTDLP_PROXY || "").trim();
-  return proxy ? ["--proxy", proxy] : [];
+  if (!proxy || !proxy.includes("{session}")) return proxy;
+  const token = sessionToken || randomUUID().replace(/-/g, "").slice(0, 12);
+  return proxy.replaceAll("{session}", token);
+}
+
+function ytDlpNetworkArgs() {
+  const args = [];
+  const proxy = ytDlpProxyUrl();
+  if (proxy) args.push("--proxy", proxy);
+  const cookies = ytDlpCookiesFile();
+  if (cookies) args.push("--cookies", cookies);
+  return args;
+}
+
+// yt-dlp rewrites its cookie file after every run, so the cookies must live on a
+// writable path even when they arrive via env var or a read-only secret mount.
+let ytDlpCookiesCache = { key: null, file: "" };
+function ytDlpCookiesFile() {
+  const explicit = String(process.env.YTDLP_COOKIES_FILE || "").trim();
+  const b64 = String(process.env.YTDLP_COOKIES_B64 || "").trim();
+  const key = `${explicit}\n${b64}`;
+  if (ytDlpCookiesCache.key === key) return ytDlpCookiesCache.file;
+  let file = "";
+  try {
+    if (explicit || b64) {
+      const dir = mkdtempSync(join(tmpdir(), "ytdlp-cookies-"));
+      file = join(dir, "cookies.txt");
+      writeFileSync(file, explicit ? readFileSync(explicit) : Buffer.from(b64, "base64"));
+    }
+  } catch {
+    file = "";
+  }
+  ytDlpCookiesCache = { key, file };
+  return file;
+}
+
+// Route the direct watch-page/timedtext fetches through the same proxy as yt-dlp.
+// Node's global fetch ignores proxy env vars, and mixing npm-undici dispatchers
+// into the built-in fetch is unsupported — so use undici's own fetch when proxied.
+let youtubeProxyState = null;
+const youtubeFetchSessionToken = randomUUID().replace(/-/g, "").slice(0, 12);
+function youtubeEgressFetch(fetchImpl) {
+  if (!String(process.env.YTDLP_PROXY || "").trim() || fetchImpl !== globalThis.fetch) return fetchImpl;
+  const proxy = ytDlpProxyUrl(youtubeFetchSessionToken);
+  if (!youtubeProxyState || youtubeProxyState.proxy !== proxy) {
+    youtubeProxyState = { proxy, dispatcher: new UndiciProxyAgent(proxy) };
+  }
+  const { dispatcher } = youtubeProxyState;
+  return (url, init = {}) => undiciFetch(url, { ...init, dispatcher });
 }
 
 async function fetchYouTubeTitle(videoId) {
@@ -5833,7 +6356,7 @@ async function fetchYouTubeTitle(videoId) {
 // When a video has no captions, download its audio track (yt-dlp) and transcribe
 // it with Deepgram, so a YouTube source is still fully transcribed rather than a
 // placeholder. ffmpeg (inside transcribeAudioWithDeepgram) normalizes the audio.
-async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch, logger, requestId } = {}) {
+async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl = globalThis.fetch, logger, requestId, diag } = {}) {
   if (!videoId || !apiKey || process.env.SOURCESTUDIO_DISABLE_YTDLP === "1") return "";
   const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
   let dir;
@@ -5843,24 +6366,30 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
       ytDlpPath,
       [
         ...ytDlpNetworkArgs(),
-        "-f", "bestaudio/best",
+        // Speech doesn't need high bitrates: prefer a small audio format so
+        // downloads stay fast (and cheap) over residential-proxy bandwidth.
+        "-f", "bestaudio[abr<=80]/bestaudio/best",
         "-x", "--audio-format", "mp3", "--audio-quality", "5",
         "--no-warnings", "--no-playlist",
+        "--retries", "3", "--socket-timeout", "20",
         "-o", join(dir, "audio.%(ext)s"),
         `https://www.youtube.com/watch?v=${videoId}`,
       ],
-      { timeout: 300_000, maxBuffer: 1024 * 1024 * 64 },
+      { timeout: 480_000, maxBuffer: 1024 * 1024 * 64 },
     );
     const files = await readdir(dir);
     const audioFile = files.find((name) => /\.mp3$/i.test(name)) || files[0];
     if (!audioFile) return "";
     const buffer = await readFile(join(dir, audioFile));
+    // Distinguishes "download blocked" from "downloaded fine but no speech"
+    // (music-only videos) so the final error can say which one happened.
+    if (diag && buffer.length > 0) diag.audioDownloaded = true;
     return (await transcribeAudioWithDeepgram(buffer, { apiKey, model, fetchImpl })) || "";
   } catch (error) {
     logger?.warn("youtube.audio_transcribe.failed", {
       request_id: requestId,
       video_id: videoId,
-      error: externalToolErrorSummary(error),
+      error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
     });
     return "";
   } finally {
@@ -5869,7 +6398,7 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
 }
 
 async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options = {}) {
-  const { logger, requestId } = options;
+  const { logger, requestId, diag } = options;
   const videoId = youtubeVideoId(url);
   if (!videoId) {
     return `# YouTube source\n\nThe supplied URL did not include a YouTube video ID. Paste the transcript to index this source.\n\nSource URL: ${url || "n/a"}`;
@@ -5886,23 +6415,28 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
       logger?.warn("youtube.transcript.ytdlp.failed", {
         request_id: requestId,
         video_id: videoId,
-        error: externalToolErrorSummary(error),
+        error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
       });
       // yt-dlp may be missing or rate-limited; fall back to the direct fetch paths.
     }
   }
 
+  // The direct fallbacks must egress through the same proxy as yt-dlp, otherwise
+  // they are guaranteed-blocked exactly when the primary path needed the proxy.
+  const directFetch = youtubeEgressFetch(fetchImpl);
+
   // Preferred path: read the watch page and use the real caption-track URLs.
   // Unlike the bare timedtext endpoint, this works for auto-generated ("asr")
   // captions and any available language, which is what most videos actually have.
   try {
-    const tracks = await fetchYouTubeCaptionTracks(videoId, fetchImpl);
+    const tracks = await fetchYouTubeCaptionTracks(videoId, directFetch);
     const track = pickBestCaptionTrack(tracks);
     if (track?.baseUrl) {
       const baseUrl = track.baseUrl.replace(/\\u0026/g, "&");
       const trackUrl = /[?&]fmt=/.test(baseUrl) ? baseUrl : `${baseUrl}&fmt=json3`;
-      const response = await fetchImpl(trackUrl, {
+      const response = await directFetch(trackUrl, {
         headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+        signal: AbortSignal.timeout(15_000),
       });
       if (response.ok) {
         const transcript = parseYouTubeTimedText(await response.text());
@@ -5933,7 +6467,7 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
   for (const lang of ["en", "en-US", "de"]) {
     try {
       const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${encodeURIComponent(videoId)}&lang=${encodeURIComponent(lang)}&fmt=json3`;
-      const response = await fetchImpl(transcriptUrl, {
+      const response = await directFetch(transcriptUrl, {
         headers: { "user-agent": YOUTUBE_UA },
       });
       if (!response.ok) continue;
@@ -5956,7 +6490,7 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
 }
 
 async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
-  const { logger, requestId } = options;
+  const { logger, requestId, diag } = options;
   const ytDlpPath = process.env.YTDLP_PATH || "yt-dlp";
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
@@ -6006,7 +6540,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
     logger?.warn("youtube.transcript.ytdlp.metadata_failed", {
       request_id: requestId,
       video_id: videoId,
-      error: externalToolErrorSummary(error),
+      error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
     });
     // Metadata probe failed; fall back to a small fixed request set below.
   }
@@ -6044,7 +6578,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
         request_id: requestId,
         video_id: videoId,
         lang: chosenLang || "fallback",
-        error: externalToolErrorSummary(error),
+        error: noteYouTubeBotCheck(diag, externalToolErrorSummary(error)),
       });
       // --ignore-errors keeps successful tracks; read whatever was written below.
     });
@@ -6081,6 +6615,9 @@ async function fetchYouTubeCaptionTracks(videoId, fetchImpl = globalThis.fetch) 
   const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en`;
   const response = await fetchImpl(watchUrl, {
     headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+    // Bound the request: a hung YouTube response would otherwise pin an ingest
+    // slot for minutes and starve the queue.
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) return [];
   const html = await response.text();
@@ -6493,9 +7030,14 @@ function createReranker({ env = process.env, fetchImpl = globalThis.fetch } = {}
 
 // Optional Supabase/pgvector store for durable, scalable vector retrieval.
 // Active when SUPABASE_DB_URL is set; otherwise the in-memory cosine path is used.
-const PGVECTOR_DIM = 384;
-function createPgStore({ env = process.env, logger } = {}) {
+const PGVECTOR_DEFAULT_DIM = 384;
+function createPgStore({ env = process.env, logger, defaultDimension } = {}) {
   const url = String(env.SUPABASE_DB_URL || "").trim();
+  // The doc_chunks table has a fixed vector dimension. It must match the active
+  // embedder or every upsert/query is a dimension mismatch: rows would silently
+  // drop and semantic retrieval would degrade to BM25-only — permanently, since
+  // the durable snapshot strips in-memory vectors once pgStore is enabled.
+  const PGVECTOR_DIM = Number(env.PGVECTOR_DIM || 0) || Number(defaultDimension || 0) || PGVECTOR_DEFAULT_DIM;
   const disabledStatus = {
     enabled: false,
     provider: "local-memory",
@@ -6503,7 +7045,7 @@ function createPgStore({ env = process.env, logger } = {}) {
     dimension: PGVECTOR_DIM,
     external: false,
   };
-  if (!url) return { enabled: false, status: () => disabledStatus };
+  if (!url) return { enabled: false, dimension: PGVECTOR_DIM, status: () => disabledStatus };
   let poolPromise = null;
   async function getPool() {
     if (!poolPromise) {
@@ -6521,9 +7063,19 @@ function createPgStore({ env = process.env, logger } = {}) {
     return poolPromise;
   }
   const toVector = (vec) => `[${vec.join(",")}]`;
+  let dimensionMismatchLogged = false;
   async function upsertChunks(rows) {
     const usable = rows.filter((row) => Array.isArray(row.embedding) && row.embedding.length === PGVECTOR_DIM);
-    if (!usable.length) return;
+    if (usable.length < rows.length && !dimensionMismatchLogged) {
+      dimensionMismatchLogged = true;
+      const sample = rows.find((row) => Array.isArray(row.embedding) && row.embedding.length !== PGVECTOR_DIM);
+      logger?.warn?.("pgvector.dimension_mismatch", {
+        expected: PGVECTOR_DIM,
+        got: sample?.embedding?.length,
+        hint: "doc_chunks vector dimension does not match the active embedder; vectors are being dropped. Recreate the table with the correct dimension or set PGVECTOR_DIM.",
+      });
+    }
+    if (!usable.length) return 0;
     const pool = await getPool();
     const client = await pool.connect();
     try {
@@ -6535,6 +7087,7 @@ function createPgStore({ env = process.env, logger } = {}) {
           [row.chunk_id, row.notebook_id, row.source_id, row.owner_user_id || "", row.content || "", row.heading_path || "", row.metadata || {}, toVector(row.embedding)],
         );
       }
+      return usable.length;
     } finally {
       client.release();
     }
@@ -6786,7 +7339,14 @@ function splitClaims(answer) {
     .split(/\n+/)
     .flatMap((line) => {
       const clean = line.replace(/^[-*]\s+/, "").trim();
-      return /\[\d+\]/.test(clean) ? [clean] : clean.split(/(?<=[.!?])\s+/);
+      const citationCount = (clean.match(/\[\d+\]/g) || []).length;
+      // A single-citation bullet/line stays whole (its markdown may span the
+      // sentence). But a paragraph carrying MULTIPLE distinct citations must be
+      // split at sentence boundaries — otherwise the per-claim overlap check
+      // measures one sentence's text against a different sentence's evidence and
+      // scores a correctly-grounded answer as "unsupported".
+      if (citationCount <= 1) return [clean];
+      return clean.split(/(?<=[.!?])\s+/);
     })
     .map((claim) => claim.trim())
     .filter((claim) => claim.length > 20);
@@ -6954,6 +7514,9 @@ function collectArtifactEvidenceUsage(payload, citationItems = []) {
 
 function extractArtifactClaimItems(payload = {}) {
   const items = [];
+  collectClaimItems(items, payload.abstract);
+  collectClaimItems(items, payload.scope);
+  collectClaimItems(items, payload.methodology);
   collectClaimItems(items, payload.executive_summary);
   collectClaimItems(items, payload.key_points);
   collectClaimItems(items, payload.key_findings);
@@ -6965,9 +7528,6 @@ function extractArtifactClaimItems(payload = {}) {
   collectClaimItems(items, payload.storyboard);
   collectClaimItems(items, payload.panels);
   collectClaimItems(items, payload.recommendations);
-  if (Array.isArray(payload.tldr)) {
-    items.push(...payload.tldr.map((text) => ({ text })));
-  }
   if (Array.isArray(payload.detailed_sections)) {
     for (const section of payload.detailed_sections) collectClaimItems(items, section?.body);
   }
@@ -7075,9 +7635,20 @@ function artifactLabel(type) {
 }
 
 function buildDataTablePayload({ notebook, titleBase, citations, evidencePack, options = {} }) {
-  const profile = dataTableProfile({ notebook, citations, evidencePack, options });
+  let profile = dataTableProfile({ notebook, citations, evidencePack, options });
   const sourceNotes = dataTableSourceNotes(citations);
-  const rowCards = dataTableRowCards(citations, profile);
+  let rowCards = dataTableRowCards(citations, profile);
+  if (!rowCards.length && profile.id !== "research_synthesis") {
+    // The specialized profile matched on a stray keyword but none of the
+    // evidence fits its sentence filter — a themed table with zero rows is
+    // useless, so fall back to the generic synthesis profile.
+    profile = {
+      id: "research_synthesis",
+      maxRows: 8,
+      columns: ["Question or Theme", "Source Finding", "Implication", "Risk / Gap", "Recommended Action", "Source"],
+    };
+    rowCards = dataTableRowCards(citations, profile);
+  }
   const rows = rowCards.slice(0, profile.maxRows).map((citation, index) =>
     profile.id === "legal_dispute"
       ? legalDataTableRow(citation, index, profile, sourceNotes)
@@ -7469,6 +8040,39 @@ function generalRecommendedAction(sentence, citation) {
   return "Use the source citation to inspect the exact passage before turning this row into a decision.";
 }
 
+function finalizeReportPayload(payload = {}, fallback = {}) {
+  const report = sanitizeReportPayloadValue({ ...fallback, ...payload });
+  delete report.tldr;
+  if (!Array.isArray(report.abstract) || !report.abstract.length) {
+    report.abstract = Array.isArray(report.executive_summary) && report.executive_summary.length
+      ? report.executive_summary.slice(0, 2)
+      : [];
+  }
+  if (!Array.isArray(report.scope)) report.scope = [];
+  if (!Array.isArray(report.methodology)) report.methodology = [];
+  if (Array.isArray(report.detailed_sections)) {
+    report.detailed_sections = report.detailed_sections.filter((section) => !isReportSectionNamedAudit(section));
+  }
+  return report;
+}
+
+function sanitizeReportPayloadValue(value) {
+  if (typeof value === "string") return value.replace(/\bTL\s*;?\s*DR\b/gi, "summary-only format");
+  if (Array.isArray(value)) return value.map(sanitizeReportPayloadValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key.toLowerCase() !== "tldr")
+      .map(([key, entry]) => [key, sanitizeReportPayloadValue(entry)]),
+  );
+}
+
+function isReportSectionNamedAudit(section) {
+  if (!section || typeof section !== "object") return false;
+  const heading = String(section.heading || section.title || "").trim();
+  return /^(evidence\s+audit|citation\s+audit|source\s+audit|audit)$/i.test(heading);
+}
+
 function buildReportPayload({ notebook, evidencePack, options = {}, keyPoints, citations }) {
   const title = options.report_type || reportTitleFromNotebook(notebook);
   const findings = keyPoints.slice(0, 8).map((point, index) => {
@@ -7484,7 +8088,7 @@ function buildReportPayload({ notebook, evidencePack, options = {}, keyPoints, c
     };
   });
   const executiveSummary = reportExecutiveSummary(findings, citations, evidencePack);
-  const sections = buildReportSections({ findings, citations, evidencePack });
+  const sections = buildReportSections({ findings, citations });
   const recommendations = reportRecommendations(findings, citations);
   const risks = reportRiskParagraphs(findings, citations).slice(0, 5);
   const openQuestions = findings
@@ -7495,8 +8099,10 @@ function buildReportPayload({ notebook, evidencePack, options = {}, keyPoints, c
   return {
     title,
     report_type: title,
+    abstract: executiveSummary,
+    scope: reportScopeParagraphs(citations, evidencePack),
+    methodology: reportMethodologyParagraphs(citations),
     executive_summary: executiveSummary,
-    tldr: findings.slice(0, 5).map((finding) => finding.text),
     key_points: findings.map((finding) => ({
       text: finding.text,
       citation: finding.citation,
@@ -7532,15 +8138,30 @@ function reportExecutiveSummary(findings, citations, evidencePack) {
   const secondary = findings[1]?.text || findings[0]?.text || primary;
   const caveat = findings.find((finding) => /risk|limit|caveat|unclear|open|failed|not yield|requires?/i.test(finding.text)) || findings.at(-1) || findings[0];
   return [
-    `This report synthesizes ${sourceCount} retrieved source${sourceCount === 1 ? "" : "s"} from the active notebook into a source-grounded assessment of the request: "${truncate(evidencePack.user_question, 140)}". The strongest supported starting point is that ${sentenceLower(primary)}`,
-    `Across the evidence, the second-order implication is that ${sentenceLower(secondary)} The report therefore treats the source set as an evidence dossier rather than a generic summary, and keeps each conclusion tied to the cited passages.`,
+    `This report evaluates the active notebook evidence for the research question "${truncate(evidencePack.user_question, 140)}" and draws conclusions only from the ${sourceCount} retrieved source${sourceCount === 1 ? "" : "s"} available in the Evidence Pack. The strongest supported starting point is that ${sentenceLower(primary)}`,
+    `The evidence also indicates that ${sentenceLower(secondary)} The report therefore treats the source set as a bounded dossier: each conclusion remains tied to cited passages and unsupported extrapolation is excluded.`,
     caveat
-      ? `The main caveat is that ${sentenceLower(caveat.text)} This should be handled as a review constraint before the report is used for decisions or external communication.`
-      : `The main caveat is that the report can only cover facts present in the retrieved Evidence Pack, so missing or weakly parsed sources should be reviewed before use. ${citations[0]?.citation || "[1]"}`,
+      ? `The main limitation is that ${sentenceLower(caveat.text)} This should be treated as a constraint on interpretation before the report is used for decisions or external communication.`
+      : `The main limitation is that the report can only cover facts present in the retrieved Evidence Pack, so missing or weakly parsed sources should be reviewed before use. ${citations[0]?.citation || "[1]"}`,
   ];
 }
 
-function buildReportSections({ findings, citations, evidencePack }) {
+function reportScopeParagraphs(citations, evidencePack) {
+  const sourceCount = new Set(citations.map((citation) => citation.source_id).filter(Boolean)).size || citations.length;
+  const evidenceCount = citations.length;
+  return [
+    `Scope: this report covers the active notebook evidence retrieved for "${truncate(evidencePack.user_question, 140)}" and does not incorporate external facts, background assumptions, or uncited model memory. The source base contains ${sourceCount} source${sourceCount === 1 ? "" : "s"} and ${evidenceCount} cited evidence item${evidenceCount === 1 ? "" : "s"}.`,
+  ];
+}
+
+function reportMethodologyParagraphs(citations) {
+  const labels = citations.slice(0, 6).map((citation) => citation.citation).filter(Boolean).join(", ");
+  return [
+    `Method: the system retrieved source chunks, ranked the relevant evidence, generated the report from those passages, and preserved citation markers for source-level review. The primary evidence labels used in this report are ${labels || "[1]"}.`,
+  ];
+}
+
+function buildReportSections({ findings, citations }) {
   const evidenceBody = findings.slice(0, 4).map((finding) =>
     `${finding.analysis} In practical terms, this supports the finding: ${stripCitations(finding.text)} ${finding.citation}`,
   );
@@ -7552,10 +8173,6 @@ function buildReportSections({ findings, citations, evidencePack }) {
   const nextStepBody = reportRecommendations(findings, citations).map((item) => item.text || item);
 
   return [
-    {
-      heading: "Executive Analysis",
-      body: reportExecutiveSummary(findings, citations, evidencePack),
-    },
     {
       heading: "What the Evidence Establishes",
       body: evidenceBody.length ? evidenceBody : ["The active Evidence Pack did not contain enough cited material for a substantive evidence section. [1]"],
@@ -7877,13 +8494,19 @@ function renderSlideSvg(slide, { index, total, deckTitle }) {
   const W = 1280, H = 720, M = 64;
   const c = infographicPalette("evidence-dashboard");
   const accent = c.accents[index % c.accents.length];
-  const layout = String(slide.layout_type || "content").toLowerCase();
+  // Providers occasionally emit a null slide or non-array bullets; coerce
+  // defensively so one malformed entry can't crash the whole slide-deck job.
+  const safeSlide = slide && typeof slide === "object" ? slide : {};
+  const layout = String(safeSlide.layout_type || "content").toLowerCase();
   const isTitle = layout === "title" || index === 0;
   const isClosing = layout === "closing" || layout === "section" || (layout === "title" && index === total - 1 && total > 1);
-  const title = infographicCleanText(slide.title || (isTitle ? deckTitle : ""));
-  const subtitle = infographicCleanText(slide.subtitle || "");
-  const bullets = (slide.bullets || []).map((b) => infographicCleanText(b)).filter(Boolean).slice(0, 6);
-  const visual = infographicCleanText(slide.visual_suggestion || "");
+  const title = infographicCleanText(safeSlide.title || (isTitle ? deckTitle : ""));
+  const subtitle = infographicCleanText(safeSlide.subtitle || "");
+  const rawBullets = Array.isArray(safeSlide.bullets)
+    ? safeSlide.bullets
+    : (typeof safeSlide.bullets === "string" ? [safeSlide.bullets] : []);
+  const bullets = rawBullets.map((b) => infographicCleanText(b)).filter(Boolean).slice(0, 6);
+  const visual = infographicCleanText(safeSlide.visual_suggestion || "");
   const p = [];
 
   p.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(title || "Slide")}">`);
@@ -9015,6 +9638,73 @@ function isMindMapSourceError(text = "") {
 }
 
 function finalizeMindMapPayload(generated, local) {
+  return dedupeMindMapChildren(resolveMindMapPayload(generated, local));
+}
+
+function capDocumentText(document) {
+  if (!document || typeof document !== "object") return document;
+  const overCap = String(document.cleaned_text || "").length > MAX_SOURCE_TEXT_CHARS
+    || String(document.raw_text || "").length > MAX_SOURCE_TEXT_CHARS;
+  if (!overCap) return document;
+  document.raw_text = String(document.raw_text || "").slice(0, MAX_SOURCE_TEXT_CHARS);
+  document.cleaned_text = String(document.cleaned_text || "").slice(0, MAX_SOURCE_TEXT_CHARS);
+  if (Array.isArray(document.blocks)) {
+    let usedChars = 0;
+    document.blocks = document.blocks.filter((block) => {
+      if (usedChars >= MAX_SOURCE_TEXT_CHARS) return false;
+      usedChars += String(block.text || "").length;
+      return true;
+    });
+  }
+  document.metadata = {
+    ...document.metadata,
+    truncated: true,
+    truncated_at_chars: MAX_SOURCE_TEXT_CHARS,
+    block_count: Array.isArray(document.blocks) ? document.blocks.length : document.metadata?.block_count,
+  };
+  return document;
+}
+
+// Providers sometimes emit several children with the same label under one
+// parent; keep the first and reattach any grandchildren to it.
+function dedupeMindMapChildren(payload) {
+  if (!payload || !Array.isArray(payload.nodes) || !Array.isArray(payload.edges)) return payload;
+  let nodes = payload.nodes;
+  let edges = payload.edges;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const parentByChild = new Map();
+    for (const edge of edges) {
+      if (!parentByChild.has(edge.target)) parentByChild.set(edge.target, edge.source);
+    }
+    const canonicalByKey = new Map();
+    const remap = new Map();
+    for (const node of nodes) {
+      const parent = parentByChild.get(node.id);
+      if (parent === undefined) continue;
+      const key = `${parent}::${String(node.label || "").trim().toLowerCase()}`;
+      const keeper = canonicalByKey.get(key);
+      if (keeper) remap.set(node.id, keeper);
+      else canonicalByKey.set(key, node.id);
+    }
+    if (!remap.size) break;
+    nodes = nodes.filter((node) => !remap.has(node.id));
+    const seenEdges = new Set();
+    edges = edges
+      .filter((edge) => !remap.has(edge.target))
+      .map((edge) => (remap.has(edge.source) ? { ...edge, source: remap.get(edge.source) } : edge))
+      .filter((edge) => {
+        if (edge.source === edge.target) return false;
+        const key = `${edge.source}->${edge.target}`;
+        if (seenEdges.has(key)) return false;
+        seenEdges.add(key);
+        return true;
+      });
+  }
+  if (nodes === payload.nodes && edges === payload.edges) return payload;
+  return { ...payload, nodes, edges };
+}
+
+function resolveMindMapPayload(generated, local) {
   const localUsable = local && typeof local === "object" && Array.isArray(local.nodes) && Array.isArray(local.edges);
   if (!generated || typeof generated !== "object" || !Array.isArray(generated.nodes) || !Array.isArray(generated.edges)) {
     return localUsable ? local : generated;
@@ -9068,14 +9758,27 @@ function mindMapMaxDepth(rootId, edges) {
     if (!children.has(edge.source)) children.set(edge.source, []);
     children.get(edge.source).push(edge.target);
   }
-  const walk = (nodeId, depth, seen = new Set()) => {
-    if (seen.has(nodeId)) return depth;
-    seen.add(nodeId);
-    const next = children.get(nodeId) || [];
-    if (!next.length) return depth;
-    return Math.max(...next.map((childId) => walk(childId, depth + 1, new Set(seen))));
-  };
-  return walk(rootId, 0);
+  // BFS by levels with a single global visited set. The old recursion cloned the
+  // seen-set per branch, so a non-tree (diamond) provider graph enumerated every
+  // distinct root-to-leaf path — exponential, blocking the event loop. BFS visits
+  // each node once; the last non-empty level index is the max depth.
+  const visited = new Set([rootId]);
+  let frontier = [rootId];
+  let depth = 0;
+  while (frontier.length) {
+    const nextFrontier = [];
+    for (const nodeId of frontier) {
+      for (const childId of children.get(nodeId) || []) {
+        if (visited.has(childId)) continue;
+        visited.add(childId);
+        nextFrontier.push(childId);
+      }
+    }
+    if (!nextFrontier.length) break;
+    depth += 1;
+    frontier = nextFrontier;
+  }
+  return depth;
 }
 
 // Single tokens that surface from the keyword extractor but read as noise when
@@ -9189,7 +9892,10 @@ function sanitizeFileName(name) {
 }
 
 function csvCell(value) {
-  const text = String(value ?? "");
+  let text = String(value ?? "");
+  // Neutralize CSV formula injection from untrusted source content: a leading
+  // =/+/-/@ would execute when the exported CSV is opened in Excel/Sheets.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 

@@ -54,6 +54,21 @@ export function createModelRouter({
     throw new Error("ModelRouter requires a local grounded-answer fallback.");
   }
 
+  // A stalled provider must not hang user requests indefinitely; the callers all
+  // have local fallbacks, so timing out degrades gracefully instead of blocking.
+  const providerTimeoutMs = positiveProviderTimeout(env.SOURCESTUDIO_PROVIDER_TIMEOUT_MS, 240000);
+
+  async function providerFetch(url, init, { provider, role }) {
+    try {
+      return await fetchImpl(url, { ...init, signal: AbortSignal.timeout(providerTimeoutMs) });
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        throw new Error(`${provider} ${role || "generation"} timed out after ${Math.round(providerTimeoutMs / 1000)}s.`);
+      }
+      throw error;
+    }
+  }
+
   function status() {
     const grounded = selectProvider("grounded_answer");
     const artifact = selectProvider("artifact_generation");
@@ -260,7 +275,7 @@ export function createModelRouter({
   }
 
   async function callAnthropic(model, prompt, options = {}) {
-    const response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+    const response = await providerFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -273,7 +288,7 @@ export function createModelRouter({
         system: options.systemPrompt || groundedSystemPrompt(),
         messages: [{ role: "user", content: prompt }],
       }),
-    });
+    }, { provider: "Anthropic", role: options.role });
     const body = await safeJson(response);
     if (!response.ok) {
       const detail = body?.error?.message ? `: ${String(body.error.message).slice(0, 160)}` : "";
@@ -283,7 +298,7 @@ export function createModelRouter({
   }
 
   async function callOpenAI(model, prompt, options = {}) {
-    const response = await fetchImpl("https://api.openai.com/v1/chat/completions", {
+    const response = await providerFetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -293,20 +308,22 @@ export function createModelRouter({
         model,
         temperature: 0,
         max_tokens: options.maxTokens || 1200,
-        response_format: { type: "json_object" },
+        // json_object mode 400s on plain-text tasks (OpenAI requires "JSON" in the
+        // prompt) and would wrap the output; only force it for JSON-shaped calls.
+        ...(options.format === "text" ? {} : { response_format: { type: "json_object" } }),
         messages: [
           { role: "system", content: options.systemPrompt || groundedSystemPrompt() },
           { role: "user", content: prompt },
         ],
       }),
-    });
+    }, { provider: "OpenAI", role: options.role });
     const body = await safeJson(response);
     if (!response.ok) throw new Error(`OpenAI ${options.role || "generation"} failed with ${response.status}.`);
     return body.choices?.[0]?.message?.content?.trim() || "";
   }
 
   async function callGoogle(model, prompt, options = {}) {
-    const response = await fetchImpl(
+    const response = await providerFetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GOOGLE_API_KEY)}`,
       {
         method: "POST",
@@ -314,7 +331,7 @@ export function createModelRouter({
         body: JSON.stringify({
           generationConfig: {
             temperature: 0,
-            responseMimeType: "application/json",
+            ...(options.format === "text" ? {} : { responseMimeType: "application/json" }),
             maxOutputTokens: options.maxTokens || 1200,
           },
           systemInstruction: {
@@ -323,6 +340,7 @@ export function createModelRouter({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
         }),
       },
+      { provider: "Google", role: options.role },
     );
     const body = await safeJson(response);
     if (!response.ok) throw new Error(`Google ${options.role || "generation"} failed with ${response.status}.`);
@@ -337,30 +355,47 @@ export function createModelRouter({
     }
     const citedIndexes = [...parsed.answer_markdown.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
     const citationByIndex = new Map(parsed.citations.map((citation) => [citation.index, citation]));
-    for (const index of citedIndexes) {
-      if (!citationByIndex.has(index)) throw new Error("Provider returned an unknown citation index.");
+    const unknownIndexes = new Set(citedIndexes.filter((index) => !citationByIndex.has(index)));
+    let answerMarkdown = parsed.answer_markdown;
+    if (unknownIndexes.size) {
+      // One stray marker must not discard an otherwise valid provider answer in
+      // favor of the local fallback; strip it and let the downstream grounding
+      // check cover the claim. Mostly-broken citation sets still hard-fail.
+      const knownCount = citedIndexes.length - [...citedIndexes].filter((index) => unknownIndexes.has(index)).length;
+      if (!citationByIndex.size || knownCount < unknownIndexes.size) {
+        throw new Error("Provider returned an unknown citation index.");
+      }
+      answerMarkdown = answerMarkdown.replace(/\s?\[(\d+)\]/g, (match, num) => (unknownIndexes.has(Number(num)) ? "" : match)).trim();
+      if (!answerMarkdown) throw new Error("Provider returned an unknown citation index.");
     }
-    const citations = parsed.citations
-      .sort((a, b) => a.index - b.index)
-      .map((citation) => {
-        const evidence = allowedEvidence.get(citation.evidence_id);
-        if (!evidence) throw new Error("Provider cited evidence outside the Evidence Pack.");
-        return {
-          index: citation.index,
-          evidence_id: evidence.evidence_id,
-          sourceId: evidence.source_id,
-          source_id: evidence.source_id,
-          sourceTitle: evidence.source_title,
-          source_title: evidence.source_title,
-          block_ids: evidence.block_ids,
-          chunk_id: evidence.chunk_id,
-          quote: evidence.quote,
-          heading_path: evidence.heading_path,
-          page_number: evidence.page_number,
-        };
-      });
+    const sortedCitations = parsed.citations.slice().sort((a, b) => a.index - b.index);
+    // Renumber to a contiguous 1..N and rewrite the [n] markers in the text to
+    // match, so downstream consumers (ledger, client) can resolve markers by
+    // position OR index interchangeably — provider numbering is often sparse.
+    const renumber = new globalThis.Map(sortedCitations.map((citation, position) => [citation.index, position + 1]));
+    answerMarkdown = answerMarkdown.replace(/\[(\d+)\]/g, (match, num) => {
+      const next = renumber.get(Number(num));
+      return next ? `[${next}]` : match;
+    });
+    const citations = sortedCitations.map((citation, position) => {
+      const evidence = allowedEvidence.get(citation.evidence_id);
+      if (!evidence) throw new Error("Provider cited evidence outside the Evidence Pack.");
+      return {
+        index: position + 1,
+        evidence_id: evidence.evidence_id,
+        sourceId: evidence.source_id,
+        source_id: evidence.source_id,
+        sourceTitle: evidence.source_title,
+        source_title: evidence.source_title,
+        block_ids: evidence.block_ids,
+        chunk_id: evidence.chunk_id,
+        quote: evidence.quote,
+        heading_path: evidence.heading_path,
+        page_number: evidence.page_number,
+      };
+    });
     return {
-      content: parsed.answer_markdown,
+      content: answerMarkdown,
       citations,
       abstained: parsed.abstained,
     };
@@ -387,14 +422,14 @@ export function createModelRouter({
     delete run.started_at_ms;
   }
 
-  async function generateStructured({ role = "artifact_generation", systemPrompt, prompt, maxTokens = 1800, startRun } = {}) {
+  async function generateStructured({ role = "artifact_generation", systemPrompt, prompt, maxTokens = 1800, format, startRun } = {}) {
     const selected = selectProvider(role);
     if (selected.provider === "local") {
       return { text: "", provider: "local", model: LOCAL_MODEL };
     }
     const run = startRun ? startRun(role, selected.provider, selected.model, prompt) : null;
     try {
-      const text = await callProvider(selected.provider, selected.model, prompt, { role, systemPrompt, maxTokens });
+      const text = await callProvider(selected.provider, selected.model, prompt, { role, systemPrompt, maxTokens, format });
       if (run) finishRun(run, "completed", text);
       return { text, provider: selected.provider, model: selected.model, run };
     } catch (error) {
@@ -514,7 +549,7 @@ function artifactExamplePayload(localPayload) {
 
 function artifactShapeInstructions(type) {
   const instructions = {
-    report: 'Report: {"title": string, "executive_summary": string[] (3 substantial paragraphs, each 2-4 sentences and cited), "tldr": string[] (4-6 concise bullets), "key_points": [{"text": string (full finding sentence + citation), "citation": "[1]"}], "key_findings": [{"heading": string, "text": string, "analysis": string (2-4 cited sentences), "citation": "[1]"}], "detailed_sections": [{"heading": string, "body": string[] (3-5 cited analytical paragraphs, not bullets)}], "recommendations": [{"action": string, "text": string (actionable cited recommendation), "citation": "[1]"}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}. Make it a real report: at least 5 detailed sections and at least 900 words when evidence allows. Do not return only a TL;DR or a list of key points.',
+    report: 'Report: {"title": string, "abstract": string[] (2-3 substantial cited paragraphs), "scope": string[] (what this report covers and excludes), "methodology": string[] (how evidence was selected and cited), "executive_summary": string[] (3 substantial paragraphs, each 2-4 sentences and cited), "key_points": [{"text": string (full finding sentence + citation), "citation": "[1]"}], "key_findings": [{"heading": string (specific, never "Finding 1"), "text": string, "analysis": string (2-4 cited analytical sentences), "citation": "[1]"}], "detailed_sections": [{"heading": string (formal report section heading), "body": string[] (3-5 cited analytical paragraphs, not bullets)}], "recommendations": [{"action": string, "text": string (actionable cited recommendation), "citation": "[1]"}], "open_questions": string[], "risks_limitations": string[], "bibliography": string[]}. Make it a formal long-form report, not a briefing note, blog post, compressed summary, or key-point list. Do not include any compressed-summary field or section. Use paragraphs for the main body. Include at least 5 detailed sections and at least 900 words when evidence allows.',
     mindmap: 'Mind map (hierarchical, NotebookLM-style): {"title": string, "nodes": [{"id": string, "label": string (a SHORT noun phrase, 2-5 words, NO citation markers and NO full sentences), "type": "notebook|topic|subtopic|claim|entity", "source_refs": []}], "edges": [{"id": string, "source": string (parent id), "target": string (child id), "label": string}]}. Build a TREE, not a star: exactly ONE root node (type "notebook", the central subject); 4-7 first-level category nodes (type "topic") each connected FROM the root; under EACH category 3-6 child nodes (type "subtopic"|"claim"|"entity") connected FROM that category; optionally add a third level beneath the richest categories. Every non-root node must have exactly ONE parent edge so the graph forms a clean tree. Labels read like clickable topic chips ("Automated Grid Trading", "GDPR Compliance", "Architecture Layers") — never paragraphs and never with [n] markers.',
     flashcards: 'Flashcards: {"title": string, "cards": [{"question": string (a real study question ending with "?"; never a quote), "answer": string (a concise conceptual answer in the learner\'s own words plus citation marker; never just a copied evidence sentence), "explanation": string (why this answer follows from the cited evidence), "difficulty": "easy|medium|hard", "tags": string[], "source_refs": []}]}. Build learning cards from the meaning of the evidence: ask what the learner should understand, decide, avoid, compare, or apply. Do not use cloze quote blanks unless the user explicitly asks for cloze drills.',
     quiz: 'Quiz: {"title": string, "questions": [{"type": "multiple_choice", "question": string, "options": string[], "correct_index": number, "explanation": string, "difficulty": "easy|medium|hard", "source_refs": []}]}',
@@ -554,6 +589,11 @@ function collectJsonStrings(value) {
   if (Array.isArray(value)) return value.flatMap(collectJsonStrings);
   if (value && typeof value === "object") return Object.values(value).flatMap(collectJsonStrings);
   return [];
+}
+
+function positiveProviderTimeout(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function artifactMaxTokens(type) {

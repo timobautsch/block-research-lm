@@ -40,7 +40,17 @@ const authStore = createAuthStore({
 });
 const app = express();
 
-app.use(express.json({ limit: MAX_SOURCE_REQUEST_BODY_BYTES }));
+// The large body limit exists only for source uploads (base64 files). Applying
+// it to every route — including unauthenticated auth endpoints — lets anyone
+// POST hundreds of MB and stall the event loop / exhaust memory. Scope the big
+// limit to the two upload routes; everything else gets a small 1 MB cap.
+const largeJson = express.json({ limit: MAX_SOURCE_REQUEST_BODY_BYTES });
+const smallJson = express.json({ limit: "1mb" });
+app.use((req, res, next) => {
+  const isUpload = req.method === "POST"
+    && (/^\/api\/notebooks\/[^/]+\/sources\/?$/.test(req.path) || req.path === "/api/sources");
+  return (isUpload ? largeJson : smallJson)(req, res, next);
+});
 app.use("/api", (_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
@@ -151,6 +161,10 @@ app.delete("/api/sources/:id", asyncHandler(async (req, res) => {
   res.json(await engine.deleteSource(req.params.id, userContext(req)));
 }));
 
+app.delete("/api/notebooks/:id", asyncHandler(async (req, res) => {
+  res.json(await engine.deleteNotebook(req.params.id, userContext(req)));
+}));
+
 app.get("/api/sources/:id/blocks", routeHandler((req) => ({
   blocks: engine.getSourceBlocks(req.params.id, userContext(req)),
 })));
@@ -188,7 +202,7 @@ app.post("/api/artifact", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/artifacts/:id", routeHandler((req) => ({
-  artifact: engine.getArtifact(req.params.id, userContext(req)),
+  artifact: engine.getArtifactForClient(req.params.id, userContext(req)),
 })));
 
 app.delete("/api/artifacts/:id", asyncHandler(async (req, res) => {
@@ -236,13 +250,19 @@ app.get("/api/jobs/:id", routeHandler((req) => ({
   job: engine.getJob(req.params.id, userContext(req)),
 })));
 
-app.get("/api/model-runs", (_req, res) => {
-  res.json({ model_runs: engine.listModelRuns() });
+app.get("/api/model-runs", (req, res) => {
+  res.json({ model_runs: engine.listModelRuns(userContext(req)) });
 });
 
 app.post("/api/seed", asyncHandler(async (req, res) => {
   res.json({ notebook: await engine.seedDemo({ resetFirst: req.body?.reset === true, ownerUserId: req.user.id, requestId: req.requestId }) });
 }));
+
+// Unknown /api routes must return a JSON 404, not the SPA HTML with a 200 —
+// otherwise a client fetch to a mistyped endpoint silently gets index.html.
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: `Unknown API route: ${req.method} ${req.path}` });
+});
 
 if (isProduction) {
   app.use(express.static(join(root, "dist")));
@@ -260,11 +280,16 @@ if (isProduction) {
 
 app.use((error, req, res, next) => {
   void next;
-  const status = Number(error?.status || 500);
+  // Zod validation failures are client errors; without this they surface as
+  // opaque 500s (e.g. POST /sources without a "type" field).
+  const isValidationError = error?.name === "ZodError" || Array.isArray(error?.issues);
+  const status = Number(error?.status || (isValidationError ? 400 : 500));
   const safeStatus = status >= 400 && status < 600 ? status : 500;
   const publicMessage = error?.type === "entity.too.large"
     ? `Uploaded files can be up to ${MAX_SOURCE_UPLOAD_MB} MB.`
-    : error.message;
+    : isValidationError
+      ? validationMessage(error)
+      : error.message;
   logger.error("http.request.error", {
     request_id: req.requestId,
     method: req.method,
@@ -281,12 +306,41 @@ app.use((error, req, res, next) => {
 });
 
 const host = process.env.HOST || (isProduction ? "0.0.0.0" : "127.0.0.1");
-app.listen(port, host, () => {
+const server = app.listen(port, host, () => {
   const health = engine.health();
   console.log(
     `Block Research LM running at http://${host}:${port}/ (${health.provider}, storage: ${health.providers.storage_dir})`,
   );
 });
+// Cloud Run's load balancer keeps idle connections ~60s; a shorter Node
+// keep-alive races it and surfaces as random ECONNRESETs on clients.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
+// A transient DB-socket error on an idle pg client can slip past the pool's
+// error handler and would otherwise take down the whole server (observed as
+// "read EADDRNOTAVAIL" killing the process mid-session). State is in memory
+// plus persisted snapshots, so logging and continuing is strictly better than
+// dying for this single-process server.
+process.on("uncaughtException", (error) => {
+  logger.error("process.uncaught_exception", {
+    error: String(error?.message || error).slice(0, 300),
+    stack: String(error?.stack || "").split("\n").slice(1, 5).join(" | "),
+  });
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error("process.unhandled_rejection", {
+    error: String(reason?.message || reason).slice(0, 300),
+    stack: String(reason?.stack || "").split("\n").slice(1, 5).join(" | "),
+  });
+});
+
+function validationMessage(error) {
+  const issue = Array.isArray(error?.issues) ? error.issues[0] : null;
+  if (!issue) return "Request validation failed.";
+  const path = Array.isArray(issue.path) && issue.path.length ? `${issue.path.join(".")}: ` : "";
+  return `Request validation failed. ${path}${issue.message || ""}`.trim();
+}
 
 function loadEnvironment() {
   const envPaths = [
