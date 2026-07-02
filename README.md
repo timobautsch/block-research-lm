@@ -1,47 +1,60 @@
-# SourceStudio AI
+# Block Research LM
 
-SourceStudio AI ist ein lokaler, NotebookLM-inspirierter Research Workspace. Die App bildet nicht nur eine Oberfläche nach, sondern implementiert eine quellengebundene Research-Pipeline: Quellen importieren, strukturieren, aktivieren oder deaktivieren, Wissen extrahieren, Fragen beantworten, Citations prüfen und daraus Artefakte wie Reports, Mind Maps, Quizze, Flashcards, Slide Decks, Audio Briefings und Video Storyboards erzeugen.
+**Live-Demo: [blockresearch-lm.web.app](https://blockresearch-lm.web.app)**
 
-Der zentrale Qualitätsanspruch ist: Antworten und Artefakte entstehen nachvollziehbar aus den aktiven Quellen. Dafür nutzt die App Evidence Packs, Source Blocks, Citation Chips und ein Citation Ledger.
+Block Research LM ist ein NotebookLM-inspirierter, source-grounded Research Workspace. Die App bildet nicht nur eine Oberfläche nach, sondern implementiert eine vollständige quellengebundene Research-Pipeline: Quellen importieren (Dokumente, URLs, YouTube-Videos, Audio, Bilder), strukturieren, aktivieren oder deaktivieren, Wissen extrahieren, Fragen beantworten, Citations prüfen und daraus Artefakte wie Reports, Mind Maps, Quizze, Flashcards, Slide Decks, Audio Overviews (gerenderte MP3-Podcasts) und Video Overviews (gerenderte MP4s) erzeugen.
 
-SourceStudio AI ist kein offizielles Google- oder NotebookLM-Produkt.
+Der zentrale Qualitätsanspruch: Antworten und Artefakte entstehen nachvollziehbar aus den aktiven Quellen. Dafür nutzt die App Evidence Packs, Source Blocks, Citation Chips und ein Citation Ledger. Die Engine im Server heißt intern „SourceStudio".
+
+Block Research LM ist kein offizielles Google- oder NotebookLM-Produkt.
 
 ## Produktidee
 
-Die wichtigste Produktidee ist nicht PDF hochladen und chatten, sondern ein kontrollierter Wissensraum: Quellen sind die Autorität. Der Chat und alle Studio-Artefakte greifen auf dieselbe strukturierte Evidence-Schicht zu.
+Die wichtigste Produktidee ist nicht „PDF hochladen und chatten", sondern ein kontrollierter Wissensraum: Quellen sind die Autorität. Der Chat und alle Studio-Artefakte greifen auf dieselbe strukturierte Evidence-Schicht zu.
 
 ## Funktionen
 
-- Notebook Workspace mit Sources, Chat und Studio.
-- Markdown/Text-Ingestion.
-- Notes als first-class Sources.
-- URL-Ingestion mit serverseitigem Fetch und HTML-Cleanup.
-- PDF-Dateien mit lokalem Text-Extraction-Fallback für Demo-Szenarien.
-- Aktive/inaktive Quellen als Scope für Retrieval, Chat und Artefakte.
+**Ingestion (multimodal)**
+
+- Markdown/Text, Notes als first-class Sources.
+- URL-Ingestion mit serverseitigem Fetch, HTML-Cleanup und optionalem Crawling.
+- PDF, DOCX, PPTX, EPUB.
+- YouTube-Videos: Transkript über Captions (yt-dlp mit Proof-of-Origin-Token-Provider), Fallback auf automatische Audio-Transkription (Deepgram Nova-3) für Videos ohne Untertitel.
+- Audio-Dateien (Deepgram, diarisiert), Bilder (Vision-Beschreibung + OCR), Google Docs.
+
+**Evidence-Schicht**
+
 - Source Blocks mit stabilen IDs, Heading-Kontext und Block-Highlighting.
-- Hierarchical Chunking mit Source References und deterministischen lokalen Embeddings.
+- Semantisches Chunking mit Source References und Embeddings (lokal deterministisch oder Provider).
 - Knowledge Layer mit Summaries, Claims, Entities, Topics, Risiken, offenen Fragen, Suggested Questions und Suggested Artifacts.
-- Hybrid Retrieval über Keyword-, lokale Vektor-, Metadata-, Heading- und Entity-Signale.
+- Hybrid Retrieval über Keyword-, Vektor-, Metadata-, Heading- und Entity-Signale, optionales Reranking (Cohere).
 - Evidence Packs und gespeicherte Retrieval Runs.
-- Grounded Chat mit inline Citation Chips.
-- Citation Ledger mit Claim-Support-Statistiken.
+
+**Grounded Chat**
+
+- Inline Citation Chips, Citation Ledger mit Claim-Support-Statistiken.
 - Abstention, wenn aktive Quellen eine Antwort nicht tragen.
-- Artifact Studio für Report, Mind Map, Flashcards, Quiz, Data Table, Slide Deck, Audio Overview Transcript, Video Overview Storyboard und Infographic.
-- Optionales ElevenLabs Rendering für Audio Overview MP3-Dateien über Text-to-Dialogue.
-- Server-seitiger Model Router mit lokalem Fallback und optionalem Anthropic/OpenAI/Gemini-Pfad für Grounded Chat.
-- Seed Demo Notebook, Tests und API-Smoke-Scripts.
+
+**Artifact Studio**
+
+- Report, Mind Map, Flashcards (mit Review-Loop und adaptiven Decks), Quiz, Data Table, Infographic (gerendertes SVG), Thumbnail (Bildgenerierung), YouTube Publish Kit.
+- Slide Deck mit designtem Layout und PPTX-Export.
+- Audio Overview: Zwei-Sprecher-Skript, gerendert als MP3 über ElevenLabs Text-to-Dialogue.
+- Video Overview: Storyboard, gerendert als abspielbares MP4 (ffmpeg).
+
+**Betrieb**
+
+- Auth mit Sessions (Signup/Login/Passwort-Reset), Persistenz über Supabase in Produktion.
+- Server-seitiger Model Router mit lokalem deterministischem Fallback und Anthropic/OpenAI/Gemini-Pfaden.
+- Deployt auf Google Cloud Run (Docker), ausgeliefert über Firebase Hosting.
+- Log-basiertes Alerting (Cloud Monitoring) für den YouTube-Egress-Proxy.
 
 ## Stack
 
-- React 19
-- Vite 7
-- TypeScript
-- Express 5
-- Zod
-- Node.js 24.x
-- Node.js JSON/Filesystem Storage
-- Deterministische lokale Embeddings
-- Optional serverseitige LLM Provider über den Model Router
+- React 19, Vite 7, TypeScript
+- Express 5, Zod, Node.js 24.x
+- Anthropic Claude (Chat + Artefakte), OpenAI (Vision + Bilder), Deepgram (ASR), ElevenLabs (TTS)
+- Lokale deterministische Embeddings als Fallback, JSON/Filesystem- oder Supabase-Storage
 
 ## Quickstart
 
@@ -64,6 +77,8 @@ Demo Notebook neu erzeugen:
 npm run seed -- --reset
 ```
 
+Ohne Provider-Keys nutzt die App reproduzierbare lokale Fallbacks — alle Kernflüsse (Ingestion, Retrieval, Chat, Artefakte) funktionieren offline.
+
 ## Commands
 
 ```bash
@@ -79,56 +94,46 @@ npm run smoke:e2e    # create notebook, add source, ask, generate quiz via API
 
 ## Environment
 
-Siehe [ENVIRONMENT.md](./ENVIRONMENT.md).
+Siehe [ENVIRONMENT.md](./ENVIRONMENT.md) und [.env.example](./.env.example).
 
 Wichtige Variablen:
 
-- `ANTHROPIC_API_KEY`
-- `ANTHROPIC_MODEL`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- `GOOGLE_API_KEY`
-- `GOOGLE_MODEL`
-- `ELEVENLABS_API_KEY`
-- `ELEVENLABS_VOICE_ID_HOST_A`
-- `ELEVENLABS_VOICE_ID_HOST_B`
-- `DATABASE_URL`
-- `REDIS_URL`
-- `STORAGE_DIR`
-- `DEFAULT_REASONING_PROVIDER`
-- `DEFAULT_EMBEDDING_PROVIDER`
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` — Grounded Chat + Artefakte
+- `OPENAI_API_KEY` — Vision (Bild-Ingestion) + Bildgenerierung
+- `DEEPGRAM_API_KEY` — Audio/YouTube-Transkription
+- `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID_HOST_A/B` — Audio-Overview-Rendering
+- `YTDLP_PROXY` — Residential-Egress-Proxy für YouTube-Ingestion aus Cloud-Umgebungen (Datacenter-IPs werden von YouTube geblockt); unterstützt einen `{session}`-Platzhalter für Sticky Sessions
+- `SUPABASE_DB_URL` — persistente Storage/Auth in Produktion
+- `DEFAULT_REASONING_PROVIDER`, `DEFAULT_EMBEDDING_PROVIDER`, `SOURCESTUDIO_ARTIFACT_PROVIDER` — Provider-Routing
 
 API-Keys bleiben serverseitig. Ohne Provider-Keys nutzt die App reproduzierbare lokale Fallbacks.
 
 ## Local Storage
 
-Die App läuft vollständig lokal und benötigt keine externen Produktivdatenbanken. Persistenz liegt standardmäßig unter:
+Lokal benötigt die App keine externen Datenbanken. Persistenz liegt standardmäßig unter:
 
 ```text
 .data/sourcestudio/
 ```
 
-Der Ordner enthält Notebook State, importierte Dateien und Artefakt-Exports. Er ist gitignored.
+Der Ordner enthält Notebook State, importierte Dateien und Artefakt-Exports. Er ist gitignored. In Produktion übernimmt Supabase die Persistenz.
 
 ## Provider-Strategie
 
-Die App erkennt optionale Provider-Keys über lokale Environment-Variablen. Für reproduzierbare Tests und lokale Demo-Läufe steht ein deterministischer Fallback-Provider zur Verfügung. Die Architektur trennt Provider-Status, Model Runs und Generierung über einen Model Router. Bei gesetztem API-Key kann die Antwortgenerierung serverseitig über externe LLM-Provider laufen.
-
-Grounded Chat unterstützt externe LLM Provider über den Model Router. Der lokale Fallback bleibt für Tests und Offline-Demo verfügbar.
+Die App erkennt optionale Provider-Keys über Environment-Variablen. Für reproduzierbare Tests und lokale Demo-Läufe steht ein deterministischer Fallback-Provider zur Verfügung. Die Architektur trennt Provider-Status, Model Runs und Generierung über einen Model Router.
 
 Studio-Artefakte können ebenfalls über den Model Router generiert werden. Standardmäßig bleibt `artifact_generation` lokal, damit Studio-Klicks keine ungeplanten Providerkosten auslösen. Mit `SOURCESTUDIO_ARTIFACT_PROVIDER=anthropic`, `openai`, `google` oder `auto` erzeugt die App Reports, Mind Maps, Quizzes, Slides und weitere Studio-Payloads über den gewählten Provider, validiert die JSON-Struktur und hängt serverseitig die kanonischen Evidence-Pack-Citations an. Bei Providerfehlern fällt die Generierung automatisch auf den lokalen Artefaktgenerator zurück.
 
 ## Grenzen des Prototyps
 
-Die App ist ein starker lokaler Interview-Slice, aber noch kein vollständig betriebenes SaaS-System. Für Produktion wären als nächste Schritte sinnvoll:
+Die App ist ein produktionsnah deployter Prototyp, aber noch kein vollständig betriebenes SaaS-System. Sinnvolle nächste Schritte:
 
-- Postgres/pgvector statt lokalem Filesystem-Speicher.
-- Redis/Queue Worker statt synchroner lokaler Jobs.
-- produktive Embedding Provider statt lokaler Hash-Embeddings.
-- weitere LLM-Rollen pro Prompt über Anthropic/OpenAI/Gemini.
-- robusteres PDF/OCR/Layout-Parsing.
-- Auth, Multi-Tenant-Isolation und Deployment.
-- Monitoring, Rate Limits und Usage Accounting.
+- pgvector-basiertes Retrieval statt In-Process-Vektorsuche.
+- Redis/Queue Worker statt In-Process-Jobs.
+- Produktive Embedding-Provider als Default statt lokaler Hash-Embeddings.
+- Robusteres PDF/OCR/Layout-Parsing.
+- Video-Frame-Analyse für YouTube-Quellen (Vision über Keyframes).
+- Feingranulares Usage Accounting und Rate Limits pro Nutzer.
 
 ## Dokumentation
 
