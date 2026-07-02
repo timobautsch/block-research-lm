@@ -237,9 +237,11 @@ app.delete("/api/flashcard-decks/:id/cards/:cardId", asyncHandler(async (req, re
   res.json({ deck: await engine.deleteFlashcard(req.params.id, req.params.cardId, userContext(req)) });
 }));
 
-app.get("/api/artifacts/:id/media", (req, res, next) => {
+app.get("/api/artifacts/:id/media", async (req, res, next) => {
   try {
-    const media = engine.getArtifactMedia(req.params.id, userContext(req));
+    // Restores the file from durable storage first when the local copy was
+    // lost to a deploy/instance swap.
+    const media = await engine.ensureArtifactMediaLocal(req.params.id, userContext(req));
     res.type(media.content_type);
     res.setHeader("content-disposition", `inline; filename="${media.file_name}"`);
     res.sendFile(media.path, { dotfiles: "allow" }, (error) => {
