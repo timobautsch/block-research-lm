@@ -117,12 +117,29 @@ export function createModelRouter({
       return { answer, model_runs: [providerRun], active_run: providerRun };
     } catch (error) {
       finishRun(providerRun, "failed", "", safeError(error));
+      // One retry before surrendering to the local extractive fallback: the
+      // observed failures are one-off formatting slips (unescaped quote,
+      // trailing prose, truncated JSON), not systematic — a nudge to return
+      // clean JSON usually recovers the full-quality answer.
+      const retryRun = startRun("grounded_answer", selected.provider, selected.model, prompt);
+      try {
+        const retryOutput = await callProvider(
+          selected.provider,
+          selected.model,
+          `${prompt}\n\nIMPORTANT: Your previous attempt failed to parse (${String(safeError(error)).slice(0, 160)}). Return ONLY the JSON object — no prose before or after, and escape any double quotes inside string values.`,
+        );
+        const answer = normalizeProviderAnswer(retryOutput, evidencePack);
+        finishRun(retryRun, "completed", answer.content);
+        return { answer, model_runs: [providerRun, retryRun], active_run: retryRun };
+      } catch (retryError) {
+        finishRun(retryRun, "failed", "", safeError(retryError));
+      }
       const fallbackRun = startRun("grounded_answer", "local", LOCAL_MODEL, question);
       const answer = localGroundedAnswer(question, evidencePack, answerStyle);
       finishRun(fallbackRun, "completed", answer.content);
       return {
         answer,
-        model_runs: [providerRun, fallbackRun],
+        model_runs: [providerRun, retryRun, fallbackRun],
         active_run: fallbackRun,
         fallback_reason: providerRun.error,
       };
@@ -737,6 +754,16 @@ function extractJson(text) {
     JSON.parse(candidate);
     return candidate;
   } catch {
+    // Unescaped quotes inside string values ('answer': 'Der Begriff "X" ...')
+    // are the most common remaining fault — try that repair first.
+    const quoteFixed = repairUnescapedInnerQuotes(candidate);
+    try {
+      JSON.parse(quoteFixed);
+      return quoteFixed;
+    } catch {
+      const fixedBalanced = firstBalancedJsonObject(quoteFixed, 0);
+      if (fixedBalanced) return fixedBalanced;
+    }
     // Providers hit max_tokens mid-object, leaving valid-but-truncated JSON
     // (an unterminated string / unclosed arrays+objects). Repairing the tail
     // keeps the model's real output instead of discarding it for the local
@@ -777,6 +804,48 @@ function firstBalancedJsonObject(text, start) {
     }
   }
   return null;
+}
+
+// Escape double-quotes INSIDE string values: a real terminator is followed
+// (past whitespace) by a structural character; anything else — 'Der Begriff
+// "Takeaways" bedeutet' — is an interior quote the model forgot to escape.
+function repairUnescapedInnerQuotes(input) {
+  const chars = [...String(input)];
+  const out = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i];
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out.push(ch);
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      out.push(ch);
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      out.push(ch);
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < chars.length && /\s/.test(chars[j])) j += 1;
+      const next = chars[j];
+      if (next === undefined || next === "," || next === "}" || next === "]" || next === ":") {
+        inString = false;
+        out.push(ch);
+      } else {
+        out.push('\\"');
+      }
+      continue;
+    }
+    out.push(ch);
+  }
+  return out.join("");
 }
 
 function repairTruncatedJson(input) {
