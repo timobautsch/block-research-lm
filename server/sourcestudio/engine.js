@@ -3238,8 +3238,19 @@ export async function createSourceStudioEngine(options = {}) {
     let scored = candidateChunks
       .map((chunk) => scoreChunkForQuery(chunk, rewriteTokenLists, queryTokens, intent, corpusStats, queryVector, pgSimMap, chunkTokenCache, embeddingByChunkId))
       .filter((result) => result.include)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, candidateLimit);
+      .sort((a, b) => b.score - a.score);
+    // Collapse exact-duplicate chunk texts BEFORE the candidate slice: a
+    // degenerate repeated-text source yields hundreds of identical chunks with
+    // identical scores that would otherwise fill the whole candidate window
+    // and evict every other source from retrieval.
+    const seenChunkTexts = new Set();
+    scored = scored.filter((result) => {
+      const key = `${result.chunk.source_id}\n${result.chunk.normalized_text || result.chunk.text}`;
+      if (seenChunkTexts.has(key)) return false;
+      seenChunkTexts.add(key);
+      return true;
+    });
+    scored = scored.slice(0, candidateLimit);
     scored = await rerankScoredChunks(scored, retrievalText, candidateLimit);
     const broadQuestion =
       ["summary", "compare", "artifact", "table", "audio", "video", "slides", "mindmap"].includes(intent) ||
@@ -3697,8 +3708,10 @@ export async function createSourceStudioEngine(options = {}) {
       return tokens;
     };
     while (pool.length && selected.length < limit) {
-      let bestIndex = 0;
+      let bestIndex = -1;
       let bestDiversityScore = Number.NEGATIVE_INFINITY;
+      let bestDupeIndex = -1;
+      let bestDupeScore = Number.NEGATIVE_INFINITY;
       // Enforce the cap only against COMPETITIVE alternatives: a capped
       // source's clearly-more-relevant chunk must not lose its slot to
       // near-noise filler from other sources (the include gate lets weak
@@ -3722,6 +3735,18 @@ export async function createSourceStudioEngine(options = {}) {
         const redundancy = selected.length
           ? Math.max(...selected.map((item) => overlapScore(candidateTokens, tokensFor(item.chunk))))
           : 0;
+        // Near-duplicates of an already-selected passage never earn a second
+        // slot while distinct material remains — the soft penalty below cannot
+        // stop a repeated-text source from flooding the pack (seen live: 8/8
+        // identical quotes, all high-score copies of one sentence).
+        if (redundancy >= 0.92) {
+          const dupeScore = candidate.score - redundancy * 0.22;
+          if (dupeScore > bestDupeScore) {
+            bestDupeScore = dupeScore;
+            bestDupeIndex = index;
+          }
+          continue;
+        }
         const sameSourceCount = selected.filter((item) => item.chunk.source_id === candidate.chunk.source_id).length;
         const headingNovelty = selected.some((item) => (item.chunk.heading_path || []).join("/") === (candidate.chunk.heading_path || []).join("/"))
           ? 0
@@ -3731,6 +3756,12 @@ export async function createSourceStudioEngine(options = {}) {
           bestDiversityScore = diversityScore;
           bestIndex = index;
         }
+      }
+      // Only when NOTHING distinct remains may a near-duplicate fill the slot.
+      if (bestIndex === -1) {
+        if (bestDupeIndex === -1) break;
+        bestIndex = bestDupeIndex;
+        bestDiversityScore = bestDupeScore;
       }
       const [picked] = pool.splice(bestIndex, 1);
       pickedPerSource.set(picked.chunk.source_id, (pickedPerSource.get(picked.chunk.source_id) || 0) + 1);
