@@ -3299,14 +3299,16 @@ export async function createSourceStudioEngine(options = {}) {
     // item per active source not already represented, built from title+summary.
     // Gate on the CURRENT question, not the blended retrieval text — otherwise
     // one collection question keeps injecting overview items for two more turns.
-    if (!artifact_type && isCollectionLevelQuestion(question)) {
+    // Mind maps ALWAYS get the per-source overviews: they must chart the whole
+    // collection's topic landscape, not just the retrieved chunks.
+    if (artifact_type === "mindmap" || (!artifact_type && isCollectionLevelQuestion(question))) {
       const summariesBySource = new globalThis.Map(
         state.knowledgeObjects
           .filter((object) => object.notebook_id === notebook_id && object.type === "source_summary")
           .map((object) => [object.source_id, String(object.data?.summary || "")]),
       );
       const representedSources = new Set(evidenceItems.map((item) => item.source_id));
-      let overviewBudget = 12;
+      let overviewBudget = artifact_type === "mindmap" ? 24 : 12;
       for (const sourceId of sourceIds) {
         if (overviewBudget <= 0) break;
         if (representedSources.has(sourceId)) continue;
@@ -6757,6 +6759,26 @@ function ytDlpNetworkArgs() {
   return args;
 }
 
+// Residential exits die mid-request (tunnel 5xx). yt-dlp's own --retries reuse
+// the SAME sticky session (= the same dead exit), so retry the whole
+// invocation instead: buildArgs() re-runs ytDlpNetworkArgs and the {session}
+// placeholder mints a fresh exit IP.
+async function execYtDlpWithFreshSession(ytDlpPath, buildArgs, execOptions, { logger, requestId, videoId, label } = {}) {
+  try {
+    return await execFile(ytDlpPath, buildArgs(), execOptions);
+  } catch (error) {
+    const summary = externalToolErrorSummary(error);
+    const sessionProxy = String(process.env.YTDLP_PROXY || "").includes("{session}");
+    if (!sessionProxy || !YOUTUBE_PROXY_FAILURE_PATTERN.test(summary)) throw error;
+    logger?.warn(`youtube.${label || "ytdlp"}.proxy_session_retry`, {
+      request_id: requestId,
+      video_id: videoId,
+      error: summary.slice(0, 160),
+    });
+    return execFile(ytDlpPath, buildArgs(), execOptions);
+  }
+}
+
 // yt-dlp rewrites its cookie file after every run, so the cookies must live on a
 // writable path even when they arrive via env var or a read-only secret mount.
 let ytDlpCookiesCache = { key: null, file: "" };
@@ -6878,9 +6900,9 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
   let dir;
   try {
     dir = await mkdtemp(join(tmpdir(), "yt-audio-"));
-    await execFile(
+    await execYtDlpWithFreshSession(
       ytDlpPath,
-      [
+      () => [
         ...ytDlpNetworkArgs(),
         // Speech doesn't need high bitrates: prefer a small audio format so
         // downloads stay fast (and cheap) over residential-proxy bandwidth.
@@ -6892,6 +6914,7 @@ async function fetchYouTubeAudioTranscript(videoId, { apiKey, model, fetchImpl =
         `https://www.youtube.com/watch?v=${videoId}`,
       ],
       { timeout: 480_000, maxBuffer: 1024 * 1024 * 64 },
+      { logger, requestId, videoId, label: "audio" },
     );
     const files = await readdir(dir);
     const audioFile = files.find((name) => /\.mp3$/i.test(name)) || files[0];
@@ -7069,9 +7092,9 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
     const subFlags = chosenLang
       ? [chosenIsAuto ? "--write-auto-subs" : "--write-subs", "--sub-langs", chosenLang]
       : ["--write-auto-subs", "--write-subs", "--sub-langs", "en,en-orig,en-US,en-GB,de,de-orig"];
-    await execFile(
+    await execYtDlpWithFreshSession(
       ytDlpPath,
-      [
+      () => [
         ...ytDlpNetworkArgs(),
         "--skip-download",
         ...subFlags,
@@ -7092,6 +7115,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, options = {}) {
         videoUrl,
       ],
       { timeout: 90_000, maxBuffer: 1024 * 1024 * 8 },
+      { logger, requestId, videoId, label: "subtitles" },
     ).catch((error) => {
       logger?.warn("youtube.transcript.ytdlp.download_failed", {
         request_id: requestId,
