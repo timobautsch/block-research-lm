@@ -2085,6 +2085,7 @@ export async function createSourceStudioEngine(options = {}) {
       // Tracks whether any fetch path hit YouTube's datacenter-IP bot check, so
       // the final error can name the real cause instead of "no captions".
       const ytDiag = { botCheck: false };
+      void maybeCheckProxyTrafficBalance(logger, context.requestId);
       let rawText = hasUserTranscript
         ? payload.body
         : await fetchYouTubeTranscript(source.original_url, fetchImpl, { logger, requestId: context.requestId, diag: ytDiag });
@@ -2122,6 +2123,13 @@ export async function createSourceStudioEngine(options = {}) {
           bot_check: ytDiag.botCheck,
           words: rawText.split(/\s+/).filter(Boolean).length,
         });
+        if (ytDiag.proxyFailure) {
+          logger.warn("youtube.proxy.unreachable", { request_id: context.requestId, video_id: videoId });
+          throw statusError(
+            422,
+            "The YouTube egress proxy rejected connections — its traffic balance may be exhausted or the credentials expired. Check the proxy account (IPRoyal) and top it up, then retry. Pasting the transcript into the source body works immediately.",
+          );
+        }
         if (ytDiag.botCheck) {
           logger.warn("youtube.blocked_ip", { request_id: context.requestId, video_id: videoId });
           throw statusError(
@@ -5924,10 +5932,59 @@ function externalToolErrorSummary(error, maxLength = 300) {
 //  - YTDLP_COOKIES_B64 / YTDLP_COOKIES_FILE: Netscape cookies from a logged-in
 //    session. Works but cookies expire unpredictably and carry account risk.
 const YOUTUBE_BOT_CHECK_PATTERN = /sign in to confirm|confirm you.{0,3}re not a bot|login_required/i;
+// The egress proxy rejecting/failing connections looks different from a YouTube
+// bot check — usually an exhausted traffic balance or bad proxy credentials.
+const YOUTUBE_PROXY_FAILURE_PATTERN =
+  /tunnel connection failed|unable to connect to proxy|proxy authentication|proxyerror|407 proxy|error connecting to proxy/i;
 
 function noteYouTubeBotCheck(diag, errorText) {
-  if (diag && YOUTUBE_BOT_CHECK_PATTERN.test(String(errorText || ""))) diag.botCheck = true;
+  const text = String(errorText || "");
+  if (diag && YOUTUBE_BOT_CHECK_PATTERN.test(text)) diag.botCheck = true;
+  if (diag && String(process.env.YTDLP_PROXY || "").trim() && YOUTUBE_PROXY_FAILURE_PATTERN.test(text)) {
+    diag.proxyFailure = true;
+  }
   return errorText;
+}
+
+// Throttled IPRoyal traffic-balance check, piggybacked on YouTube ingests (the
+// only thing that consumes proxy traffic). Emits youtube.proxy.traffic_low so a
+// Cloud Monitoring log-based alert can email the operator before the balance
+// runs dry. Requires IPROYAL_API_TOKEN (dashboard -> Settings -> API); threshold
+// via IPROYAL_ALERT_THRESHOLD_GB (default 0.2 GB = 10% of a 2 GB purchase).
+let proxyBalanceCheckLastAt = 0;
+async function maybeCheckProxyTrafficBalance(logger, requestId) {
+  const token = String(process.env.IPROYAL_API_TOKEN || "").trim();
+  if (!token || !String(process.env.YTDLP_PROXY || "").trim()) return;
+  const now = Date.now();
+  if (now - proxyBalanceCheckLastAt < 60 * 60 * 1000) return;
+  proxyBalanceCheckLastAt = now;
+  try {
+    const response = await globalThis.fetch("https://resi-api.iproyal.com/v1/me", {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      logger?.warn("youtube.proxy.balance_check_failed", { request_id: requestId, status: response.status });
+      return;
+    }
+    const body = await response.json();
+    const availableGb = Number(body?.available_traffic ?? 0);
+    const thresholdGb = Number(process.env.IPROYAL_ALERT_THRESHOLD_GB || "") || 0.2;
+    if (availableGb <= thresholdGb) {
+      logger?.warn("youtube.proxy.traffic_low", {
+        request_id: requestId,
+        available_gb: availableGb,
+        threshold_gb: thresholdGb,
+      });
+    } else {
+      logger?.info("youtube.proxy.traffic_ok", { request_id: requestId, available_gb: availableGb });
+    }
+  } catch (error) {
+    logger?.warn("youtube.proxy.balance_check_failed", {
+      request_id: requestId,
+      error: externalToolErrorSummary(error),
+    });
+  }
 }
 
 // YTDLP_PROXY may contain a "{session}" placeholder (rotating-proxy sticky
