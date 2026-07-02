@@ -3847,9 +3847,10 @@ export async function createSourceStudioEngine(options = {}) {
       else if (!claim.trim() || answer.abstained || (!citationIndexes.length && /:\s*$/.test(claim))) supportLevel = "not_checkable";
       // Translated answers share no tokens with source-language quotes, and
       // word explanations legitimately carry no citations — both are language
-      // work the overlap check cannot judge. Keep them instead of nuking the
-      // whole answer down to a forced abstention.
-      else if (otherLanguageRequested && citedEvidence.length) supportLevel = "not_checkable";
+      // work the overlap check cannot judge. Keep ALL claims of a translated
+      // answer (stripping one item silently turned "Top 10" into a 9-item
+      // list); citation_coverage still records any missing markers honestly.
+      else if (otherLanguageRequested) supportLevel = "not_checkable";
       else if (languageHelpRequested && !citationIndexes.length) supportLevel = "not_checkable";
       return {
         claim_id: id("claim"),
