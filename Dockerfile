@@ -18,7 +18,7 @@ COPY --from=brainicism/bgutil-ytdlp-pot-provider:1.3.1 /app /opt/bgutil-pot-serv
 # + bgutil PO-token plugin zip (loaded from /etc/yt-dlp/plugins by the standalone
 # binary). yt-dlp is pinned so it moves together with the plugin/provider versions.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip \
   && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_linux -o /usr/local/bin/yt-dlp \
   && chmod a+rx /usr/local/bin/yt-dlp \
   && mkdir -p /etc/yt-dlp/plugins \

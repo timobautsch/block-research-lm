@@ -7365,20 +7365,37 @@ function csvTextCell(value: unknown) {
 }
 
 async function api<T>(path: string, init?: ApiInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers || {}),
-    },
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(body.error || `Request failed with ${response.status}`);
+  // Cloud Run answers 429 ("no available instance") under load spikes. Reads
+  // are safe to retry after a short backoff; writes surface a friendly retry
+  // hint instead of a raw status code.
+  const method = (init?.method || "GET").toUpperCase();
+  const attempts = method === "GET" ? 3 : 1;
+  let lastStatus = 0;
+  let lastBodyError = "";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const response = await fetch(path, {
+      ...init,
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        "content-type": "application/json",
+        ...(init?.headers || {}),
+      },
+    });
+    const body = await response.json().catch(() => ({}));
+    if (response.ok) return body as T;
+    lastStatus = response.status;
+    lastBodyError = String((body as { error?: string }).error || "");
+    if (response.status === 429 && attempt < attempts) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 900 * attempt));
+      continue;
+    }
+    break;
   }
-  return body as T;
+  if (lastStatus === 429) {
+    throw new Error("The server is momentarily at capacity — please try again in a few seconds.");
+  }
+  throw new Error(lastBodyError || `Request failed with ${lastStatus}`);
 }
 
 function apiWithUploadProgress<T>(

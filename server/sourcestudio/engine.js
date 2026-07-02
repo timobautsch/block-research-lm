@@ -587,6 +587,16 @@ export async function createSourceStudioEngine(options = {}) {
       await maybeAutoNameNotebook(notebookId, context);
       return decorateSource(sourceId, { includeBlocks: true });
     } catch (error) {
+      // Synchronous 4xx rejections (empty body, unreadable text) surface the
+      // error directly to the uploader — don't leave a residual failed row the
+      // client never asked for. Async failures keep the row so the UI can show
+      // why the upload failed.
+      if (!shouldRunAsync && error?.status && error.status < 500) {
+        state.sources = state.sources.filter((item) => item.id !== sourceId);
+        removeSourceDerivedRows(sourceId);
+        persistInBackground({ waitForDurable: false });
+        throw error;
+      }
       source.status = "failed";
       source.updated_at = now();
       source.metadata_json = {
@@ -623,6 +633,10 @@ export async function createSourceStudioEngine(options = {}) {
   function shouldIndexSynchronously(parsed) {
     if (parsed.defer_indexing) return false;
     if (parsed.base64) return false;
+    // Large pasted bodies must go async: synchronous indexing held the request
+    // past the Firebase proxy's ~60s timeout, so the client got a 502 for an
+    // upload that actually succeeded.
+    if ((parsed.body?.length || 0) > 200_000) return false;
     if (parsed.body?.trim()) return true;
     if (["markdown", "text", "note"].includes(parsed.type)) return true;
     if (parsed.body && parsed.type === "url" && parsed.crawl === false) return true;
@@ -1963,6 +1977,11 @@ export async function createSourceStudioEngine(options = {}) {
     const rawSummary = knowledge.find((object) => object.type === "source_summary")?.data?.summary || "";
     const base = {
       ...source,
+      // Never ship megabytes of source text with every notebook fetch — one
+      // large upload made GET /api/notebooks/:id a 3.2MB response. The client
+      // renders counts/summaries; block text is available via /blocks.
+      raw_text: "",
+      cleaned_text: "",
       block_count: blocks.length,
       chunk_count: chunks.length,
       word_count: lowQualityExtraction || !source.cleaned_text ? 0 : tokenize(source.cleaned_text).length,
@@ -2423,7 +2442,14 @@ export async function createSourceStudioEngine(options = {}) {
         }
       }
       if (!rawText) {
-        rawText = `# Audio source: ${source.title}\n\nAudio file uploaded. Configure DEEPGRAM_API_KEY to transcribe automatically, or paste a transcript to make this source searchable.`;
+        // Fail honestly instead of indexing a placeholder that pretends to be
+        // a healthy source — and never blame a missing API key that is set.
+        throw statusError(
+          422,
+          realProviderKey(env.DEEPGRAM_API_KEY)
+            ? "No speech was recognized in this audio file (it may be silent or music-only). Paste a transcript into the source body to index it."
+            : "Automatic transcription requires DEEPGRAM_API_KEY. Paste a transcript into the source body to index this audio.",
+        );
       }
       return parseMarkdownLikeDocument(source, {
         rawText,
@@ -2455,7 +2481,12 @@ export async function createSourceStudioEngine(options = {}) {
         }
       }
       if (!rawText) {
-        rawText = `# Image source: ${source.title}\n\nImage uploaded. Configure OPENAI_API_KEY for vision description, or paste a caption.`;
+        throw statusError(
+          422,
+          realProviderKey(env.OPENAI_API_KEY)
+            ? "The vision model could not produce a description for this image. Paste a caption into the source body to index it."
+            : "Image description requires OPENAI_API_KEY. Paste a caption into the source body to index this image.",
+        );
       }
       return parseMarkdownLikeDocument(source, {
         rawText,
@@ -3210,7 +3241,10 @@ export async function createSourceStudioEngine(options = {}) {
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateLimit);
     scored = await rerankScoredChunks(scored, retrievalText, candidateLimit);
-    scored = diversifyScoredChunks(scored, evidenceLimit);
+    const broadQuestion =
+      ["summary", "compare", "artifact", "table", "audio", "video", "slides", "mindmap"].includes(intent) ||
+      isCollectionLevelQuestion(question || retrievalText);
+    scored = diversifyScoredChunks(scored, evidenceLimit, { broad: broadQuestion });
     if (!scored.length && ["summary", "compare", "artifact", "table", "audio", "video", "slides", "mindmap"].includes(intent)) {
       scored = diversifyScoredChunks(candidateChunks
         .slice(0, candidateLimit)
@@ -3221,7 +3255,7 @@ export async function createSourceStudioEngine(options = {}) {
           include: true,
           support_type: "summary_context",
           ranking_signals: { summary_context: 1 },
-        })), evidenceLimit);
+        })), evidenceLimit, { broad: true });
     }
     const evidenceItems = scored.map((result, index) => {
       const source = state.sources.find((item) => item.id === result.chunk.source_id);
@@ -3643,7 +3677,7 @@ export async function createSourceStudioEngine(options = {}) {
     return score / Math.max(1, queryTokens.length);
   }
 
-  function diversifyScoredChunks(scored, limit) {
+  function diversifyScoredChunks(scored, limit, { broad = false } = {}) {
     const selected = [];
     const pool = [...scored];
     // Hard per-source cap: the soft same-source penalty below cannot stop one
@@ -3676,7 +3710,14 @@ export async function createSourceStudioEngine(options = {}) {
       for (let index = 0; index < pool.length; index += 1) {
         const candidate = pool[index];
         const capped = (pickedPerSource.get(candidate.chunk.source_id) || 0) >= perSourceCap;
-        if (capped && bestUnderCapScore >= Math.max(0.5, candidate.score * 0.3)) continue;
+        // Two regimes, because score alone cannot distinguish them: BROAD
+        // questions (summaries, comparisons, artifacts) enforce the cap
+        // strictly — coverage across sources is the point, and a dominant
+        // source otherwise fills every slot. FACTUAL questions enforce it only
+        // against competitive alternatives, so the one relevant source never
+        // loses its answer chunk to near-noise filler.
+        if (capped && broad && bestUnderCapScore > Number.NEGATIVE_INFINITY) continue;
+        if (capped && !broad && bestUnderCapScore >= Math.max(0.5, candidate.score * 0.3)) continue;
         const candidateTokens = tokensFor(candidate.chunk);
         const redundancy = selected.length
           ? Math.max(...selected.map((item) => overlapScore(candidateTokens, tokensFor(item.chunk))))
@@ -3897,7 +3938,14 @@ export async function createSourceStudioEngine(options = {}) {
       let supportLevel = "unsupported";
       if (support >= 0.18) supportLevel = "supported";
       else if (support >= 0.08) supportLevel = "partially_supported";
-      else if (!claim.trim() || answer.abstained || (!citationIndexes.length && /:\s*$/.test(claim))) supportLevel = "not_checkable";
+      else if (
+        !claim.trim() ||
+        answer.abstained ||
+        (!citationIndexes.length && /:\s*$/.test(claim)) ||
+        // Markdown headings are structure, not factual claims — stripping them
+        // as "unsupported" mutilated well-formed provider answers.
+        /^#{1,6}\s/.test(claim.trim())
+      ) supportLevel = "not_checkable";
       // Translated answers share no tokens with source-language quotes, and
       // word explanations legitimately carry no citations — both are language
       // work the overlap check cannot judge. Keep ALL claims of a translated
@@ -3926,10 +3974,22 @@ export async function createSourceStudioEngine(options = {}) {
     const unsupported = entries.filter((entry) => entry.support_level === "unsupported");
     let finalContent = answer.content;
     if (unsupported.length && !answer.abstained) {
+      // Remove unsupported claims IN PLACE so the surviving answer keeps its
+      // markdown structure — re-joining kept claims with bare newlines
+      // flattened numbered lists, paragraphs, and blank lines.
       const unsupportedSet = new Set(unsupported.map((entry) => entry.claim_text));
-      const kept = claims.filter((claim) => !unsupportedSet.has(stripCitations(claim)));
-      finalContent = kept.length
-        ? kept.join("\n")
+      const unsupportedRaw = claims.filter((claim) => unsupportedSet.has(stripCitations(claim)));
+      let pruned = answer.content;
+      for (const raw of unsupportedRaw) {
+        if (raw.trim()) pruned = pruned.replace(raw, "");
+      }
+      pruned = pruned
+        .replace(/^[ \t]*(?:[-*]|\d+\.)[ \t]*$/gm, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      const anythingKept = claims.some((claim) => !unsupportedSet.has(stripCitations(claim)));
+      finalContent = anythingKept && pruned
+        ? pruned
         : "I cannot provide a verified answer from the available evidence, so Source-only mode abstained.";
     }
     const ledger = {
@@ -6172,9 +6232,12 @@ async function extractPdfText(buffer) {
     // Fall through to the byte-scan fallback (e.g. scanned/encrypted PDFs).
   }
   const fallbackText = parsePdfFallback(buffer);
+  if (fallbackText === PDF_UNREADABLE_TEXT) {
+    throw statusError(422, "Could not read this PDF — it appears scanned, image-only, or corrupted, and OCR is not enabled. Paste the text into the source body to index it.");
+  }
   return {
     text: fallbackText,
-    parser: fallbackText === PDF_UNREADABLE_TEXT ? "pdf-unreadable" : "pdf-string-fallback",
+    parser: "pdf-string-fallback",
   };
 }
 
@@ -6257,7 +6320,7 @@ async function parseDocxTextFallback(filePath) {
   } catch {
     // The fallback depends on the local unzip binary and a standard DOCX XML layer.
   }
-  return "DOCX uploaded. The local XML text fallback did not find reliable text. Paste document text or add a production DOCX parser for layout-aware extraction.";
+  throw statusError(422, "Could not extract text from this DOCX file — it may be corrupted, empty, or unsupported. Paste the document text into the source body to index it.");
 }
 
 async function parsePptxTextFallback(filePath) {
@@ -6283,7 +6346,7 @@ async function parsePptxTextFallback(filePath) {
   } catch {
     // PPTX is an Open XML zip. The fallback extracts text from slide XML when unzip is available.
   }
-  return "PPTX uploaded. The local XML text fallback did not find reliable slide text. Paste slide text or add a production presentation parser for layout-aware extraction.";
+  throw statusError(422, "Could not extract text from this PPTX file — it may be corrupted, empty, or unsupported. Paste the slide text into the source body to index it.");
 }
 
 async function parseEpubTextFallback(filePath) {
@@ -6302,7 +6365,7 @@ async function parseEpubTextFallback(filePath) {
   } catch {
     // EPUB is a zip of HTML/XHTML content; this fallback intentionally ignores layout and media.
   }
-  return "EPUB uploaded. The local HTML text fallback did not find reliable readable text. Paste book text or add a production EPUB parser for table-of-contents-aware extraction.";
+  throw statusError(422, "Could not extract text from this EPUB file — it may be corrupted or DRM-protected. Paste the book text into the source body to index it.");
 }
 
 async function parsePlainTextUploadFallback(filePath, payload = {}) {
@@ -6557,7 +6620,7 @@ function externalToolErrorSummary(error, maxLength = 300) {
 // rather than facts inside one source. Chunk retrieval alone cannot answer
 // these — the collection structure lives in titles and summaries.
 const COLLECTION_QUESTION_PATTERN =
-  /\b(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|topics?|overview|überblick|worüber|über was|about what|interviews?)\b/i;
+  /\b(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|themes?|topics?|overview|überblick|worüber|über was|about what|interviews?|documents?|docs?|files?|papers?|pdfs?|dokumente?n?|unterlagen|dateien)\b/i;
 // "According to the sources, what is X?" cites the collection without asking
 // about it — strip that framing before testing, or every source-referential
 // question would count as collection-level and bypass the abstention gate.
@@ -6576,8 +6639,11 @@ function isCollectionLevelQuestion(text) {
 // The user asked for the answer in another language ("auf Aserbaidschanisch",
 // "translate to French"). A translated answer cannot pass a token-overlap
 // check against source-language quotes — the verifier must not nuke it.
+// Explicit language names only — a generic "in ...ish/ian/ese" suffix match
+// false-positived on ordinary phrases ("in general", "in Grafana") and turned
+// grounding off for normal questions.
 const OTHER_LANGUAGE_REQUEST_PATTERN =
-  /übersetz\w*|translat\w*|\bauf\s+[a-zäöüß]+isch\w*\b|\bin[s]?\s+[a-z]+(?:isch\w*|esisch\w*|ese|ian|ish)\b/i;
+  /übersetz\w*|translat\w*|\bauf\s+[a-zäöüß]+isch\w*\b|\b(?:in|ins|into|to)\s+(?:english|german|french|spanish|italian|portuguese|dutch|polish|russian|ukrainian|turkish|azerbaijani|arabic|hebrew|hindi|chinese|mandarin|japanese|korean|vietnamese|indonesian|swedish|norwegian|danish|finnish|czech|greek|romanian|hungarian)\b/i;
 // The user asked what a word/phrase means — language help about the
 // conversation itself, legitimately answerable without source citations.
 const LANGUAGE_HELP_PATTERN =
@@ -7211,7 +7277,10 @@ function tokenize(input) {
   ]);
   return String(input)
     .toLowerCase()
-    .replace(/[^a-z0-9äöüß\s-]/gi, " ")
+    // Unicode-aware: [a-z0-9äöüß] erased every non-Latin script (Cyrillic,
+    // CJK, Azerbaijani ə/ı …), breaking retrieval and verification for
+    // non-German/English content end-to-end.
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
     .split(/\s+/)
     .map((token) => token.trim())
     .filter((token) => token.length > 2 && !stop.has(token));
@@ -7580,7 +7649,7 @@ function detectIntent(question, artifactType = "") {
     if (artifactType === "video") return "video";
     return "artifact";
   }
-  if (/summari[sz]e|overview|brief|tl;?dr|zusammenfass\w*|überblick|kernaussagen?|key.?takeaways?|takeaways?|top\s*\d+|haupt(?:punkte|aussagen|erkenntnisse)|wichtigste/i.test(question)) return "summary";
+  if (/summar[iy]\w*|overview|brief|tl;?dr|zusammenfass\w*|überblick|kernaussagen?|key.?takeaways?|takeaways?|top\s*\d+|haupt(?:punkte|aussagen|erkenntnisse)|wichtigste/i.test(question)) return "summary";
   if (/compare|difference|versus|vs|contradiction|disagree|tension|vergleich\w*|unterschied\w*|widerspr\w+/i.test(question)) return "compare";
   if (/table|extract|numbers|dates|list|tabelle|auflist\w*/i.test(question)) return "table";
   if (/quiz|flashcard|slide|deck|artifact|audio|video|mind.?map|report/i.test(question)) return "artifact";
