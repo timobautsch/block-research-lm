@@ -3119,12 +3119,15 @@ export async function createSourceStudioEngine(options = {}) {
     // retrievalText drives ranking/embedding; `question` stays the stored/displayed question.
     const retrievalText = retrieval_query && retrieval_query.trim() ? retrieval_query : question;
     const intent = detectIntent(retrievalText, artifact_type);
-    const evidenceLimit = artifact_type === "audio"
-      ? MAX_AUDIO_EVIDENCE_ITEMS
-      : artifact_type
-        ? MAX_ARTIFACT_EVIDENCE_ITEMS
-        : MAX_EVIDENCE_ITEMS;
     const sourceIds = resolveSourceIds(notebook_id, source_mode, selected_source_ids);
+    // Budgets scale with the active source set. The old fixed caps (8 chat / 12
+    // artifact) made 25-source notebooks answer from one or two dominant
+    // sources — everything else silently never reached the model.
+    const evidenceLimit = artifact_type === "audio"
+      ? Math.min(24, Math.max(MAX_AUDIO_EVIDENCE_ITEMS, sourceIds.length))
+      : artifact_type
+        ? Math.min(24, Math.max(MAX_ARTIFACT_EVIDENCE_ITEMS, sourceIds.length))
+        : Math.min(16, Math.max(MAX_EVIDENCE_ITEMS, Math.ceil(sourceIds.length / 2)));
     const queryTokens = tokenize(retrievalText);
     const rewrites = rewriteQuery(retrievalText, notebook_id, queryTokens);
     const candidateChunks = state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id) && isRetrievableChunk(chunk));
@@ -3179,7 +3182,9 @@ export async function createSourceStudioEngine(options = {}) {
         // Show the full retrieved chunk (capped) — truncating to a few hundred chars used
         // to hide evidence that sat past the chunk opening (e.g. a pricing table mid-chunk),
         // which made the model abstain even though the chunk contained the answer.
-        quote: truncate(result.chunk.text, 2600),
+        // The per-item cap shares a total budget so the scaled evidence limits
+        // don't double provider input cost on large notebooks.
+        quote: truncate(result.chunk.text, Math.min(2600, Math.max(1200, Math.floor(31_200 / evidenceLimit)))),
         heading_path: result.chunk.heading_path || [],
         page_number: result.chunk.page_start || firstBlock?.page_number || null,
         timestamp_start: result.chunk.timestamp_start || null,
@@ -3190,6 +3195,46 @@ export async function createSourceStudioEngine(options = {}) {
         ranking_signals: result.ranking_signals || {},
       };
     });
+    // Collection-level questions ("what do the podcasts cover?") ask about the
+    // source SET — "podcast" never appears inside a transcript, only in source
+    // titles. Hand the model the sources themselves as citable evidence: one
+    // item per active source not already represented, built from title+summary.
+    // Gate on the CURRENT question, not the blended retrieval text — otherwise
+    // one collection question keeps injecting overview items for two more turns.
+    if (!artifact_type && isCollectionLevelQuestion(question)) {
+      const summariesBySource = new globalThis.Map(
+        state.knowledgeObjects
+          .filter((object) => object.notebook_id === notebook_id && object.type === "source_summary")
+          .map((object) => [object.source_id, String(object.data?.summary || "")]),
+      );
+      const representedSources = new Set(evidenceItems.map((item) => item.source_id));
+      let overviewBudget = 12;
+      for (const sourceId of sourceIds) {
+        if (overviewBudget <= 0) break;
+        if (representedSources.has(sourceId)) continue;
+        const source = state.sources.find((item) => item.id === sourceId);
+        if (!source || isLowQualityExtractionSource(source)) continue;
+        const summary = (summariesBySource.get(sourceId) || "").trim();
+        const firstBlock = state.blocks.find((block) => block.source_id === sourceId);
+        overviewBudget -= 1;
+        evidenceItems.push({
+          evidence_id: `E${evidenceItems.length + 1}`,
+          source_id: sourceId,
+          source_title: source.title,
+          block_ids: firstBlock ? [firstBlock.block_id] : [],
+          chunk_id: "",
+          quote: truncate([source.title, summary].filter(Boolean).join(". "), 500),
+          heading_path: ["Source overview"],
+          page_number: null,
+          timestamp_start: null,
+          timestamp_end: null,
+          relevance_score: 0.2,
+          rerank_score: 0.2,
+          support_type: "source_overview",
+          ranking_signals: { source_overview: 1 },
+        });
+      }
+    }
     const relevantKnowledge = getRelevantKnowledgeObjects(notebook_id, queryTokens, sourceIds);
     const sourceSummaries = sourceSummariesForIds(notebook_id, sourceIds);
     const retrievalRun = {
@@ -3213,6 +3258,13 @@ export async function createSourceStudioEngine(options = {}) {
       user_question: question,
       notebook_id,
       active_source_ids: sourceIds,
+      // Compact roster of the whole active set, so the model can reason about
+      // the collection ("three Trading Unscripted podcast episodes") even when
+      // chunk retrieval only surfaced a few of the sources.
+      active_sources: sourceIds
+        .map((sourceId) => state.sources.find((item) => item.id === sourceId))
+        .filter(Boolean)
+        .map((source) => ({ id: source.id, title: source.title, type: source.type })),
       intent,
       retrieved_items: retrievalRun.retrieved_chunks,
       source_summaries: sourceSummaries,
@@ -3541,6 +3593,11 @@ export async function createSourceStudioEngine(options = {}) {
   function diversifyScoredChunks(scored, limit) {
     const selected = [];
     const pool = [...scored];
+    // Hard per-source cap: the soft same-source penalty below cannot stop one
+    // dominant source from filling every slot in a many-source notebook.
+    const distinctSources = new Set(scored.map((item) => item.chunk.source_id)).size || 1;
+    const perSourceCap = distinctSources > 1 ? Math.max(2, Math.ceil(limit / distinctSources) + 1) : limit;
+    const pickedPerSource = new globalThis.Map();
     // Tokenize each chunk once up front, not O(pool × selected) times inside the
     // selection loop (was effectively O(n³) tokenization on large candidate sets).
     const tokensByChunkId = new globalThis.Map();
@@ -3555,8 +3612,18 @@ export async function createSourceStudioEngine(options = {}) {
     while (pool.length && selected.length < limit) {
       let bestIndex = 0;
       let bestDiversityScore = Number.NEGATIVE_INFINITY;
+      // Enforce the cap only against COMPETITIVE alternatives: a capped
+      // source's clearly-more-relevant chunk must not lose its slot to
+      // near-noise filler from other sources (the include gate lets weak
+      // keyword hits into the pool).
+      const underCapScores = pool
+        .filter((item) => (pickedPerSource.get(item.chunk.source_id) || 0) < perSourceCap)
+        .map((item) => item.score);
+      const bestUnderCapScore = underCapScores.length ? Math.max(...underCapScores) : Number.NEGATIVE_INFINITY;
       for (let index = 0; index < pool.length; index += 1) {
         const candidate = pool[index];
+        const capped = (pickedPerSource.get(candidate.chunk.source_id) || 0) >= perSourceCap;
+        if (capped && bestUnderCapScore >= Math.max(0.5, candidate.score * 0.3)) continue;
         const candidateTokens = tokensFor(candidate.chunk);
         const redundancy = selected.length
           ? Math.max(...selected.map((item) => overlapScore(candidateTokens, tokensFor(item.chunk))))
@@ -3572,6 +3639,7 @@ export async function createSourceStudioEngine(options = {}) {
         }
       }
       const [picked] = pool.splice(bestIndex, 1);
+      pickedPerSource.set(picked.chunk.source_id, (pickedPerSource.get(picked.chunk.source_id) || 0) + 1);
       selected.push({
         ...picked,
         // Preserve the real reranker relevance; record the diversity-adjusted
@@ -3645,7 +3713,16 @@ export async function createSourceStudioEngine(options = {}) {
     // "ist"/"die" survive tokenize and substring-match everything). Summary and
     // compare intents legitimately share no tokens with the evidence.
     if (!["summary", "compare"].includes(evidencePack.intent)) {
-      const meaningful = tokenize(question).filter((token) => token.length >= 4);
+      // Collection scaffolding ("what do the podcasts talk about") carries no
+      // retrievable content — measure relevance on the remaining tokens. A
+      // PURELY collection-level question has none left and may answer from the
+      // source-overview evidence; a smuggled fact question ("according to the
+      // sources, what is the capital of Australia?") keeps its content tokens
+      // and must still pass the gate.
+      const meaningful = tokenize(question).filter(
+        (token) => token.length >= 4 && !COLLECTION_SCAFFOLDING_PATTERN.test(token),
+      );
+      const purelyCollection = isCollectionLevelQuestion(question) && !meaningful.length;
       const relevance = meaningful.length
         ? Math.max(
             ...citations.map((citation) => {
@@ -3661,7 +3738,7 @@ export async function createSourceStudioEngine(options = {}) {
             }),
           )
         : 1;
-      if (relevance < 0.2) {
+      if (!purelyCollection && relevance < 0.2) {
         return {
           content:
             "I cannot answer that from the active sources. The Evidence Pack did not contain a passage that supports the requested claim, so Source-only mode abstained.",
@@ -3741,6 +3818,9 @@ export async function createSourceStudioEngine(options = {}) {
     const citationByIndex = new globalThis.Map(
       (answer.citations || []).map((citation) => [Number(citation.index), citation]),
     );
+    const userQuestion = String(evidencePack.user_question || "");
+    const otherLanguageRequested = OTHER_LANGUAGE_REQUEST_PATTERN.test(userQuestion);
+    const languageHelpRequested = LANGUAGE_HELP_PATTERN.test(userQuestion);
     const entries = claims.map((claim, claimIndex) => {
       const citationIndexes = [...claim.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
       const citedEvidence = citationIndexes
@@ -3755,6 +3835,12 @@ export async function createSourceStudioEngine(options = {}) {
       if (support >= 0.18) supportLevel = "supported";
       else if (support >= 0.08) supportLevel = "partially_supported";
       else if (!claim.trim() || answer.abstained || (!citationIndexes.length && /:\s*$/.test(claim))) supportLevel = "not_checkable";
+      // Translated answers share no tokens with source-language quotes, and
+      // word explanations legitimately carry no citations — both are language
+      // work the overlap check cannot judge. Keep them instead of nuking the
+      // whole answer down to a forced abstention.
+      else if (otherLanguageRequested && citedEvidence.length) supportLevel = "not_checkable";
+      else if (languageHelpRequested && !citationIndexes.length) supportLevel = "not_checkable";
       return {
         claim_id: id("claim"),
         answer_message_id: "",
@@ -6343,6 +6429,36 @@ function externalToolErrorSummary(error, maxLength = 300) {
 //    direct caption fetches below so all YouTube traffic shares one egress IP.
 //  - YTDLP_COOKIES_B64 / YTDLP_COOKIES_FILE: Netscape cookies from a logged-in
 //    session. Works but cookies expire unpredictably and carry account risk.
+// Questions about the source COLLECTION itself (its podcasts, videos, topics)
+// rather than facts inside one source. Chunk retrieval alone cannot answer
+// these — the collection structure lives in titles and summaries.
+const COLLECTION_QUESTION_PATTERN =
+  /\b(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|topics?|overview|überblick|worüber|über was|about what|interviews?)\b/i;
+// "According to the sources, what is X?" cites the collection without asking
+// about it — strip that framing before testing, or every source-referential
+// question would count as collection-level and bypass the abstention gate.
+const COLLECTION_REFERENTIAL_FRAMING =
+  /\b(according to|based on|laut|gemäß|from|aus|in)\s+(the\s+|den\s+|die\s+|der\s+|diesen\s+|deinen\s+|meinen\s+|all\s+)?(sources?|quellen?|notebooks?|library|collection|sammlung)\b/gi;
+// Question scaffolding around collection asks ("what is talked about in the
+// podcasts") — these words carry no retrievable content of their own.
+const COLLECTION_SCAFFOLDING_PATTERN =
+  /^(podcasts?|episoden?|episodes?|folgen|videos?|quellen?|sources?|channels?|kanal|kanäle|sammlung|collection|library|notebooks?|themen|topics?|overview|überblick|worüber|interviews?|gesprochen|besprochen|geredet|behandelt|erzählt|discussed|talked|covered|spoken|about|inhalt|contents?|über|welche|which|what|does|gibt|sagt|sagen|wird|werden|sprechen|spricht)$/i;
+
+function isCollectionLevelQuestion(text) {
+  const cleaned = String(text || "").replace(COLLECTION_REFERENTIAL_FRAMING, " ");
+  return COLLECTION_QUESTION_PATTERN.test(cleaned);
+}
+
+// The user asked for the answer in another language ("auf Aserbaidschanisch",
+// "translate to French"). A translated answer cannot pass a token-overlap
+// check against source-language quotes — the verifier must not nuke it.
+const OTHER_LANGUAGE_REQUEST_PATTERN =
+  /übersetz\w*|translat\w*|\bauf\s+[a-zäöüß]+isch\w*\b|\bin[s]?\s+[a-z]+(?:isch\w*|esisch\w*|ese|ian|ish)\b/i;
+// The user asked what a word/phrase means — language help about the
+// conversation itself, legitimately answerable without source citations.
+const LANGUAGE_HELP_PATTERN =
+  /was\s+bedeutet|was\s+heißt|bedeutung\s+von|what\s+does\s+.{1,60}\s+mean|meaning\s+of|erklär\w*\s+(mir\s+)?(nochmal\s+)?(auch\s+)?(auf\s+\S+\s+)?(das\s+wort|den\s+begriff|was\s+bedeutet)/i;
+
 const YOUTUBE_BOT_CHECK_PATTERN = /sign in to confirm|confirm you.{0,3}re not a bot|login_required/i;
 // The egress proxy rejecting/failing connections looks different from a YouTube
 // bot check — usually an exhausted traffic balance or bad proxy credentials.
@@ -7340,9 +7456,9 @@ function detectIntent(question, artifactType = "") {
     if (artifactType === "video") return "video";
     return "artifact";
   }
-  if (/summari[sz]e|overview|brief|tl;?dr/i.test(question)) return "summary";
-  if (/compare|difference|versus|vs|contradiction|disagree|tension/i.test(question)) return "compare";
-  if (/table|extract|numbers|dates|list/i.test(question)) return "table";
+  if (/summari[sz]e|overview|brief|tl;?dr|zusammenfass\w*|überblick|kernaussagen?|key.?takeaways?|takeaways?|top\s*\d+|haupt(?:punkte|aussagen|erkenntnisse)|wichtigste/i.test(question)) return "summary";
+  if (/compare|difference|versus|vs|contradiction|disagree|tension|vergleich\w*|unterschied\w*|widerspr\w+/i.test(question)) return "compare";
+  if (/table|extract|numbers|dates|list|tabelle|auflist\w*/i.test(question)) return "table";
   if (/quiz|flashcard|slide|deck|artifact|audio|video|mind.?map|report/i.test(question)) return "artifact";
   if (/why|explain|concept/i.test(question)) return "explain";
   return "factual";

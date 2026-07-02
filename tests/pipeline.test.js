@@ -694,6 +694,82 @@ test("reranks hybrid retrieval candidates through Cohere when configured", async
   });
 });
 
+test("keeps translated provider answers instead of nuking them as unsupported", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sourcestudio-translate-test-"));
+  // Provider returns the takeaways translated to Azerbaijani — zero token
+  // overlap with the German source quotes, which used to get every claim
+  // marked unsupported and the whole answer replaced by a forced abstention.
+  const providerAnswer = {
+    abstained: false,
+    answer_markdown:
+      "Əsas nəticələr: Aurora Hydrogen 2019-cu ildə Hamburqda qurulub [1]. Elektrolizerin səmərəliliyi 74 faizdir [1].",
+    citations: [{ index: 1, evidence_id: "E1" }],
+  };
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ content: [{ text: JSON.stringify(providerAnswer) }] }),
+  });
+  const engine = await createSourceStudioEngine({
+    root: resolve("."),
+    storageDir: dir,
+    stateFile: join(dir, "state.json"),
+    env: {
+      ANTHROPIC_API_KEY: "test-provider-token",
+      ANTHROPIC_MODEL: "test-claude-model",
+      SOURCESTUDIO_VIDEO_TTS: "false",
+    },
+    fetchImpl,
+  });
+  try {
+    const notebook = await engine.createNotebook({ title: "Übersetzung" });
+    await engine.ingestSource(notebook.id, {
+      type: "markdown",
+      title: "Aurora Dossier",
+      body: "# Aurora\n\nAurora Hydrogen wurde 2019 in Hamburg gegründet. Der Elektrolyseur erreicht 74 Prozent Effizienz.",
+    });
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Übersetze die wichtigsten Key-Takeaways auf Aserbaidschanisch.",
+    });
+    assert.equal(response.message.mode, "grounded");
+    assert.ok(response.message.content.includes("Əsas nəticələr"), "translated content must survive verification");
+    assert.ok(response.citations.length >= 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("collection questions expose every source via overview evidence", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Podcast collection" });
+    const episodes = [
+      ["Trading Unscripted Episode 1", "Wir sprechen über Risikomanagement und Positionsgrößen im täglichen Trading Alltag."],
+      ["Trading Unscripted Episode 2", "Das Interview behandelt Marktzyklen, Emotionen und die Psychologie hinter Verlustserien."],
+      ["Trading Unscripted Episode 3", "Diese Folge erklärt automatisierte Strategien, Backtesting und den Umgang mit Slippage."],
+    ];
+    for (const [title, body] of episodes) {
+      await engine.ingestSource(notebook.id, {
+        type: "youtube",
+        title,
+        original_url: `https://www.youtube.com/watch?v=ep${episodes.findIndex((e) => e[0] === title)}0000000`,
+        body: `# YouTube transcript\n\n${body}`,
+      });
+    }
+    const response = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Über was wird in den Podcasts gesprochen?",
+    });
+    // The evidence pack must cover the whole collection: every source appears
+    // either via retrieved chunks or via a synthetic source-overview item.
+    const evidencedSources = new Set(response.evidence_pack.evidence_items.map((item) => item.source_id));
+    assert.equal(evidencedSources.size, 3);
+    // And the collection question must not be answered with an abstention that
+    // claims there is no podcast information.
+    assert.equal(response.message.mode, "grounded");
+  });
+});
+
 test("imports the latest channel videos as individual YouTube sources", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sourcestudio-youtube-batch-test-"));
   const channelVideos = [
@@ -862,6 +938,14 @@ test("abstains on off-topic questions even when retrieval returns evidence", asy
     });
     assert.equal(offTopic.message.mode, "abstained");
     assert.equal(offTopic.citations.length, 0);
+    // Referencing the collection must not smuggle an off-topic question past
+    // the gate ("laut den Quellen" / "according to the sources").
+    const framedOffTopic = await engine.askChat({
+      notebook_id: notebook.id,
+      question: "Was ist laut den Quellen die Hauptstadt von Australien?",
+    });
+    assert.equal(framedOffTopic.message.mode, "abstained");
+    assert.equal(framedOffTopic.citations.length, 0);
     // A genuinely grounded question must still pass the relevance gate.
     const grounded = await engine.askChat({
       notebook_id: notebook.id,
