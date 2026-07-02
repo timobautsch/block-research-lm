@@ -346,7 +346,8 @@ interface Citation {
 }
 
 interface SourceBlock {
-  id: string;
+  // The blocks API returns `block_id` (not `id`) — matching citation.block_ids.
+  block_id: string;
   text: string;
   heading_path?: string[];
   page_number?: number | null;
@@ -2523,10 +2524,10 @@ export default function App() {
                 <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
               ) : citationViewer.blocks.length ? (
                 citationViewer.blocks.map((block) => {
-                  const cited = citationViewer.citation.block_ids?.includes(block.id);
+                  const cited = citationViewer.citation.block_ids?.includes(block.block_id);
                   return (
                     <p
-                      key={block.id}
+                      key={block.block_id}
                       className={cited ? "citation-block cited" : "citation-block"}
                       ref={cited ? scrollCitedBlockIntoView : undefined}
                     >

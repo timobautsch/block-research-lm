@@ -13,7 +13,9 @@ const GroundedCitationSchema = z.object({
 const GroundedAnswerSchema = z.object({
   abstained: z.boolean().optional().default(false),
   answer_markdown: z.string().trim().max(9000).optional().default(""),
-  citations: z.array(GroundedCitationSchema).max(8).optional().default([]),
+  // Wide cap: evidence packs can carry 30+ items on large notebooks, and a
+  // response citing more than the cap must not be discarded to the fallback.
+  citations: z.array(GroundedCitationSchema).max(40).optional().default([]),
 });
 
 const AudioScriptTurnSchema = z.object({
@@ -375,6 +377,15 @@ export function createModelRouter({
       }
     }
     if (!parsed.abstained && !parsed.citations.length) {
+      // Language help about the conversation itself ("what does 'takeaways'
+      // mean?") is legitimately citation-free — don't discard it.
+      const languageHelp =
+        /was\s+bedeutet|was\s+heißt|bedeutung\s+von|what\s+does\s+.{1,60}\s+mean|meaning\s+of|erklär\w*\s+.{0,40}(wort|begriff|bedeutet)/i.test(
+          String(evidencePack.user_question || ""),
+        );
+      if (languageHelp && !/\[\d+\]/.test(parsed.answer_markdown)) {
+        return { content: parsed.answer_markdown, citations: [], abstained: false };
+      }
       throw new Error("Provider returned a grounded answer without citations.");
     }
     const citedIndexes = [...parsed.answer_markdown.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
@@ -489,6 +500,10 @@ function buildGroundedAnswerPrompt({ question, evidencePack, answerStyle, histor
     user_question: question,
     answer_style: answerStyle,
     constraints: evidencePack.constraints,
+    // Titles of ALL active sources (tiny), so collection-level questions
+    // ("what do the podcasts cover?") can be reasoned about even when chunk
+    // retrieval surfaced only a few sources.
+    active_sources: (evidencePack.active_sources || []).map((source) => source.title).slice(0, 60),
     evidence_items: evidencePack.evidence_items.map((item) => ({
       evidence_id: item.evidence_id,
       source_id: item.source_id,
@@ -508,10 +523,13 @@ function buildGroundedAnswerPrompt({ question, evidencePack, answerStyle, histor
     "Return strict JSON matching this schema:",
     '{"abstained": boolean, "answer_markdown": string, "citations": [{"index": number, "evidence_id": "E1"}]}',
     "Rules:",
-    "- Do not use general knowledge or unstated assumptions.",
+    "- Do not use general knowledge or unstated assumptions for FACTUAL content — every fact must come from the evidence.",
+    "- Synthesis IS grounded work: you may summarize, rank, group, compare, and extract key takeaways from the evidence. Never abstain merely because the sources do not already contain the requested list or format — build it from the cited passages.",
+    "- Translations and other output languages are allowed and expected when requested: if the user asks for the answer in another language (e.g. 'auf Aserbaidschanisch'), write answer_markdown in that language and keep the [n] markers. Translating or reformatting source content is NOT outside knowledge.",
+    "- Brief language help about the conversation itself (e.g. what a term like 'takeaways' means, how to say something in another language) is allowed without citations — answer it (abstained false, citations may be empty) instead of abstaining.",
     "- Use the conversation history to resolve follow-ups, pronouns, and short references. A terse message like \"sicher?\", \"are you sure?\", \"why?\" or \"and the price?\" refers to your previous answer and its topic — interpret it that way.",
     "- If the latest question asks you to confirm, double-check, or clarify your previous answer, do NOT abstain because it is short or meta. Re-verify the relevant facts against the Evidence Pack and answer (confirm or correct), with citations.",
-    "- Answer in the same language as the user's latest question.",
+    "- Answer in the same language as the user's latest question, unless the user asks for another output language.",
     "- Every factual sentence in answer_markdown must end with a citation like [1].",
     "- Citation indexes must map to the citations array.",
     "- citations[].evidence_id must be one of the provided evidence_id values.",
