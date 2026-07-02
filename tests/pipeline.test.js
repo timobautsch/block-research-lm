@@ -113,10 +113,25 @@ async function withArtifactProviderEngine(fn) {
           {
             text: JSON.stringify({
               title: "Provider Executive Brief",
-              tldr: ["SourceStudio uses Evidence Packs to make retrieval auditable. [1]"],
+              abstract: ["SourceStudio uses Evidence Packs to make retrieval auditable before generation. [1]"],
+              scope: ["This report is limited to the active grounding source. [1]"],
+              methodology: ["The report uses cited evidence from the retrieved source block. [1]"],
+              executive_summary: [
+                "SourceStudio uses Evidence Packs to make retrieval auditable. [1]",
+                "Citation Ledgers verify answer claims against cited source blocks. [1]",
+                "The report remains limited to the active evidence. [1]",
+              ],
               key_points: [
                 {
                   text: "SourceStudio uses Evidence Packs to make retrieval auditable. [1]",
+                  citation: "[1]",
+                },
+              ],
+              key_findings: [
+                {
+                  heading: "Auditable evidence layer",
+                  text: "SourceStudio uses Evidence Packs to make retrieval auditable. [1]",
+                  analysis: "The cited source establishes the evidence layer as the basis for artifact generation. [1]",
                   citation: "[1]",
                 },
               ],
@@ -758,7 +773,7 @@ test("generates all required source-backed Studio artifacts", async () => {
     await engine.ingestSource(notebook.id, {
       type: "markdown",
       title: "Artifact source",
-      body: "# Artifact Source\n\nReports, mind maps, flashcards, quizzes, data tables, slide decks, audio scripts, and video storyboards should carry source references.",
+      body: "# Artifact Source\n\nReports, mind maps, flashcards, quizzes, data tables, slide decks, audio scripts, and video storyboards should carry source references. Reports should not be TLDR or short bullet lists.",
     });
     for (const type of ["report", "mindmap", "flashcards", "quiz", "data-table", "slide-deck", "audio", "video", "infographic"]) {
       const response = await engine.createArtifact({ notebook_id: notebook.id, type, options: {} });
@@ -773,8 +788,15 @@ test("generates all required source-backed Studio artifacts", async () => {
       assert.ok(response.artifact.content_json.evidence_audit.top_sources.length >= 1, `${type} should expose source audit details`);
       if (type === "report") {
         assert.ok(response.artifact.content_json.executive_summary.length >= 3, "report should include an executive summary");
+        assert.ok(response.artifact.content_json.abstract.length >= 1, "report should include an abstract");
+        assert.ok(response.artifact.content_json.scope.length >= 1, "report should define scope");
+        assert.ok(response.artifact.content_json.methodology.length >= 1, "report should define methodology");
+        assert.equal("tldr" in response.artifact.content_json, false, "report should not include a tldr field");
         assert.ok(response.artifact.content_json.detailed_sections.length >= 5, "report should include long-form sections");
         assert.match(response.artifact.text_content, /## Executive Summary/);
+        assert.match(response.artifact.text_content, /## Scope and Method/);
+        assert.match(response.artifact.text_content, /## Principal Findings/);
+        assert.doesNotMatch(response.artifact.text_content, /TL\s*;?\s*DR/i);
         assert.match(response.artifact.text_content, /## Recommendations/);
         assert.ok(response.artifact.text_content.length > 2500, "report export should be substantive");
       }
@@ -789,6 +811,40 @@ test("generates all required source-backed Studio artifacts", async () => {
         assert.equal(pptxBytes.subarray(0, 2).toString("utf8"), "PK");
       }
     }
+  });
+});
+
+test("sanitizes legacy report artifacts for client reads", async () => {
+  await withEngine(async (engine) => {
+    const notebook = await engine.createNotebook({ title: "Legacy report test" });
+    engine._state().artifacts.push({
+      id: "artifact_legacy_report",
+      notebook_id: notebook.id,
+      type: "report",
+      title: "Legacy Report",
+      content_json: {
+        title: "Legacy Report",
+        executive_summary: ["This legacy report still contains TLDR wording. [1]"],
+        tldr: ["Old short summary. [1]"],
+        key_findings: [{ heading: "Finding 1", text: "Legacy reports should be formal. [1]", citation: "[1]" }],
+        detailed_sections: [{ heading: "Evidence audit", body: ["Internal audit details. [1]"] }],
+        recommendations: [],
+        open_questions: [],
+        risks_limitations: [],
+        bibliography: [],
+      },
+      text_content: "## TLDR\nOld short summary.",
+      file_path: "",
+      source_refs_json: [],
+      model_runs_json: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const clientArtifact = engine.getNotebook(notebook.id).artifacts.find((artifact) => artifact.id === "artifact_legacy_report");
+    assert.ok(clientArtifact, "legacy report should be returned to the client");
+    assert.equal("tldr" in clientArtifact.content_json, false, "legacy report client payload should not include tldr");
+    assert.doesNotMatch(clientArtifact.text_content, /TL\s*;?\s*DR/i);
+    assert.match(clientArtifact.text_content, /## Scope and Method/);
   });
 });
 

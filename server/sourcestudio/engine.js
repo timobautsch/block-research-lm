@@ -7339,7 +7339,14 @@ function splitClaims(answer) {
     .split(/\n+/)
     .flatMap((line) => {
       const clean = line.replace(/^[-*]\s+/, "").trim();
-      return /\[\d+\]/.test(clean) ? [clean] : clean.split(/(?<=[.!?])\s+/);
+      const citationCount = (clean.match(/\[\d+\]/g) || []).length;
+      // A single-citation bullet/line stays whole (its markdown may span the
+      // sentence). But a paragraph carrying MULTIPLE distinct citations must be
+      // split at sentence boundaries — otherwise the per-claim overlap check
+      // measures one sentence's text against a different sentence's evidence and
+      // scores a correctly-grounded answer as "unsupported".
+      if (citationCount <= 1) return [clean];
+      return clean.split(/(?<=[.!?])\s+/);
     })
     .map((claim) => claim.trim())
     .filter((claim) => claim.length > 20);
