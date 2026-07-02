@@ -41,7 +41,7 @@ and natural, NOT two people taking turns reading a summary.
 - `deep_dive`: two-host guided conversation with synthesis, nuance, and a clear takeaway.
 - `brief`: compact single-speaker overview for fast listening (Host A only; still warm).
 - `critique`: two-host constructive critique — strengths, gaps, risks, next questions.
-- `debate`: two-host spirited but fair debate — claim, counterclaim, evidence, synthesis.
+- `debate`: two-host HEATED but fair debate — claim, counterclaim, evidence, synthesis. Make it genuinely spirited: the hosts interrupt each other mid-thought, push back hard ("Come on —", "That's exactly backwards"), concede points grudgingly, and get audibly worked up before finding common ground at the end. Use v3 audio tags inline ([heated], [interrupting], [scoffs], [incredulous], [fast-paced], [laughs], [calming down]) and matching voice_direction values ("heated, fast", "interrupting, incredulous", "defiant", "grudging concession") on most turns — never let two consecutive turns share the same energy.
 - Match the requested **language** (write the spoken text in that language) and **length**.
 
 Return valid JSON only, in exactly this shape:

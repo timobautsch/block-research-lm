@@ -345,14 +345,6 @@ interface Citation {
   page_number?: number | null;
 }
 
-interface SourceBlock {
-  // The blocks API returns `block_id` (not `id`) — matching citation.block_ids.
-  block_id: string;
-  text: string;
-  heading_path?: string[];
-  page_number?: number | null;
-}
-
 interface ConfirmRequest {
   title: string;
   message: string;
@@ -631,7 +623,7 @@ const baseReportFormatOptions: ReportFormatOption[] = [
 ];
 
 const defaultAudioOverviewOptions: AudioOverviewOptions = {
-  format: "deep_dive",
+  format: "debate",
   length: "default",
   language: "English",
   prompt: "",
@@ -717,9 +709,8 @@ export default function App() {
   // one go; each video still becomes its own transcribed source.
   const [youtubeImportMode, setYoutubeImportMode] = useState<"video" | "channel">("video");
   const [youtubeBatchCount, setYoutubeBatchCount] = useState(10);
-  // Citation chips open the cited source passage with its blocks highlighted.
-  const [citationViewer, setCitationViewer] = useState<{ citation: Citation; blocks: SourceBlock[] | null } | null>(null);
-  const citedScrolledRef = useRef(false);
+  // Citation chips open a compact viewer with just the cited passage.
+  const [citationViewer, setCitationViewer] = useState<{ citation: Citation } | null>(null);
   // In-app replacement for window.confirm — the browser dialog looks foreign.
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [sourceFileQueue, setSourceFileQueue] = useState<QueuedSourceFile[]>([]);
@@ -2017,27 +2008,10 @@ export default function App() {
     setActiveSourceId(sourceId);
     setHighlightedBlockIds(citation.block_ids || []);
     setMobilePanel("sources");
-    // Open the passage viewer immediately (with the quote as fallback content)
-    // and pull the source's full blocks so the cited ones can be highlighted
-    // in their surrounding context.
-    citedScrolledRef.current = false;
-    setCitationViewer({ citation, blocks: null });
-    api<{ blocks: SourceBlock[] }>(`/api/sources/${sourceId}/blocks`)
-      .then((response) =>
-        setCitationViewer((current) =>
-          current && current.citation === citation ? { ...current, blocks: response.blocks || [] } : current,
-        ),
-      )
-      .catch(() =>
-        setCitationViewer((current) => (current && current.citation === citation ? { ...current, blocks: [] } : current)),
-      );
-  }, []);
-
-  const scrollCitedBlockIntoView = useCallback((node: HTMLElement | null) => {
-    if (node && !citedScrolledRef.current) {
-      citedScrolledRef.current = true;
-      window.requestAnimationFrame(() => node.scrollIntoView({ block: "center", behavior: "smooth" }));
-    }
+    // Compact excerpt viewer: show ONLY the cited passage. Whole-source block
+    // dumps turned a click into a wall of text for transcript sources, whose
+    // "blocks" run thousands of words.
+    setCitationViewer({ citation });
   }, []);
 
   function askConfirm(options: { title: string; message: string; confirmLabel?: string }) {
@@ -2520,26 +2494,9 @@ export default function App() {
               </button>
             </div>
             <div className="citation-viewer-body">
-              {citationViewer.blocks === null ? (
-                <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
-              ) : citationViewer.blocks.length ? (
-                citationViewer.blocks.map((block) => {
-                  const cited = citationViewer.citation.block_ids?.includes(block.block_id);
-                  return (
-                    <p
-                      key={block.block_id}
-                      className={cited ? "citation-block cited" : "citation-block"}
-                      ref={cited ? scrollCitedBlockIntoView : undefined}
-                    >
-                      {block.text}
-                    </p>
-                  );
-                })
-              ) : (
-                <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
-              )}
+              <blockquote className="citation-block cited">{citationViewer.citation.quote}</blockquote>
             </div>
-            <p className="citation-viewer-hint">Highlighted passages are the evidence this citation points to.</p>
+            <p className="citation-viewer-hint">This is the exact source passage the citation points to.</p>
           </section>
         </div>
       ) : null}
