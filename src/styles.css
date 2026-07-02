@@ -1956,6 +1956,8 @@ select:focus-visible {
   flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
+  max-height: 168px;
+  overflow-y: auto;
 }
 
 .flashcard-token-row button,

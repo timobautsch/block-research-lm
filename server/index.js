@@ -40,7 +40,17 @@ const authStore = createAuthStore({
 });
 const app = express();
 
-app.use(express.json({ limit: MAX_SOURCE_REQUEST_BODY_BYTES }));
+// The large body limit exists only for source uploads (base64 files). Applying
+// it to every route — including unauthenticated auth endpoints — lets anyone
+// POST hundreds of MB and stall the event loop / exhaust memory. Scope the big
+// limit to the two upload routes; everything else gets a small 1 MB cap.
+const largeJson = express.json({ limit: MAX_SOURCE_REQUEST_BODY_BYTES });
+const smallJson = express.json({ limit: "1mb" });
+app.use((req, res, next) => {
+  const isUpload = req.method === "POST"
+    && (/^\/api\/notebooks\/[^/]+\/sources\/?$/.test(req.path) || req.path === "/api/sources");
+  return (isUpload ? largeJson : smallJson)(req, res, next);
+});
 app.use("/api", (_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
@@ -240,13 +250,19 @@ app.get("/api/jobs/:id", routeHandler((req) => ({
   job: engine.getJob(req.params.id, userContext(req)),
 })));
 
-app.get("/api/model-runs", (_req, res) => {
-  res.json({ model_runs: engine.listModelRuns() });
+app.get("/api/model-runs", (req, res) => {
+  res.json({ model_runs: engine.listModelRuns(userContext(req)) });
 });
 
 app.post("/api/seed", asyncHandler(async (req, res) => {
   res.json({ notebook: await engine.seedDemo({ resetFirst: req.body?.reset === true, ownerUserId: req.user.id, requestId: req.requestId }) });
 }));
+
+// Unknown /api routes must return a JSON 404, not the SPA HTML with a 200 —
+// otherwise a client fetch to a mistyped endpoint silently gets index.html.
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: `Unknown API route: ${req.method} ${req.path}` });
+});
 
 if (isProduction) {
   app.use(express.static(join(root, "dist")));

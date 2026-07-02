@@ -2,6 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -102,6 +104,13 @@ export async function createSourceStudioEngine(options = {}) {
   let durablePersistTimer = null;
   let durablePersistChain = Promise.resolve();
   let activeIngestJobs = 0;
+  // Only strip embeddings from the durable snapshot once pgvector has actually
+  // accepted at least one upsert this process — guards against silent dimension
+  // mismatches that would otherwise drop every row and lose vectors on restart.
+  let pgVectorsAccepted = false;
+  // Source ids deleted while their async ingest is still in flight, so runIngest
+  // can bail instead of resurrecting orphaned derived rows.
+  const deletedSourceIds = new Set();
   const ingestQueue = [];
   const recoveredInterruptedJobs = recoverInterruptedArtifactJobs();
   if (recoveredInterruptedJobs) await persist();
@@ -234,7 +243,10 @@ export async function createSourceStudioEngine(options = {}) {
     // pgvector already stores every chunk vector; shipping the raw float arrays
     // in the KV snapshot multiplies its size and times out the write on big
     // corpora. Retrieval after a restore falls back to BM25 + pgvector.
-    if (!pgStore.enabled || !Array.isArray(state.embeddings) || !state.embeddings.length) return state;
+    // Only strip when pgvector has actually accepted vectors — otherwise (e.g.
+    // dimension mismatch dropping every row) we would delete the sole copy and
+    // lose semantic retrieval permanently across the restart.
+    if (!pgStore.enabled || !pgVectorsAccepted || !Array.isArray(state.embeddings) || !state.embeddings.length) return state;
     return { ...state, embeddings: [] };
   }
 
@@ -285,6 +297,21 @@ export async function createSourceStudioEngine(options = {}) {
       job.status = "failed";
       job.error = "Generation was interrupted by a server restart. Please start it again.";
       job.updated_at = now();
+      recovered += 1;
+    }
+    // Async ingestion (uploads/URLs/YouTube) persists source.status = "pending"/
+    // "parsing" while running in the in-memory queue. A restart loses the queue
+    // but the durable snapshot keeps the source, so without this sweep it would
+    // spin on "parsing" forever, excluded from retrieval and never completable.
+    for (const source of state.sources) {
+      if (!["pending", "parsing"].includes(source.status)) continue;
+      source.status = "failed";
+      source.metadata_json = {
+        ...source.metadata_json,
+        ingest_stage: "failed",
+        error: "Ingestion was interrupted by a server restart. Please re-add the source.",
+      };
+      source.updated_at = now();
       recovered += 1;
     }
     if (recovered) {
@@ -468,6 +495,17 @@ export async function createSourceStudioEngine(options = {}) {
 
       const document = await parseSource(source, parsed, context);
       capDocumentText(document);
+      // The user can delete the source (or its notebook) while parsing/embedding
+      // is still awaiting. If it's gone, bail before inserting derived rows so we
+      // don't resurrect orphaned blocks/chunks/embeddings/pgvector rows.
+      if (deletedSourceIds.has(sourceId) || !state.sources.some((item) => item.id === sourceId)) {
+        removeSourceDerivedRows(sourceId);
+        if (pgStore.enabled) {
+          await pgStore.deleteBySource(sourceId).catch(() => undefined);
+        }
+        deletedSourceIds.delete(sourceId);
+        return null;
+      }
       markSourceStage("chunking");
       source.title = document.title || source.title;
       source.raw_text = document.raw_text;
@@ -482,9 +520,16 @@ export async function createSourceStudioEngine(options = {}) {
       }
       state.blocks.push(...document.blocks);
       const chunks = chunkDocument(notebookId, source, document.blocks);
-      state.chunks.push(...chunks);
       markSourceStage("embedding");
       const chunkVectors = await embedder.embed(chunks.map((chunk) => chunk.normalized_text), "document");
+      // Re-check after the embedding await — deletion could have landed here too.
+      if (deletedSourceIds.has(sourceId) || !state.sources.some((item) => item.id === sourceId)) {
+        removeSourceDerivedRows(sourceId);
+        if (pgStore.enabled) await pgStore.deleteBySource(sourceId).catch(() => undefined);
+        deletedSourceIds.delete(sourceId);
+        return null;
+      }
+      state.chunks.push(...chunks);
       state.embeddings.push(
         ...chunks.map((chunk, index) => ({
           id: id("embedding"),
@@ -498,7 +543,7 @@ export async function createSourceStudioEngine(options = {}) {
       if (pgStore.enabled) {
         markSourceStage("vector_indexing");
         try {
-          await pgStore.upsertChunks(
+          const upserted = await pgStore.upsertChunks(
             chunks.map((chunk, index) => ({
               chunk_id: chunk.id,
               notebook_id: notebookId,
@@ -512,6 +557,7 @@ export async function createSourceStudioEngine(options = {}) {
               embedding_model: embedder.model,
             })),
           );
+          if (upserted > 0) pgVectorsAccepted = true;
         } catch (error) {
           logger.warn("pgvector.upsert.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) });
         }
@@ -688,12 +734,18 @@ export async function createSourceStudioEngine(options = {}) {
   async function deleteSource(sourceId, context = {}) {
     const source = findSource(sourceId);
     assertSourceAccess(source, context);
+    // Signal any in-flight ingest for this source to bail before inserting rows.
+    deletedSourceIds.add(sourceId);
     state.sources = state.sources.filter((item) => item.id !== sourceId);
     removeSourceDerivedRows(sourceId);
     if (pgStore.enabled) {
       await pgStore.deleteBySource(sourceId).catch((error) =>
         logger.warn("pgvector.delete.failed", { source_id: sourceId, error: String(error?.message || error).slice(0, 160) }),
       );
+    }
+    // Free the uploaded original file (up to 200 MB) instead of leaking it on disk.
+    if (source.file_path) {
+      await unlink(source.file_path).catch(() => undefined);
     }
     rebuildNotebookKnowledge(source.notebook_id);
     await persist({ waitForDurable: false });
@@ -727,6 +779,7 @@ export async function createSourceStudioEngine(options = {}) {
     const notebook = state.notebooks.find((item) => item.id === notebookId);
     const sources = state.sources.filter((source) => source.notebook_id === notebookId);
     for (const source of sources) {
+      deletedSourceIds.add(source.id);
       removeSourceDerivedRows(source.id);
       if (pgStore.enabled) {
         await pgStore.deleteBySource(source.id).catch((error) =>
@@ -856,8 +909,12 @@ export async function createSourceStudioEngine(options = {}) {
       state.retrievalRuns.push(evidencePack.retrieval_run);
       state.evidencePacks.push(evidencePack);
       state.citationLedgers.push(verification.ledger);
-      state.modelRuns.push(...generation.model_runs);
-      await persist({ waitForDurable: false });
+      state.modelRuns.push(...tagModelRunOwners(generation.model_runs, context));
+      // Persist off the response path: JSON.stringify of the whole (multi-MB)
+      // state is synchronous and would block the event loop before returning the
+      // answer. The message is already in memory and in the response body, and
+      // the queued write still runs — so returning first is safe and much faster.
+      persistInBackground({ waitForDurable: false });
       logger.info("chat.ask.complete", {
         request_id: context.requestId,
         notebook_id: notebook.id,
@@ -1014,7 +1071,7 @@ export async function createSourceStudioEngine(options = {}) {
           artifactPayload.generation_fallback_reason = generation.fallback_reason || "";
           artifactPayload.evidence_audit = buildArtifactEvidenceAudit(evidencePack, artifactPayload);
         }
-        state.modelRuns.push(...generation.model_runs, ...artifactModelRuns);
+        state.modelRuns.push(...tagModelRunOwners([...generation.model_runs, ...artifactModelRuns], context));
         modelRunIds = [...generation.model_runs.map((run) => run.id), ...artifactModelRuns.map((run) => run.id)];
       }
       job.progress = parsed.type === "audio" || parsed.type === "video" ? 70 : 85;
@@ -1027,7 +1084,7 @@ export async function createSourceStudioEngine(options = {}) {
           payload: artifactPayload,
         });
         if (audioRun) {
-          state.modelRuns.push(audioRun);
+          state.modelRuns.push(...tagModelRunOwners([audioRun], context));
           modelRunIds.push(audioRun.id);
         }
       }
@@ -1353,8 +1410,23 @@ export async function createSourceStudioEngine(options = {}) {
     return job;
   }
 
-  function listModelRuns() {
-    return state.modelRuns.slice(-80).reverse();
+  function tagModelRunOwners(runs, context = {}) {
+    const owner = context.ownerUserId || "";
+    for (const run of runs) {
+      if (run && !run.owner_user_id) run.owner_user_id = owner;
+    }
+    return runs;
+  }
+
+  function listModelRuns(context = {}) {
+    // Model runs are pure telemetry (provider/model/tokens/latency, no prompts),
+    // but timing still shouldn't leak across users. Scope to the caller's runs;
+    // legacy untagged runs are hidden rather than shown to everyone.
+    const owner = context.ownerUserId || "";
+    return state.modelRuns
+      .filter((run) => (run.owner_user_id || "") === owner)
+      .slice(-80)
+      .reverse();
   }
 
   function debugSnapshot(context = {}) {
@@ -1378,7 +1450,11 @@ export async function createSourceStudioEngine(options = {}) {
         .slice(0, 8)
         .map(debugJob),
       recent_jobs: jobs.slice(0, 12).map(debugJob),
-      recent_model_runs: state.modelRuns.slice(-16).reverse().map(debugModelRun),
+      recent_model_runs: state.modelRuns
+        .filter((run) => (run.owner_user_id || "") === (context.ownerUserId || ""))
+        .slice(-16)
+        .reverse()
+        .map(debugModelRun),
       recent_messages: messages.slice(0, 10).map((message) => ({
         id: message.id,
         role: message.role,
@@ -1694,13 +1770,29 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   function decorateArtifactForClient(artifact) {
-    if (!artifact || artifact.type !== "report") return artifact;
-    const contentJson = finalizeReportPayload(artifact.content_json || {});
+    if (!artifact) return artifact;
+    const base = stripServerPathsFromArtifact(artifact);
+    if (base.type !== "report") return base;
+    const contentJson = finalizeReportPayload(base.content_json || {});
     return {
-      ...artifact,
+      ...base,
       content_json: contentJson,
       text_content: renderArtifactText("report", contentJson),
     };
+  }
+
+  // Absolute server filesystem paths must never reach the client — media is
+  // served through /api/artifacts/:id/media, so drop the raw paths and the
+  // engine-only file_path from the payload.
+  function stripServerPathsFromArtifact(artifact) {
+    const content = artifact.content_json;
+    if ((!content || typeof content !== "object")
+      && !artifact.file_path) return artifact;
+    const { audio_file_path, video_file_path, pptx_file_path, ...safeContent } = content || {};
+    void audio_file_path; void video_file_path; void pptx_file_path;
+    const { file_path, ...rest } = artifact;
+    void file_path;
+    return { ...rest, content_json: content ? safeContent : content };
   }
 
   function buildNotebookSuggestedQuestions(sources = []) {
@@ -2069,11 +2161,15 @@ export async function createSourceStudioEngine(options = {}) {
 
   function removeSourceDerivedRows(sourceId) {
     state.blocks = state.blocks.filter((item) => item.source_id !== sourceId);
+    // Collect this source's chunk ids BEFORE filtering chunks: the old code
+    // looked each embedding's chunk up in the already-filtered chunks array, so
+    // it (a) ran O(embeddings × chunks) and (b) kept the source's embeddings as
+    // orphans because their chunk was already gone. Set membership fixes both.
+    const removedChunkIds = new Set(
+      state.chunks.filter((item) => item.source_id === sourceId).map((item) => item.id),
+    );
     state.chunks = state.chunks.filter((item) => item.source_id !== sourceId);
-    state.embeddings = state.embeddings.filter((embedding) => {
-      const chunk = state.chunks.find((item) => item.id === embedding.chunk_id);
-      return chunk && chunk.source_id !== sourceId;
-    });
+    state.embeddings = state.embeddings.filter((embedding) => !removedChunkIds.has(embedding.chunk_id));
     state.knowledgeObjects = state.knowledgeObjects.filter((item) => item.source_id !== sourceId);
   }
 
@@ -2449,8 +2545,15 @@ export async function createSourceStudioEngine(options = {}) {
   }
 
   function parseMarkdownLikeDocument(source, { rawText, cleanedText, parser, fallback, metadata = {} }) {
-    const text = cleanedText.trim();
+    // Cap BEFORE block-parsing: a 50 MB text file would otherwise be fully
+    // line-split and block-parsed (seconds of blocked event loop) only to be
+    // truncated afterward. Truncating the input keeps parse cost bounded.
+    const truncated = String(cleanedText || "").length > MAX_SOURCE_TEXT_CHARS;
+    const text = (truncated ? cleanedText.slice(0, MAX_SOURCE_TEXT_CHARS) : cleanedText).trim();
     if (!text) throw statusError(400, "Source does not contain readable text.");
+    const cappedRawText = String(rawText || "").length > MAX_SOURCE_TEXT_CHARS
+      ? String(rawText).slice(0, MAX_SOURCE_TEXT_CHARS)
+      : rawText;
     const blocks = parseMarkdownBlocks(source, text);
     return {
       title: source.title || firstHeading(text) || inferTitle({ body: text, type: source.type }),
@@ -2462,9 +2565,10 @@ export async function createSourceStudioEngine(options = {}) {
         fallback,
         block_count: blocks.length,
         cleaned_characters: text.length,
+        ...(truncated ? { truncated: true, truncated_at_chars: MAX_SOURCE_TEXT_CHARS } : {}),
         ...metadata,
       },
-      raw_text: rawText,
+      raw_text: cappedRawText,
       cleaned_text: text,
     };
   }
@@ -2645,6 +2749,10 @@ export async function createSourceStudioEngine(options = {}) {
     let tokenCount = 0;
     let currentHeading = [];
     let carriedOverlap = 0;
+    // Cache the accumulating chunk's embedding + tokens: without this,
+    // semanticBoundaryBetween re-tokenizes and re-hashes the entire growing
+    // buffer for every block, i.e. O(blocks²) work during large ingests.
+    const currentEmbedCache = { key: "", vector: null, tokens: null };
 
     const pushChunk = (reason = "target_tokens") => {
       const text = current.map((block) => block.text).join("\n\n").trim();
@@ -2704,7 +2812,7 @@ export async function createSourceStudioEngine(options = {}) {
 
       const blockTokens = estimateTokens(block.text);
       const semanticBoundary = current.length > carriedOverlap
-        ? semanticBoundaryBetween(current.slice(carriedOverlap), block, tokenCount)
+        ? semanticBoundaryBetween(current.slice(carriedOverlap), block, tokenCount, currentEmbedCache)
         : null;
       if (semanticBoundary?.break) {
         pushChunk("semantic_shift");
@@ -2735,15 +2843,27 @@ export async function createSourceStudioEngine(options = {}) {
     return chunks;
   }
 
-  function semanticBoundaryBetween(currentBlocks, nextBlock, tokenCount) {
+  function semanticBoundaryBetween(currentBlocks, nextBlock, tokenCount, cache = null) {
     if (tokenCount < CHUNK_SEMANTIC_MIN || nextBlock.type === "heading") return { break: false, weak: false };
     const currentText = currentBlocks.map((block) => block.text).join("\n\n");
     const nextText = nextBlock.text || "";
-    const currentTokens = tokenize(currentText);
+    // Reuse the accumulating buffer's tokens/embedding across blocks — only the
+    // appended block changes it, so recomputing per block is quadratic.
+    const cacheKey = `${currentBlocks.length}:${currentBlocks.at(-1)?.block_id || ""}:${currentText.length}`;
+    let currentTokens;
+    let currentVector;
+    if (cache && cache.key === cacheKey) {
+      currentTokens = cache.tokens;
+      currentVector = cache.vector;
+    } else {
+      currentTokens = tokenize(currentText);
+      currentVector = embedText(currentText);
+      if (cache) { cache.key = cacheKey; cache.tokens = currentTokens; cache.vector = currentVector; }
+    }
     const nextTokens = tokenize(nextText);
     if (currentTokens.length < 20 || nextTokens.length < 8) return { break: false, weak: false };
     const lexicalOverlap = overlapScore(nextTokens, currentTokens);
-    const vectorSimilarity = cosineSimilarity(embedText(currentText), embedText(nextText));
+    const vectorSimilarity = cosineSimilarity(currentVector, embedText(nextText));
     const breakOnSemanticShift =
       vectorSimilarity < CHUNK_SEMANTIC_BREAK_SIMILARITY &&
       lexicalOverlap < CHUNK_SEMANTIC_BREAK_OVERLAP;
@@ -2934,7 +3054,16 @@ export async function createSourceStudioEngine(options = {}) {
     const queryTokens = tokenize(retrievalText);
     const rewrites = rewriteQuery(retrievalText, notebook_id, queryTokens);
     const candidateChunks = state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id) && isRetrievableChunk(chunk));
-    const corpusStats = buildRetrievalCorpusStats(sourceIds, candidateChunks);
+    // Per-query caches: tokenize each candidate chunk once, and index embeddings
+    // by chunk_id once, instead of re-tokenizing and linearly scanning per chunk.
+    const chunkTokenCache = new globalThis.Map();
+    const candidateChunkIds = new Set(candidateChunks.map((chunk) => chunk.id));
+    const embeddingByChunkId = new globalThis.Map();
+    for (const embedding of state.embeddings) {
+      if (candidateChunkIds.has(embedding.chunk_id)) embeddingByChunkId.set(embedding.chunk_id, embedding);
+    }
+    const corpusStats = buildRetrievalCorpusStats(sourceIds, candidateChunks, chunkTokenCache);
+    const rewriteTokenLists = rewrites.map((query) => tokenize(query));
     const queryVector = (await embedder.embed([rewrites.join(" ") || retrievalText], "query"))[0] || [];
     const candidateLimit = Math.max(evidenceLimit * RETRIEVAL_CANDIDATE_MULTIPLIER, RETRIEVAL_MIN_CANDIDATES);
     let pgSimMap = null;
@@ -2946,7 +3075,7 @@ export async function createSourceStudioEngine(options = {}) {
       }
     }
     let scored = candidateChunks
-      .map((chunk) => scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector, pgSimMap))
+      .map((chunk) => scoreChunkForQuery(chunk, rewriteTokenLists, queryTokens, intent, corpusStats, queryVector, pgSimMap, chunkTokenCache, embeddingByChunkId))
       .filter((result) => result.include)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateLimit);
@@ -3157,12 +3286,18 @@ export async function createSourceStudioEngine(options = {}) {
     return sources.filter((source) => source.active).map((source) => source.id);
   }
 
-  function buildRetrievalCorpusStats(sourceIds, candidateChunks = null) {
+  function buildRetrievalCorpusStats(sourceIds, candidateChunks = null, tokenCache = null) {
     const chunks = candidateChunks || state.chunks.filter((chunk) => sourceIds.includes(chunk.source_id));
     const documentFrequency = new Map();
     let totalTokenCount = 0;
     for (const chunk of chunks) {
-      const tokens = tokenize(chunk.normalized_text);
+      // Reuse the per-query token cache so each chunk is tokenized exactly once
+      // per request instead of here AND again inside scoreChunkForQuery.
+      let tokens = tokenCache?.get(chunk.id);
+      if (!tokens) {
+        tokens = tokenize(chunk.normalized_text);
+        tokenCache?.set(chunk.id, tokens);
+      }
       totalTokenCount += tokens.length;
       for (const token of new Set(tokens)) documentFrequency.set(token, (documentFrequency.get(token) || 0) + 1);
     }
@@ -3173,8 +3308,12 @@ export async function createSourceStudioEngine(options = {}) {
     };
   }
 
-  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector = [], pgSimMap = null) {
-    const chunkTokens = tokenize(chunk.normalized_text);
+  function scoreChunkForQuery(chunk, rewrites, queryTokens, intent, corpusStats, queryVector = [], pgSimMap = null, tokenCache = null, embeddingByChunkId = null) {
+    let chunkTokens = tokenCache?.get(chunk.id);
+    if (!chunkTokens) {
+      chunkTokens = tokenize(chunk.normalized_text);
+      tokenCache?.set(chunk.id, chunkTokens);
+    }
     const keywordScore = queryTokens.reduce((sum, token) => {
       const exact = chunkTokens.filter((chunkToken) => chunkToken === token).length;
       const partial = chunkTokens.filter((chunkToken) => chunkToken.includes(token) || token.includes(chunkToken)).length;
@@ -3182,8 +3321,14 @@ export async function createSourceStudioEngine(options = {}) {
     }, 0);
     const keywordNorm = keywordScore / Math.max(1, queryTokens.length);
     const bm25Score = bm25QueryScore(queryTokens, chunkTokens, corpusStats);
-    const rewriteScore = rewrites.reduce((sum, query) => sum + overlapScore(tokenize(query), chunkTokens), 0);
-    const stored = state.embeddings.find((item) => item.chunk_id === chunk.id);
+    // rewrites arrive pre-tokenized (array of token arrays) so each rewrite is
+    // tokenized once per query, not once per (query × chunk).
+    const rewriteScore = rewrites.reduce((sum, rewriteTokens) => sum + overlapScore(rewriteTokens, chunkTokens), 0);
+    // O(1) embedding lookup via the per-query map instead of a linear scan of
+    // the whole embeddings array for every candidate chunk (was O(chunks²)).
+    const stored = embeddingByChunkId
+      ? embeddingByChunkId.get(chunk.id)
+      : state.embeddings.find((item) => item.chunk_id === chunk.id);
     const chunkVector = stored?.vector;
     const semantic = embedder.isSemantic;
     let vectorScore = 0;
@@ -3322,31 +3467,46 @@ export async function createSourceStudioEngine(options = {}) {
   function diversifyScoredChunks(scored, limit) {
     const selected = [];
     const pool = [...scored];
+    // Tokenize each chunk once up front, not O(pool × selected) times inside the
+    // selection loop (was effectively O(n³) tokenization on large candidate sets).
+    const tokensByChunkId = new globalThis.Map();
+    const tokensFor = (chunk) => {
+      let tokens = tokensByChunkId.get(chunk.id);
+      if (!tokens) {
+        tokens = tokenize(chunk.text);
+        tokensByChunkId.set(chunk.id, tokens);
+      }
+      return tokens;
+    };
     while (pool.length && selected.length < limit) {
       let bestIndex = 0;
-      let bestScore = Number.NEGATIVE_INFINITY;
+      let bestDiversityScore = Number.NEGATIVE_INFINITY;
       for (let index = 0; index < pool.length; index += 1) {
         const candidate = pool[index];
+        const candidateTokens = tokensFor(candidate.chunk);
         const redundancy = selected.length
-          ? Math.max(...selected.map((item) => overlapScore(tokenize(candidate.chunk.text), tokenize(item.chunk.text))))
+          ? Math.max(...selected.map((item) => overlapScore(candidateTokens, tokensFor(item.chunk))))
           : 0;
         const sameSourceCount = selected.filter((item) => item.chunk.source_id === candidate.chunk.source_id).length;
         const headingNovelty = selected.some((item) => (item.chunk.heading_path || []).join("/") === (candidate.chunk.heading_path || []).join("/"))
           ? 0
           : 0.08;
-        const rerankScore = candidate.score - redundancy * 0.22 - sameSourceCount * 0.04 + headingNovelty;
-        if (rerankScore > bestScore) {
-          bestScore = rerankScore;
+        const diversityScore = candidate.score - redundancy * 0.22 - sameSourceCount * 0.04 + headingNovelty;
+        if (diversityScore > bestDiversityScore) {
+          bestDiversityScore = diversityScore;
           bestIndex = index;
         }
       }
       const [picked] = pool.splice(bestIndex, 1);
       selected.push({
         ...picked,
-        rerank_score: bestScore,
+        // Preserve the real reranker relevance; record the diversity-adjusted
+        // selection score separately instead of clobbering rerank_score.
+        rerank_score: typeof picked.rerank_score === "number" ? picked.rerank_score : picked.score,
+        diversity_score: Number(bestDiversityScore.toFixed(4)),
         ranking_signals: {
           ...(picked.ranking_signals || {}),
-          diversity: Number(bestScore.toFixed(4)),
+          diversity: Number(bestDiversityScore.toFixed(4)),
         },
       });
     }
@@ -3467,10 +3627,17 @@ export async function createSourceStudioEngine(options = {}) {
   function verifyAnswer(answer, evidencePack) {
     const ledgerId = id("ledger");
     const claims = splitClaims(answer.content);
+    // Resolve [n] markers by the citation's own `index` field, not by array
+    // position: provider citations can be sparse/non-contiguous (e.g. only [2]
+    // and [4]), so positional lookup would attribute the wrong quote and silently
+    // drop correctly-cited claims.
+    const citationByIndex = new globalThis.Map(
+      (answer.citations || []).map((citation) => [Number(citation.index), citation]),
+    );
     const entries = claims.map((claim, claimIndex) => {
       const citationIndexes = [...claim.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
       const citedEvidence = citationIndexes
-        .map((index) => answer.citations[index - 1])
+        .map((index) => citationByIndex.get(index) ?? answer.citations[index - 1])
         .filter(Boolean)
         .map((citation) => evidencePack.evidence_items.find((item) => item.evidence_id === citation.evidence_id))
         .filter(Boolean);
@@ -5125,13 +5292,48 @@ export async function createSourceStudioEngine(options = {}) {
     }
     const svgPath = join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.svg`);
     await writeFile(svgPath, renderVideoCartoonFallbackSvg(scene, { index, total }));
-    await execFile(env.SIPS_PATH || "sips", ["-s", "format", "png", svgPath, "--out", pngPath], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
+    await rasterizeSvgToPng(svgPath, pngPath, { index, total });
     scene.image_prompt = prompt;
     scene.visual_status = "rendered_local_cartoon";
     scene.visual_fallback_reason = result.error || "";
+  }
+
+  // Turn the fallback SVG into a PNG in a way that works on Linux/Cloud Run, not
+  // just macOS. sips is macOS-only, so try it, then ffmpeg (which can rasterize
+  // via its SVG demuxer when built with librsvg), then a plain solid-color PNG
+  // via ffmpeg's lavfi color source — so a single scene can never fail the whole
+  // video artifact regardless of platform.
+  async function rasterizeSvgToPng(svgPath, pngPath, { index = 0 } = {}) {
+    const ffmpegPath = env.FFMPEG_PATH || "ffmpeg";
+    // 1) macOS sips, only when explicitly present.
+    if (env.SIPS_PATH || process.platform === "darwin") {
+      try {
+        await execFile(env.SIPS_PATH || "sips", ["-s", "format", "png", svgPath, "--out", pngPath], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+        return;
+      } catch {
+        // fall through to ffmpeg
+      }
+    }
+    // 2) ffmpeg SVG demux (works when ffmpeg is built with librsvg).
+    try {
+      await execFile(ffmpegPath, ["-y", "-loglevel", "error", "-i", svgPath, "-vf", "scale=1536:1024", pngPath], {
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024,
+      });
+      return;
+    } catch {
+      // fall through to a solid-color placeholder frame
+    }
+    // 3) Last resort: a solid branded frame so the video still renders.
+    const palette = ["#0f766e", "#1d4ed8", "#7c3aed", "#b45309", "#0891b2", "#be123c"];
+    const color = palette[index % palette.length];
+    await execFile(ffmpegPath, ["-y", "-loglevel", "error", "-f", "lavfi", "-i", `color=c=${color}:s=1536x1024:d=1`, "-frames:v", "1", pngPath], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
   }
 
   async function writeDataUriFile(dataUri, filePath) {
@@ -5206,7 +5408,12 @@ export async function createSourceStudioEngine(options = {}) {
     if (type === "data-table") {
       const columns = payload.columns || [];
       const rows = payload.rows || [];
-      return [columns.join(","), ...rows.map((row) => columns.map((column) => csvCell(row.cells?.[column] || "")).join(","))].join("\n");
+      // Escape the header row too: a provider-generated column label with a comma
+      // or quote would otherwise corrupt column alignment for every row.
+      return [
+        columns.map((column) => csvCell(column)).join(","),
+        ...rows.map((row) => columns.map((column) => csvCell(row.cells?.[column] || "")).join(",")),
+      ].join("\n");
     }
     if (type === "infographic" && payload.svg_markup) {
       return payload.svg_markup;
@@ -5368,7 +5575,11 @@ function stateFreshness(state) {
     ...(state.sources || []).flatMap((item) => [item.created_at, item.updated_at]),
     ...(state.artifacts || []).map((item) => item.created_at),
     ...(state.artifactJobs || []).flatMap((item) => [item.created_at, item.updated_at]),
-    ...(state.messages || []).map((item) => item.created_at),
+    // The state key is chatMessages, not messages — reading the wrong key meant
+    // chat activity never counted toward freshness, so a snapshot with newer
+    // chats could be judged stale and overwritten by an older local copy.
+    ...(state.chatMessages || []).map((item) => item.created_at),
+    ...(state.flashcardReviews || []).map((item) => item.created_at),
   ];
   return dates.reduce((freshest, value) => {
     const time = Date.parse(value || "");
@@ -5422,44 +5633,126 @@ function hasConfiguredValue(value) {
   return Boolean(text && !/^replace-with-/i.test(text));
 }
 
+// SSRF guard: only allow fetching public http(s) URLs. Blocks private/loopback/
+// link-local ranges and the cloud metadata endpoint so a signed-in user can't
+// pivot the server into fetching internal services or 169.254.169.254.
+function ipIsBlocked(ip) {
+  const v = isIP(ip);
+  if (v === 4) {
+    const p = ip.split(".").map(Number);
+    if (p[0] === 10) return true;
+    if (p[0] === 127) return true;
+    if (p[0] === 0) return true;
+    if (p[0] === 169 && p[1] === 254) return true; // link-local + metadata
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT
+    if (p[0] >= 224) return true; // multicast/reserved
+    return false;
+  }
+  if (v === 6) {
+    const lower = ip.toLowerCase();
+    if (lower === "::1" || lower === "::") return true;
+    if (lower.startsWith("fe80") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
+    // IPv4-mapped (::ffff:a.b.c.d) — re-check the embedded v4 address.
+    const mapped = lower.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return ipIsBlocked(mapped[1]);
+    return false;
+  }
+  return false;
+}
+
+async function assertPublicUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw statusError(400, "URL source is not a valid URL.");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw statusError(400, "Only http(s) URLs can be ingested.");
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal")) {
+    throw statusError(400, "That URL is not reachable for security reasons.");
+  }
+  let addresses = [];
+  if (isIP(host)) {
+    addresses = [host];
+  } else {
+    try {
+      const resolved = await dnsLookup(host, { all: true });
+      addresses = resolved.map((entry) => entry.address);
+    } catch {
+      throw statusError(400, "That URL's host could not be resolved.");
+    }
+  }
+  if (!addresses.length || addresses.some((address) => ipIsBlocked(address))) {
+    throw statusError(400, "That URL resolves to a non-public address and cannot be ingested.");
+  }
+}
+
 async function fetchUrlText(url, fetchImpl = globalThis.fetch) {
   const page = await fetchUrlPage(url, fetchImpl);
   return page.cleanedText;
 }
 
 async function fetchUrlPage(url, fetchImpl = globalThis.fetch) {
+  await assertPublicUrl(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
     const response = await fetchImpl(url, {
       signal: controller.signal,
+      redirect: "manual",
       headers: {
         "user-agent": "SourceStudioAI/1.0 local demo crawler",
         accept: "text/html, text/plain;q=0.9, */*;q=0.5",
       },
     });
-    if (!response.ok) throw statusError(400, `URL fetch failed with ${response.status}.`);
-    const contentType = response.headers.get("content-type") || "";
-    const text = await response.text();
-    if (contentType.includes("html")) {
-      return {
-        url: response.url || url,
-        title: extractHtmlTitle(text) || readableUrlTitle(response.url || url),
-        cleanedText: cleanHtml(text),
-        links: extractHtmlLinks(text, response.url || url),
-        contentType,
-      };
+    // A redirect could point at an internal address that bypassed the initial
+    // SSRF check; re-validate the target and follow it once manually.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw statusError(400, "URL fetch failed with an empty redirect.");
+      const nextUrl = new URL(location, url).toString();
+      await assertPublicUrl(nextUrl);
+      const followed = await fetchImpl(nextUrl, {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: {
+          "user-agent": "SourceStudioAI/1.0 local demo crawler",
+          accept: "text/html, text/plain;q=0.9, */*;q=0.5",
+        },
+      });
+      return buildUrlPageResult(followed, nextUrl);
     }
-    return {
-      url: response.url || url,
-      title: readableUrlTitle(response.url || url),
-      cleanedText: normalizeWhitespace(text),
-      links: [],
-      contentType,
-    };
+    return buildUrlPageResult(response, url);
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function buildUrlPageResult(response, url) {
+  if (!response.ok) throw statusError(400, `URL fetch failed with ${response.status}.`);
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (contentType.includes("html")) {
+    return {
+      url: response.url || url,
+      title: extractHtmlTitle(text) || readableUrlTitle(response.url || url),
+      cleanedText: cleanHtml(text),
+      links: extractHtmlLinks(text, response.url || url),
+      contentType,
+    };
+  }
+  return {
+    url: response.url || url,
+    title: readableUrlTitle(response.url || url),
+    cleanedText: normalizeWhitespace(text),
+    links: [],
+    contentType,
+  };
 }
 
 async function discoverSitemapUrls(startUrl, fetchImpl = globalThis.fetch) {
@@ -6143,6 +6436,7 @@ async function fetchYouTubeTranscript(url, fetchImpl = globalThis.fetch, options
       const trackUrl = /[?&]fmt=/.test(baseUrl) ? baseUrl : `${baseUrl}&fmt=json3`;
       const response = await directFetch(trackUrl, {
         headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+        signal: AbortSignal.timeout(15_000),
       });
       if (response.ok) {
         const transcript = parseYouTubeTimedText(await response.text());
@@ -6321,6 +6615,9 @@ async function fetchYouTubeCaptionTracks(videoId, fetchImpl = globalThis.fetch) 
   const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en`;
   const response = await fetchImpl(watchUrl, {
     headers: { "user-agent": YOUTUBE_UA, "accept-language": "en,de;q=0.8" },
+    // Bound the request: a hung YouTube response would otherwise pin an ingest
+    // slot for minutes and starve the queue.
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) return [];
   const html = await response.text();
@@ -6733,9 +7030,14 @@ function createReranker({ env = process.env, fetchImpl = globalThis.fetch } = {}
 
 // Optional Supabase/pgvector store for durable, scalable vector retrieval.
 // Active when SUPABASE_DB_URL is set; otherwise the in-memory cosine path is used.
-const PGVECTOR_DIM = 384;
-function createPgStore({ env = process.env, logger } = {}) {
+const PGVECTOR_DEFAULT_DIM = 384;
+function createPgStore({ env = process.env, logger, defaultDimension } = {}) {
   const url = String(env.SUPABASE_DB_URL || "").trim();
+  // The doc_chunks table has a fixed vector dimension. It must match the active
+  // embedder or every upsert/query is a dimension mismatch: rows would silently
+  // drop and semantic retrieval would degrade to BM25-only — permanently, since
+  // the durable snapshot strips in-memory vectors once pgStore is enabled.
+  const PGVECTOR_DIM = Number(env.PGVECTOR_DIM || 0) || Number(defaultDimension || 0) || PGVECTOR_DEFAULT_DIM;
   const disabledStatus = {
     enabled: false,
     provider: "local-memory",
@@ -6743,7 +7045,7 @@ function createPgStore({ env = process.env, logger } = {}) {
     dimension: PGVECTOR_DIM,
     external: false,
   };
-  if (!url) return { enabled: false, status: () => disabledStatus };
+  if (!url) return { enabled: false, dimension: PGVECTOR_DIM, status: () => disabledStatus };
   let poolPromise = null;
   async function getPool() {
     if (!poolPromise) {
@@ -6761,9 +7063,19 @@ function createPgStore({ env = process.env, logger } = {}) {
     return poolPromise;
   }
   const toVector = (vec) => `[${vec.join(",")}]`;
+  let dimensionMismatchLogged = false;
   async function upsertChunks(rows) {
     const usable = rows.filter((row) => Array.isArray(row.embedding) && row.embedding.length === PGVECTOR_DIM);
-    if (!usable.length) return;
+    if (usable.length < rows.length && !dimensionMismatchLogged) {
+      dimensionMismatchLogged = true;
+      const sample = rows.find((row) => Array.isArray(row.embedding) && row.embedding.length !== PGVECTOR_DIM);
+      logger?.warn?.("pgvector.dimension_mismatch", {
+        expected: PGVECTOR_DIM,
+        got: sample?.embedding?.length,
+        hint: "doc_chunks vector dimension does not match the active embedder; vectors are being dropped. Recreate the table with the correct dimension or set PGVECTOR_DIM.",
+      });
+    }
+    if (!usable.length) return 0;
     const pool = await getPool();
     const client = await pool.connect();
     try {
@@ -6775,6 +7087,7 @@ function createPgStore({ env = process.env, logger } = {}) {
           [row.chunk_id, row.notebook_id, row.source_id, row.owner_user_id || "", row.content || "", row.heading_path || "", row.metadata || {}, toVector(row.embedding)],
         );
       }
+      return usable.length;
     } finally {
       client.release();
     }
@@ -8174,13 +8487,19 @@ function renderSlideSvg(slide, { index, total, deckTitle }) {
   const W = 1280, H = 720, M = 64;
   const c = infographicPalette("evidence-dashboard");
   const accent = c.accents[index % c.accents.length];
-  const layout = String(slide.layout_type || "content").toLowerCase();
+  // Providers occasionally emit a null slide or non-array bullets; coerce
+  // defensively so one malformed entry can't crash the whole slide-deck job.
+  const safeSlide = slide && typeof slide === "object" ? slide : {};
+  const layout = String(safeSlide.layout_type || "content").toLowerCase();
   const isTitle = layout === "title" || index === 0;
   const isClosing = layout === "closing" || layout === "section" || (layout === "title" && index === total - 1 && total > 1);
-  const title = infographicCleanText(slide.title || (isTitle ? deckTitle : ""));
-  const subtitle = infographicCleanText(slide.subtitle || "");
-  const bullets = (slide.bullets || []).map((b) => infographicCleanText(b)).filter(Boolean).slice(0, 6);
-  const visual = infographicCleanText(slide.visual_suggestion || "");
+  const title = infographicCleanText(safeSlide.title || (isTitle ? deckTitle : ""));
+  const subtitle = infographicCleanText(safeSlide.subtitle || "");
+  const rawBullets = Array.isArray(safeSlide.bullets)
+    ? safeSlide.bullets
+    : (typeof safeSlide.bullets === "string" ? [safeSlide.bullets] : []);
+  const bullets = rawBullets.map((b) => infographicCleanText(b)).filter(Boolean).slice(0, 6);
+  const visual = infographicCleanText(safeSlide.visual_suggestion || "");
   const p = [];
 
   p.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${escapeXml(title || "Slide")}">`);
@@ -9432,14 +9751,27 @@ function mindMapMaxDepth(rootId, edges) {
     if (!children.has(edge.source)) children.set(edge.source, []);
     children.get(edge.source).push(edge.target);
   }
-  const walk = (nodeId, depth, seen = new Set()) => {
-    if (seen.has(nodeId)) return depth;
-    seen.add(nodeId);
-    const next = children.get(nodeId) || [];
-    if (!next.length) return depth;
-    return Math.max(...next.map((childId) => walk(childId, depth + 1, new Set(seen))));
-  };
-  return walk(rootId, 0);
+  // BFS by levels with a single global visited set. The old recursion cloned the
+  // seen-set per branch, so a non-tree (diamond) provider graph enumerated every
+  // distinct root-to-leaf path — exponential, blocking the event loop. BFS visits
+  // each node once; the last non-empty level index is the max depth.
+  const visited = new Set([rootId]);
+  let frontier = [rootId];
+  let depth = 0;
+  while (frontier.length) {
+    const nextFrontier = [];
+    for (const nodeId of frontier) {
+      for (const childId of children.get(nodeId) || []) {
+        if (visited.has(childId)) continue;
+        visited.add(childId);
+        nextFrontier.push(childId);
+      }
+    }
+    if (!nextFrontier.length) break;
+    depth += 1;
+    frontier = nextFrontier;
+  }
+  return depth;
 }
 
 // Single tokens that surface from the keyword extractor but read as noise when
@@ -9553,7 +9885,10 @@ function sanitizeFileName(name) {
 }
 
 function csvCell(value) {
-  const text = String(value ?? "");
+  let text = String(value ?? "");
+  // Neutralize CSV formula injection from untrusted source content: a leading
+  // =/+/-/@ would execute when the exported CSV is opened in Excel/Sheets.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 

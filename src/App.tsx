@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type {
   ChangeEvent,
@@ -786,6 +786,13 @@ export default function App() {
     setSelectedArtifactId("");
     setIsArtifactDetailOpen(false);
   }, [notebook, selectedArtifactId]);
+
+  // Switching notebooks (or landing on a different one after a delete) must not
+  // leave the inline artifact audio playing with no visible control to stop it.
+  useEffect(() => {
+    inlineAudioRef.current?.pause();
+    setPlayingArtifactId("");
+  }, [notebook?.id]);
 
   useEffect(() => {
     const messagesNode = messagesRef.current;
@@ -1951,12 +1958,12 @@ export default function App() {
     }
   }
 
-  function focusCitation(citation: Citation) {
+  const focusCitation = useCallback((citation: Citation) => {
     const sourceId = citation.source_id || citation.sourceId || "";
     setActiveSourceId(sourceId);
     setHighlightedBlockIds(citation.block_ids || []);
     setMobilePanel("sources");
-  }
+  }, []);
 
   function openWorkspace(nextAuthMode?: unknown) {
     setShowLanding(false);
@@ -2496,6 +2503,16 @@ export default function App() {
                 suggestions={notebook?.suggested_questions?.length ? notebook.suggested_questions : defaultQuestions}
                 onAsk={(prompt) => void askQuestion(prompt)}
                 onSaveSummary={saveOverviewToNote}
+                onCopyOverview={(text) => {
+                  void (async () => {
+                    try {
+                      await copyTextToClipboard(text);
+                      setToast("Overview copied.");
+                    } catch (copyError) {
+                      setError(messageFromError(copyError));
+                    }
+                  })();
+                }}
               />
             ) : (
               visibleMessages.map((message) => (
@@ -2826,7 +2843,7 @@ export default function App() {
               </label>
               {flashcardOptions.sourceMode === "selected" ? (
                 <div className="flashcard-source-picks" aria-label="Selected flashcard sources">
-                  {notebook?.sources.slice(0, 6).map((source) => {
+                  {notebook?.sources.map((source) => {
                     const selected = flashcardOptions.selectedSourceIds.includes(source.id);
                     return (
                       <button
@@ -4104,6 +4121,7 @@ function ResearchCanvas({
   suggestions,
   onAsk,
   onSaveSummary,
+  onCopyOverview,
 }: {
   title: string;
   activeCount: number;
@@ -4113,6 +4131,7 @@ function ResearchCanvas({
   suggestions: string[];
   onAsk: (prompt: string) => void;
   onSaveSummary: () => void;
+  onCopyOverview: (text: string) => void;
 }) {
   const activeSources = sources.filter((source) => source.active);
   const firstSourceSummary = activeSources.find((source) => source.summary)?.summary || "";
@@ -4139,7 +4158,7 @@ function ResearchCanvas({
             </button>
             <button
               type="button"
-              onClick={() => void navigator.clipboard?.writeText(overview)}
+              onClick={() => onCopyOverview(overview)}
               aria-label="Copy overview"
               title="Copy overview"
             >
@@ -4181,13 +4200,20 @@ function ScaleIcon() {
   );
 }
 
-function ChatBubble({
+const ChatBubble = memo(function ChatBubble({
   message,
   onCitationClick,
 }: {
   message: ChatMessage;
   onCitationClick: (citation: Citation) => void;
 }) {
+  // Parsing markdown is the expensive part of rendering a message. Memoize it so
+  // unrelated App re-renders (typing in the input, the debug status poll) don't
+  // re-parse every message's markdown on each keystroke/tick.
+  const body = useMemo(
+    () => renderMessageContent(message.content, message.citations || [], onCitationClick),
+    [message.content, message.citations, onCitationClick],
+  );
   return (
     <article className="chat-bubble" data-role={message.role}>
       <span className="avatar">{message.role === "assistant" ? <Bot size={17} /> : <NotebookPen size={17} />}</span>
@@ -4197,11 +4223,11 @@ function ChatBubble({
           {message.role === "assistant" && message.provider ? <span>{providerMeta(message)}</span> : null}
           {message.mode === "abstained" ? <span>Abstained</span> : null}
         </div>
-        <div className="answer-text">{renderMessageContent(message.content, message.citations || [], onCitationClick)}</div>
+        <div className="answer-text">{body}</div>
       </div>
     </article>
   );
-}
+});
 
 function renderInline(
   text: string,
@@ -4212,10 +4238,13 @@ function renderInline(
   return text.split(/(\*\*[^*]+\*\*|\[\d+\])/g).map((token, index) => {
     const key = `${keyPrefix}-${index}`;
     const bold = /^\*\*([^*]+)\*\*$/.exec(token);
-    if (bold) return <strong key={key}>{bold[1]}</strong>;
+    // Recurse into bold spans so citation markers nested in **…[1]** still render
+    // as clickable chips instead of dead literal text.
+    if (bold) return <strong key={key}>{renderInline(bold[1], citations, onCitationClick, key)}</strong>;
     const cite = /^\[(\d+)\]$/.exec(token);
     if (cite) {
-      const citation = citations[Number(cite[1]) - 1];
+      const marker = Number(cite[1]);
+      const citation = citations.find((c) => c.index === marker) ?? citations[marker - 1];
       if (citation) {
         return (
           <button key={key} type="button" className="inline-citation" onClick={() => onCitationClick(citation)}>

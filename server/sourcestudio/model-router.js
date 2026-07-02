@@ -368,25 +368,32 @@ export function createModelRouter({
       answerMarkdown = answerMarkdown.replace(/\s?\[(\d+)\]/g, (match, num) => (unknownIndexes.has(Number(num)) ? "" : match)).trim();
       if (!answerMarkdown) throw new Error("Provider returned an unknown citation index.");
     }
-    const citations = parsed.citations
-      .sort((a, b) => a.index - b.index)
-      .map((citation) => {
-        const evidence = allowedEvidence.get(citation.evidence_id);
-        if (!evidence) throw new Error("Provider cited evidence outside the Evidence Pack.");
-        return {
-          index: citation.index,
-          evidence_id: evidence.evidence_id,
-          sourceId: evidence.source_id,
-          source_id: evidence.source_id,
-          sourceTitle: evidence.source_title,
-          source_title: evidence.source_title,
-          block_ids: evidence.block_ids,
-          chunk_id: evidence.chunk_id,
-          quote: evidence.quote,
-          heading_path: evidence.heading_path,
-          page_number: evidence.page_number,
-        };
-      });
+    const sortedCitations = parsed.citations.slice().sort((a, b) => a.index - b.index);
+    // Renumber to a contiguous 1..N and rewrite the [n] markers in the text to
+    // match, so downstream consumers (ledger, client) can resolve markers by
+    // position OR index interchangeably — provider numbering is often sparse.
+    const renumber = new globalThis.Map(sortedCitations.map((citation, position) => [citation.index, position + 1]));
+    answerMarkdown = answerMarkdown.replace(/\[(\d+)\]/g, (match, num) => {
+      const next = renumber.get(Number(num));
+      return next ? `[${next}]` : match;
+    });
+    const citations = sortedCitations.map((citation, position) => {
+      const evidence = allowedEvidence.get(citation.evidence_id);
+      if (!evidence) throw new Error("Provider cited evidence outside the Evidence Pack.");
+      return {
+        index: position + 1,
+        evidence_id: evidence.evidence_id,
+        sourceId: evidence.source_id,
+        source_id: evidence.source_id,
+        sourceTitle: evidence.source_title,
+        source_title: evidence.source_title,
+        block_ids: evidence.block_ids,
+        chunk_id: evidence.chunk_id,
+        quote: evidence.quote,
+        heading_path: evidence.heading_path,
+        page_number: evidence.page_number,
+      };
+    });
     return {
       content: answerMarkdown,
       citations,
